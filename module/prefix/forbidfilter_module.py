@@ -2,7 +2,7 @@
 
 # 이 파일에서는 prefix 명령어를 사용함
 # 모든 채팅 채널에서 금지어가 포함된 채팅을 발견하면 경고 메시지를 출력함
-# 금지어 목록은 prohibited_words.json 파일 참조
+# 금지어 목록은 forbidden_words.json 파일 참조
 
 import discord
 import os

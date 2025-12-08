@@ -4,7 +4,7 @@ from discord.ext import commands
 from datetime import datetime, timezone
 from module.slash.config import EVENT_CHANNEL_ID
 
-class EventNotifyCog(commands.Cog):
+class EventNoticeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
@@ -69,4 +69,4 @@ class EventNotifyCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(EventNotifyCog(bot))
+    await bot.add_cog(EventNoticeCog(bot))

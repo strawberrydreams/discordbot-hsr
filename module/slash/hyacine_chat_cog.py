@@ -12,7 +12,7 @@ from module.slash.config import OPENAI_API_KEY
 LIGHT_MODEL = "gpt-5.1-chat-latest" # GPT-5.1 Instant
 DEEP_MODEL  = "gpt-5.1"             # GPT-5.1 Thinking
 
-class HyacineGPT5Cog(commands.Cog):
+class HyacineChatCog(commands.Cog):
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
         self.bot = bot
         self.nickname = nickname
@@ -22,7 +22,8 @@ class HyacineGPT5Cog(commands.Cog):
         
         user_alias = f"{nickname}둥이 씨"
         self.current_model = LIGHT_MODEL
-        self.MAX_ASSISTANT = 500 # Reduced for efficiency
+        self.MAX_ASSISTANT_LIGHT = 2_000 # Reduced for efficiency
+        self.MAX_ASSISTANT_DEEP = 16_000 # Stricter limit for a GPT-5.1 Thinking
         self.MAX_CONTEXT_TOKENS = 128_000 # GPT-5.1 supports large context
         self.REASONING_EFFORT = "none" # Default for Light model (Instant)
         self.DISCORD_LIMIT = 2000
@@ -137,17 +138,18 @@ class HyacineGPT5Cog(commands.Cog):
 
     async def send_chunked_followup(self, inter: discord.Interaction, text: str):
         parts = self._split_for_discord(text)
-        for p in parts:
+        for idx, p in enumerate(parts):
+            if not p.strip():
+                continue
             await inter.followup.send(p)
 
-    @app_commands.command(name="대화", description="Hyacine과 대화")
-    @app_commands.describe(내용="메시지", 이미지="(선택) 이미지", 검색="(선택) 인터넷 찾아보기")
+    @app_commands.command(name="대화", description=f"Hyacine과 대화 (현재 모델: /상태 명령어로 확인)")
+    @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     async def _talk(
         self,
         inter: discord.Interaction,
         내용: str,
         이미지: Optional[discord.Attachment] = None,
-        검색: bool = False,
     ):
         # Check Points for Deep Model
         cost = 0
@@ -157,7 +159,7 @@ class HyacineGPT5Cog(commands.Cog):
             if not attendance_cog:
                 await inter.response.send_message("❌ 출석체크 모듈 오류.", ephemeral=True)
                 return
-            
+
             if not attendance_cog.deduct_points(inter.user.id, cost):
                 current = attendance_cog.get_points(inter.user.id)
                 await inter.response.send_message(f"❌ 고급 모델(Thinking)은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
@@ -170,7 +172,7 @@ class HyacineGPT5Cog(commands.Cog):
 
         # 최근 10개 메시지 (5턴) 사용
         recent_turns = [m for m in list(self.history) if m["role"] != "system"][-10:]
-        
+
         # System only
         sys_block = {"role": "system", "content": self.system_prompt}
 
@@ -178,21 +180,28 @@ class HyacineGPT5Cog(commands.Cog):
         messages = [sys_block] + recent_turns + [{"role": "user", "content": parts}]
 
         try:
+            # Determine max tokens based on a model
+            max_tokens = self.MAX_ASSISTANT_DEEP if self.current_model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
+
             # Standard OpenAI Chat Completion
             # GPT-5.1 supports reasoning_effort
             kwargs = {
                 "model": self.current_model,
                 "messages": messages,
-                "max_tokens": self.MAX_ASSISTANT,
+                "max_completion_tokens": max_tokens,
             }
-            
-            # Add reasoning_effort only if model supports it (GPT-5.1 does)
-            if "gpt-5" in self.current_model:
-                 kwargs["reasoning_effort"] = self.REASONING_EFFORT
+
+            # Add reasoning_effort only if the model supports it (GPT-5.1 does)
+            if self.current_model == DEEP_MODEL:
+                kwargs["reasoning_effort"] = self.REASONING_EFFORT
 
             resp = await self.client.chat.completions.create(**kwargs)
 
-            reply = resp.choices[0].message.content.strip()
+            reply = (resp.choices[0].message.content or "").strip()
+
+            if not reply.strip():
+                await inter.followup.send("⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요.")
+                return
             
             self.last_usage = {
                 "model": resp.model,
@@ -220,7 +229,7 @@ class HyacineGPT5Cog(commands.Cog):
     async def _deep(self, inter: discord.Interaction):
         self.current_model = DEEP_MODEL
         self.MAX_CONTEXT_TOKENS = 128_000
-        self.REASONING_EFFORT = "high" # Deep thinking
+        self.REASONING_EFFORT = "medium" # Medium thinking
         await inter.response.send_message("🌌 더 깊은 별빛으로 대화할게요~ (GPT-5.1 Thinking)")
 
     @app_commands.command(name="기본", description="GPT-5.1 Instant 모델로 전환 (기본)")
@@ -253,5 +262,4 @@ class HyacineGPT5Cog(commands.Cog):
         )
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HyacineGPT5Cog(bot))
-
+    await bot.add_cog(HyacineChatCog(bot))

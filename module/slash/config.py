@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 # 1. Load Environment Variables
 # Assuming the bot is run from the root directory
 SETTINGS_DIR = pathlib.Path("settings")
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "."))
 
 load_dotenv(dotenv_path=SETTINGS_DIR / "DISCORD_TOKEN.env")
 load_dotenv(dotenv_path=SETTINGS_DIR / "OPENAI_API_KEY.env")
@@ -18,8 +19,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # 3. Channel IDs
-RECRUIT_CHANNEL_ID = 1360877145886429375
-EVENT_CHANNEL_ID = 1360875517016015083
+RECRUIT_CHANNEL_ID = 1361245403147931669
+EVENT_CHANNEL_ID = 1365885232489955428
 
 # 4. Game Settings
 GAMES = {
@@ -37,14 +38,14 @@ GAMES = {
     }
 }
 
-# 5. Prohibited Words
-PROHIBITED_WORDS_FILE = SETTINGS_DIR / "prohibited_words.json"
+# 5. Forbidden Words
+FORBIDDEN_WORDS_FILE = SETTINGS_DIR / "forbidden_words.json"
 
-def load_prohibited_words():
-    if not PROHIBITED_WORDS_FILE.exists():
+def load_forbidden_words():
+    if not FORBIDDEN_WORDS_FILE.exists():
         return []
     try:
-        with PROHIBITED_WORDS_FILE.open(encoding="utf-8") as fp:
+        with FORBIDDEN_WORDS_FILE.open(encoding="utf-8") as fp:
             data = json.load(fp)
         if isinstance(data, list):
             return [str(w).lower() for w in data if w]

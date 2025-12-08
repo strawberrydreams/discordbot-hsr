@@ -5,7 +5,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-DB_FILE = "attendance_data.db"
+from module.slash.config import DATA_DIR
+
+DB_FILE = DATA_DIR / "attendance_data.db"
 
 class AttendanceCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -19,9 +21,17 @@ class AttendanceCog(commands.Cog):
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     points INTEGER DEFAULT 0,
-                    last_attendance_date TEXT
+                    last_attendance_date TEXT,
+                    forbidden_count INTEGER DEFAULT 0
                 )
             """)
+            
+            # Migration for existing tables
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN forbidden_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass # Column already exists
+                
             conn.commit()
 
     def get_points(self, user_id: int) -> int:
@@ -58,6 +68,23 @@ class AttendanceCog(commands.Cog):
             c.execute("SELECT points, last_attendance_date FROM users WHERE user_id = ?", (user_id,))
             return c.fetchone()
 
+    def increment_forbidden_count(self, user_id: int):
+        """Increments the forbidden word count for a user."""
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            # Ensure user exists
+            c.execute("INSERT OR IGNORE INTO users (user_id, points, forbidden_count) VALUES (?, 0, 0)", (user_id,))
+            c.execute("UPDATE users SET forbidden_count = forbidden_count + 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+    def get_forbidden_count(self, user_id: int) -> int:
+        """Returns the forbidden word count for a user."""
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT forbidden_count FROM users WHERE user_id = ?", (user_id,))
+            result = c.fetchone()
+            return result[0] if result else 0
+
     def _update_user_data(self, user_id: int, points: int, attendance_date: str):
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
@@ -73,12 +100,12 @@ class AttendanceCog(commands.Cog):
                 """, (points, attendance_date, user_id))
             else:
                 c.execute("""
-                    INSERT INTO users (user_id, points, last_attendance_date)
-                    VALUES (?, ?, ?)
+                    INSERT INTO users (user_id, points, last_attendance_date, forbidden_count)
+                    VALUES (?, ?, ?, 0)
                 """, (user_id, points, attendance_date))
             conn.commit()
 
-    @app_commands.command(name="출석", description="매일 한 번 출석체크하고 포인트를 받으세요!")
+    @app_commands.command(name="출석", description="매일 한 번 출석체크하고 랜덤 포인트를 받으세요!")
     async def _attend(self, inter: discord.Interaction):
         user_id = inter.user.id
         today_str = date.today().isoformat()
@@ -95,7 +122,7 @@ class AttendanceCog(commands.Cog):
             return
         
         # Reward calculation
-        reward = random.randint(1000, 100000)
+        reward = random.randint(1000, 50000)
         new_points = current_points + reward
         
         self._update_user_data(user_id, new_points, today_str)
@@ -181,6 +208,32 @@ class AttendanceCog(commands.Cog):
             medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx-1]
             embed.add_field(name=f"{medal} {name}", value=f"**{points:,}** P", inline=False)
             
+        await inter.response.send_message(embed=embed)
+
+    @app_commands.command(name="프로필", description="사용자의 서버 프로필 정보를 확인합니다.")
+    @app_commands.describe(유저="프로필을 확인할 유저 (선택사항, 기본값: 본인)")
+    async def _profile(self, inter: discord.Interaction, 유저: discord.Member = None):
+        target_user = 유저 if 유저 else inter.user
+        
+        # Get data
+        points = self.get_points(target_user.id)
+        forbidden_count = self.get_forbidden_count(target_user.id)
+        
+        # Join date
+        join_date = target_user.joined_at.strftime("%Y-%m-%d") if target_user.joined_at else "알 수 없음"
+        
+        embed = discord.Embed(
+            title=f"👤 {target_user.display_name}님의 프로필",
+            color=target_user.color
+        )
+        
+        if target_user.avatar:
+            embed.set_thumbnail(url=target_user.avatar.url)
+            
+        embed.add_field(name="📅 서버 가입일", value=join_date, inline=True)
+        embed.add_field(name="💰 보유 포인트", value=f"{points:,} P", inline=True)
+        embed.add_field(name="🚫 금지어 경고", value=f"{forbidden_count}회", inline=True)
+        
         await inter.response.send_message(embed=embed)
 
 async def setup(bot: commands.Bot):

@@ -9,9 +9,9 @@ from google import genai
 from module.slash.config import GOOGLE_API_KEY
 
 # Model Alias
-IMAGE_MODEL = "nano-banana-pro" # Gemini 3 Pro Image
+IMAGE_MODEL = "imagen-4.0-ultra-generate-001" # Imagen 4.0 Ultra
 
-class HyacineGeminiCog(commands.Cog):
+class HyacineImageCog(commands.Cog):
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
         self.bot = bot
         self.nickname = nickname
@@ -32,7 +32,7 @@ class HyacineGeminiCog(commands.Cog):
         except Exception as e:
             print(f"⚠️ Failed to delete {file_path}: {e}")
 
-    @app_commands.command(name="이미지", description="Gemini Nano Banana Pro에게 그림을 그려달라고 요청합니다. (50,000 P)")
+    @app_commands.command(name="이미지", description="Imagen 4.0 Ultra에게 그림을 그려달라고 요청합니다. (50,000 P)")
     @app_commands.describe(프롬프트="그려줘! 라고 할 내용")
     async def _image(self, inter: discord.Interaction, 프롬프트: str):
         # 0. Check Points
@@ -59,14 +59,15 @@ class HyacineGeminiCog(commands.Cog):
                 lambda: self.client.models.generate_images(
                     model=IMAGE_MODEL,
                     prompt=프롬프트,
-                    number_of_images=1
+                    config=genai.types.GenerateImagesConfig(number_of_images=1)
                 )
             )
             
             if not response.generated_images:
                 # Refund on failure
                 attendance_cog.add_points(inter.user.id, cost)
-                await inter.followup.send("❌ 이미지를 생성하지 못했어요. 포인트는 환불해 드렸습니다.")
+                print(f"⚠️ Image generation blocked/failed. Response: {response}")
+                await inter.followup.send("❌ 이미지를 생성하지 못했어요. 포인트는 환불해 드렸습니다.\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)")
                 return
 
             image_data = response.generated_images[0].image.image_bytes
@@ -86,7 +87,7 @@ class HyacineGeminiCog(commands.Cog):
                 color=0x9b59b6 # Purple-ish
             )
             embed.set_image(url=f"attachment://{filename}")
-            embed.set_footer(text=f"Model: {IMAGE_MODEL} | 비용: {cost:,} P | 5분 후 삭제됨")
+            embed.set_footer(text=f"Model: {IMAGE_MODEL} | 비용: {cost:,} P | 5분 후 서버에서 삭제됨")
             
             await inter.followup.send(embed=embed, file=file)
             
@@ -96,8 +97,8 @@ class HyacineGeminiCog(commands.Cog):
         except Exception as e:
             # Refund on error
             attendance_cog.add_points(inter.user.id, cost)
-            await inter.followup.send(f"❌ 이미지 생성 중 오류가 발생했어요: {e} (포인트 환불됨)", ephemeral=True)
+            await inter.followup.send(f"❌ 이미지 생성 중 오류가 발생했어요: {e} 포인트는 환불해 드렸습니다.", ephemeral=True)
             print(f"Error in _image: {e}")
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HyacineGeminiCog(bot))
+    await bot.add_cog(HyacineImageCog(bot))

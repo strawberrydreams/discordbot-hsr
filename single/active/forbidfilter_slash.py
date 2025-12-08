@@ -2,7 +2,7 @@
 
 # 이 파일에서는 slash 명령어를 사용함
 # 모든 채팅 채널에서 금지어가 포함된 채팅을 발견하면 경고 메시지를 출력함
-# 금지어 목록은 prohibited_words.json 파일 참조
+# 금지어 목록은 forbidden_words.json 파일 참조
 
 import discord
 import os
@@ -46,7 +46,7 @@ def load_prohibited_words():
 # 2. 금지어 목록이 .json 파일일 때
 def load_prohibited_words():
     try:
-        with open("prohibited_words.json", "r", encoding="utf-8") as f:
+        with open("forbidden_words.json", "r", encoding="utf-8") as f:
             words = json.load(f)
             return [word.strip().lower() for word in words if isinstance(word, str) and word.strip()]
     except FileNotFoundError:

@@ -2,6 +2,8 @@ import discord
 from discord.ext import commands
 from module.slash.config import DISCORD_TOKEN
 
+# 실행 커맨드: python -m module.slash.main
+
 # Intents 설정
 intents = discord.Intents.default()
 intents.guild_scheduled_events = True
@@ -19,12 +21,13 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         # Load Extensions (Cogs)
         extensions = [
-            "module.slash.eventnotify_module",
-            "module.slash.makeparty_module",
-            "module.slash.forbidfilter_module",
-            "module.slash.hyacine_gpt_5_module",
-            "module.slash.hyacine_gemini_module",
-            "module.slash.attendance_module"
+            "module.slash.eventnotice_cog",
+            "module.slash.playwith_cog",
+            "module.slash.forbiddenfilter_cog",
+            "module.slash.hyacine_chat_cog",
+            "module.slash.hyacine_image_cog",
+            "module.slash.attendance_cog",
+            "module.slash.finance_cog"
         ]
         
         for ext in extensions:
@@ -42,8 +45,16 @@ class MyBot(commands.Bot):
 
     async def on_ready(self):
         print(f"✅ {self.user} 봇이 실행되었습니다!")
-        activity = discord.Activity(type=discord.ActivityType.listening, name="Spotify")
+
+        activity = discord.Game(name="📝 생각나는 아이디어를 끄적이는 중...")
+        # activity = discord.Streaming(name="broadcast_title", url="broadcast_link")
+        # activity = discord.Activity(type=discord.ActivityType.listening, name="music_title")
+        # activity = discord.Activity(type=discord.ActivityType.watching, name="video_title")
+
         await self.change_presence(status=discord.Status.online, activity=activity)
+        # await client.change_presence(status=discord.Status.idle, activity=activity)
+        # await client.change_presence(status=discord.Status.dnd, activity=activity)
+        # await client.change_presence(status=discord.Status.invisible, activity=activity)
 
 bot = MyBot()
 

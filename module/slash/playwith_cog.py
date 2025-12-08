@@ -4,12 +4,12 @@ import datetime
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import View, Select, Button
-from module.slash.config import RECRUIT_CHANNEL_ID, GAMES
+from module.slash.config import RECRUIT_CHANNEL_ID, GAMES, DATA_DIR
 
-class MakePartyCog(commands.Cog):
+class PlayWithCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.db_path = "party_data.db"
+        self.db_path = DATA_DIR / "party_data.db"
         self.init_db()
         self.cleanup_parties.start()
         self.shared_views = {}
@@ -358,4 +358,4 @@ class RoleUpdateSelect(Select):
         await interaction.response.send_message(f"🔄 역할이 `{role}`(으)로 변경되었습니다!", ephemeral=True)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(MakePartyCog(bot))
+    await bot.add_cog(PlayWithCog(bot))
