@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from discord.ui import View, Select, Button
 
-RECRUIT_CHANNEL_ID = 1361245403147931669
+RECRUIT_CHANNEL_ID = 1
 
 GAMES = {
     "League of Legends": {

@@ -9,7 +9,7 @@ from discord.ext import commands
 from discord.ui import Button, View, Select
 from dotenv import load_dotenv
 
-RECRUIT_CHANNEL_ID = 1360877145886429375
+RECRUIT_CHANNEL_ID = 1
 
 GAMES = {
     "League of Legends": {

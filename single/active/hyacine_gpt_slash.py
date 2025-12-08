@@ -19,15 +19,11 @@ from collections import deque
 from typing import List, Dict, Optional
 from discord import app_commands
 
-# 🔑 환경 변수 또는 직접 입력
-OPENAI_API_KEY = "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"
-DISCORD_BOT_TOKEN = "MTM2MDg4MjY0MjI0OTA2MDQ1Mg.GOZ8UI.aabAVattC9-ov06mrvYM-_wGS3-hIMNus88HiM"
-
 openai.api_key = OPENAI_API_KEY
 
 # ────────── 환경 변수 ────────── #
-# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # images/* 권한 None!
-# DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # images/* 권한 None!
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not (OPENAI_API_KEY and DISCORD_BOT_TOKEN):
     raise RuntimeError("OPENAI_API_KEY / DISCORD_BOT_TOKEN 모두 설정해 주세요.")
 # openai.api_key = OPENAI_API_KEY

@@ -9,7 +9,7 @@ from discord.ext import commands
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-EVENT_CHANNEL_ID = 1339250284366659637
+EVENT_CHANNEL_ID = 1
 
 # 클라이언트 및 명령 트리 초기화
 intents = discord.Intents.default()

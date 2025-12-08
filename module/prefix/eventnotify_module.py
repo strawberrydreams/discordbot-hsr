@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 
-EVENT_CHANNEL_ID = 1365885232489955428
+EVENT_CHANNEL_ID = 1
 
 # prefix 명령어 등록
 def setup_event_commands(bot):
