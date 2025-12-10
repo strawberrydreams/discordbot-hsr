@@ -1,6 +1,6 @@
 import random
 import sqlite3
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -22,13 +22,16 @@ class AttendanceCog(commands.Cog):
                     user_id INTEGER PRIMARY KEY,
                     points INTEGER DEFAULT 0,
                     last_attendance_date TEXT,
-                    forbidden_count INTEGER DEFAULT 0
+                    forbidden_count INTEGER DEFAULT 0,
+                    luckybox_count INTEGER DEFAULT 0,
+                    last_luckybox_date VARCHAR(20)
                 )
             """)
             
             # Migration for existing tables
             try:
-                c.execute("ALTER TABLE users ADD COLUMN forbidden_count INTEGER DEFAULT 0")
+                c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS luckybox_count INTEGER DEFAULT 0")
+                c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_luckybox_date VARCHAR(20)")
             except sqlite3.OperationalError:
                 pass # Column already exists
                 
@@ -108,7 +111,8 @@ class AttendanceCog(commands.Cog):
     @app_commands.command(name="출석", description="매일 한 번 출석체크하고 랜덤 포인트를 받으세요!")
     async def _attend(self, inter: discord.Interaction):
         user_id = inter.user.id
-        today_str = date.today().isoformat()
+        kst = timezone(timedelta(hours=9))
+        today_str = datetime.now(kst).date().isoformat()
         
         data = self._get_user_data(user_id)
         current_points = 0
@@ -122,7 +126,7 @@ class AttendanceCog(commands.Cog):
             return
         
         # Reward calculation
-        reward = random.randint(1000, 50000)
+        reward = random.randint(5000, 30000)
         new_points = current_points + reward
         
         self._update_user_data(user_id, new_points, today_str)
@@ -157,6 +161,33 @@ class AttendanceCog(commands.Cog):
             await inter.response.send_message("❌ 0보다 큰 금액을 걸어야죠!", ephemeral=True)
             return
 
+        user_id = inter.user.id
+        kst = timezone(timedelta(hours=9))
+        today_str = datetime.now(kst).date().isoformat()
+
+        # Check limit
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT luckybox_count, last_luckybox_date FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            user_data = c.fetchone()
+
+        current_count = 0
+        last_date = None
+        if user_data:
+            current_count = user_data[0]
+            last_date = user_data[1]
+        
+        # Reset count if new day
+        if last_date != today_str:
+            current_count = 0
+        
+        if current_count >= 3:
+            await inter.response.send_message(f"🛑 {inter.user.mention}, 오늘은 그만! 하루 3번만 가능해요. 내일 다시 도전하세요! 🎲", ephemeral=True)
+            return
+
         current_points = self.get_points(inter.user.id)
         if current_points < 금액:
             await inter.response.send_message(f"❌ 포인트가 부족해요! (보유: {current_points:,} P)", ephemeral=True)
@@ -172,6 +203,16 @@ class AttendanceCog(commands.Cog):
         
         # Add result
         self.add_points(inter.user.id, result_amount)
+
+        # Update luckybox count and date
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET luckybox_count = ?, last_luckybox_date = ? WHERE user_id = ?",
+                (current_count + 1, today_str, user_id)
+            )
+            conn.commit()
+
         final_points = self.get_points(inter.user.id)
 
         # Visuals
