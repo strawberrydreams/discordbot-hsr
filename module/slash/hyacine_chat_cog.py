@@ -8,9 +8,9 @@ from discord import app_commands
 from discord.ext import commands
 from module.slash.config import OPENAI_API_KEY
 
-# GPT-5.1 Update
-LIGHT_MODEL = "gpt-5.1-chat-latest" # GPT-5.1 Instant
-DEEP_MODEL  = "gpt-5.1"             # GPT-5.1 Thinking
+# GPT-5.2 Update
+LIGHT_MODEL = "gpt-5.2-chat-latest" # GPT-5.2 Instant
+DEEP_MODEL  = "gpt-5.2"             # GPT-5.2 Thinking
 
 class HyacineChatCog(commands.Cog):
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
@@ -23,8 +23,8 @@ class HyacineChatCog(commands.Cog):
         user_alias = f"{nickname}둥이 씨"
         self.current_model = LIGHT_MODEL
         self.MAX_ASSISTANT_LIGHT = 2_000 # Reduced for efficiency
-        self.MAX_ASSISTANT_DEEP = 16_000 # Stricter limit for a GPT-5.1 Thinking
-        self.MAX_CONTEXT_TOKENS = 128_000 # GPT-5.1 supports large context
+        self.MAX_ASSISTANT_DEEP = 16_000 # Stricter limit for a GPT-5.2 Thinking
+        self.MAX_CONTEXT_TOKENS = 128_000 # GPT-5.2 supports large context
         self.REASONING_EFFORT = "none" # Default for Light model (Instant)
         self.DISCORD_LIMIT = 2000
 
@@ -183,21 +183,22 @@ class HyacineChatCog(commands.Cog):
             # Determine max tokens based on a model
             max_tokens = self.MAX_ASSISTANT_DEEP if self.current_model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
 
-            # Standard OpenAI Chat Completion
-            # GPT-5.1 supports reasoning_effort
+            # OpenAI Responses API
+            # GPT-5.2 supports reasoning_effort
             kwargs = {
                 "model": self.current_model,
-                "messages": messages,
-                "max_completion_tokens": max_tokens,
+                "instructions": self.system_prompt,
+                "input": recent_turns + [{"role": "user", "content": parts}],
+                "max_output_tokens": max_tokens,
             }
 
-            # Add reasoning_effort only if the model supports it (GPT-5.1 does)
+            # Add reasoning for Deep model (GPT-5.2 Thinking)
             if self.current_model == DEEP_MODEL:
-                kwargs["reasoning_effort"] = self.REASONING_EFFORT
+                kwargs["reasoning"] = {"effort": self.REASONING_EFFORT}
 
-            resp = await self.client.chat.completions.create(**kwargs)
+            resp = await self.client.responses.create(**kwargs)
 
-            reply = (resp.choices[0].message.content or "").strip()
+            reply = (resp.output_text or "").strip()
 
             if not reply.strip():
                 await inter.followup.send("⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요.")
@@ -205,8 +206,8 @@ class HyacineChatCog(commands.Cog):
             
             self.last_usage = {
                 "model": resp.model,
-                "input_tokens": resp.usage.prompt_tokens,
-                "output_tokens": resp.usage.completion_tokens,
+                "input_tokens": resp.usage.input_tokens,
+                "output_tokens": resp.usage.output_tokens,
                 "total_tokens": resp.usage.total_tokens
             }
 
@@ -225,19 +226,19 @@ class HyacineChatCog(commands.Cog):
             await inter.followup.send(f"❌ `{self.current_model}` 호출 실패: `{e}` (포인트 환불됨)", ephemeral=True)
             print(f"Error: {e}")
 
-    @app_commands.command(name="고급", description="GPT-5.1 Thinking 모델로 전환 (고급)")
+    @app_commands.command(name="고급", description="GPT-5.2 Thinking 모델로 전환 (고급)")
     async def _deep(self, inter: discord.Interaction):
         self.current_model = DEEP_MODEL
         self.MAX_CONTEXT_TOKENS = 128_000
         self.REASONING_EFFORT = "medium" # Medium thinking
-        await inter.response.send_message("🌌 더 깊은 별빛으로 대화할게요~ (GPT-5.1 Thinking)")
+        await inter.response.send_message("🌌 더 깊은 별빛으로 대화할게요~ (GPT-5.2 Thinking)")
 
-    @app_commands.command(name="기본", description="GPT-5.1 Instant 모델로 전환 (기본)")
+    @app_commands.command(name="기본", description="GPT-5.2 Instant 모델로 전환 (기본)")
     async def _light(self, inter: discord.Interaction):
         self.current_model = LIGHT_MODEL
         self.MAX_CONTEXT_TOKENS = 128_000
         self.REASONING_EFFORT = "none" # Instant response
-        await inter.response.send_message("✨ 다시 가벼운 별바람으로 돌아왔어요~ (GPT-5.1 Instant)")
+        await inter.response.send_message("✨ 다시 가벼운 별바람으로 돌아왔어요~ (GPT-5.2 Instant)")
 
     @app_commands.command(name="상태", description="현재 상태 확인")
     async def _status(self, inter: discord.Interaction):

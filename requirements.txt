@@ -1,6 +1,6 @@
 discord.py==2.6.4
 python-dotenv==1.2.1
-openai==2.9.0
-google-genai==1.53.0
+openai==2.14.0 # 2.9.0 -> 2.14.0
+google-genai==1.56.0 # 1.53.0 -> 1.56.0
 tiktoken==0.12.0
-yfinance==0.2.66
+yfinance==1.0 # 0.2.66 -> 1.0
