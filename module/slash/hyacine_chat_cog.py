@@ -87,11 +87,11 @@ class HyacineChatCog(commands.Cog):
     def build_user_parts(self, text: Optional[str], image_att: Optional[discord.Attachment]) -> List[Dict[str, Any]]:
         parts: List[Dict[str, Any]] = []
         if text and text.strip():
-            parts.append({"type": "text", "text": text.strip()})
+            parts.append({"type": "input_text", "text": text.strip()})
         if image_att and (image_att.content_type or "").startswith("image/"):
-            parts.append({"type": "image_url", "image_url": {"url": image_att.url}})
+            parts.append({"type": "input_image", "image_url": image_att.url})
         if not parts:
-            parts.append({"type": "text", "text": "(빈 입력)"})
+            parts.append({"type": "input_text", "text": "(빈 입력)"})
         return parts
 
     def _split_for_discord(self, text: str, limit: int = 2000) -> List[str]:
