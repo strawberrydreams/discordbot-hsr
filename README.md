@@ -2,13 +2,13 @@
 
 이미지
 
-이 프로젝트는 **개인적인 디스코드 서버에서 사용하기 위해 제작된 커스텀 봇**입니다. 작성자의 개인적인 필요와 서버 환경에 맞춰 개발되었으며, 범용적인 사용보다는 특정 커뮤니티의 편의 기능을 제공하는 데 초점을 맞추고 있습니다.
+이 프로젝트는 **개인적인 디스코드 서버에서 사용하기 위해 제작된 커스텀 봇**입니다. 작성자의 개인적인 필요와 서버 환경에 맞춰 개발되었으며, 특정 커뮤니티의 편의 기능을 제공하는 데 초점을 맞추고 있습니다.
 
 ## 📂 프로젝트 구조 및 모듈 설명
 
-이 프로젝트의 핵심 기능은 `module/slash/` 디렉터리에 모듈화되어 있습니다.
+이 프로젝트의 핵심 기능은 `module/` 디렉터리에 모듈화되어 있습니다.
 
-### `module/slash/` (핵심 기능)
+### `module/` (핵심 기능)
 
 이 디렉터리의 파일들은 디스코드의 **Slash Command (슬래시 명령어)** 기능을 기반으로 동작하는 최신 코드들입니다.
 
@@ -27,10 +27,9 @@
 
 ---
 
-### 🏚️ Legacy Code (`single/`, `module/prefix/`)
+### 🏚️ Legacy Code (`single/`)
 
 *   **`single/`**: 단순한 임베드 공지 메시지를 전송할 수 있는 일회용 스크립트(`command_prefix.py`) 하나만 템플릿으로 보존되어 있습니다.
-*   **`module/prefix/`**: Slash Command가 도입되기 전, `!`와 같은 접두사(Prefix)를 사용하여 명령어를 처리하던 구버전 모듈들입니다. 현재 프로젝트의 주력은 `module/slash/`의 슬래시 명령어입니다.
 
 ---
 
@@ -46,10 +45,10 @@
 *   `OPENAI_API_KEY.env`: `OPENAI_API_KEY=sk-...`
 *   `GOOGLE_API_KEY.env`: `GOOGLE_API_KEY=AIza...`
 
-또한 `module/slash/config.py` 파일에서 다음 ID들을 본인의 서버에 맞게 수정해야 합니다.
+또한 `module/config.py` 파일에서 다음 ID들을 본인의 서버에 맞게 수정해야 합니다.
 
 ```python
-# module/slash/config.py
+# module/config.py
 
 RECRUIT_CHANNEL_ID = 1234567890... # 파티 모집을 진행할 채널 ID
 EVENT_CHANNEL_ID = 1234567890...   # 이벤트 알림을 띄울 채널 ID
@@ -86,12 +85,12 @@ EVENT_CHANNEL_ID = 1234567890...   # 이벤트 알림을 띄울 채널 ID
 
 ## ☁️ 클라우드 배포 가이드
 
-이 봇은 Python 앱을 실행할 수 있는 어떤 클라우드 서비스(PaaS, VPS, 컨테이너 등)에도 배포할 수 있습니다. 서비스별 메뉴 이름은 다르지만, 공통적으로 아래 네 가지만 설정하면 됩니다.
+이 봇은 Python 앱을 실행할 수 있는 클라우드 서비스에 배포할 수 있습니다.
 
 ### 1. 실행 환경
 *   **Python 버전**: `3.11` 이상 권장
 *   **의존성 설치 (빌드 명령어)**: `pip install -r requirements.txt`
-*   **시작 명령어**: `python -m module.slash.main` (프로젝트 루트 기준)
+*   **시작 명령어**: `python -m module.main` (프로젝트 루트 기준)
 *   저장소를 사용할 경우 **비공개(Private)** 로 유지하세요.
 
 ### 2. 환경 변수 (Environment Variables)
@@ -113,7 +112,7 @@ EVENT_CHANNEL_ID = 1234567890...   # 이벤트 알림을 띄울 채널 ID
 *   **외부 DB 사용**: MySQL, Oracle 등 관리형 DB를 쓰면 볼륨 설정이 필요 없습니다. 아래 '외부 DB 연결' 참고.
 
 ### 4. 외부 DB 연결 (선택)
-DB 접근은 `module/slash/database.py`의 Repository 계층으로 추상화되어 있어, Cog 코드를 건드리지 않고 백엔드를 교체할 수 있습니다.
+DB 접근은 `module/database.py`의 Repository 계층으로 추상화되어 있어, Cog 코드를 건드리지 않고 백엔드를 교체할 수 있습니다.
 
 1.  `database.py`에 `AttendanceRepository` / `PartyRepository`를 상속한 구현 클래스를 작성합니다. (SQL placeholder 등 방언 차이만 처리하면 됩니다)
 2.  같은 파일의 `create_attendance_repository` / `create_party_repository` 팩토리에 분기를 추가합니다.
