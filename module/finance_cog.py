@@ -73,9 +73,7 @@ class FinanceCog(commands.Cog):
                 # Emoji for a direction
                 if change > 0:
                     emoji = "🔺"
-                    color_code = "+ " # For diff syntax if used, but simple string is better here
                 elif change < 0:
-                    emoji = "hg" # wait, down arrow
                     emoji = "🔹"
                 else:
                     emoji = "➖"

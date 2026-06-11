@@ -7,7 +7,14 @@ from dotenv import load_dotenv
 # 1. Load Environment Variables
 # Assuming the bot is run from the root directory
 SETTINGS_DIR = pathlib.Path("settings")
-DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "."))
+# 로컬 기본값은 data/, 배포 환경에서는 DATA_DIR 환경 변수로 덮어쓸 수 있음 (예: /app/data)
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "data"))
+
+# DB 백엔드 선택: 기본은 sqlite.
+# 외부 DB(MySQL, Oracle 등)를 붙이려면 module/database.py에 Repository 구현을 추가하고
+# 이 값을 해당 백엔드 이름으로 설정한다. 접속 정보는 DB_URL 환경 변수로 전달한다.
+DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
+DB_URL = os.getenv("DB_URL")  # 예: mysql://user:pass@host:3306/botdb (sqlite에서는 사용 안 함)
 
 load_dotenv(dotenv_path=SETTINGS_DIR / "DISCORD_TOKEN.env")
 load_dotenv(dotenv_path=SETTINGS_DIR / "OPENAI_API_KEY.env")

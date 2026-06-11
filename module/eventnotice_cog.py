@@ -1,23 +1,26 @@
-# Discord Bot / 이벤트 채널의 이벤트 정보 업로드용 모듈
-
-# 이 파일에서는 prefix 명령어를 사용함
-# 이벤트 채널에서 (*이벤트 [숫자])를 입력하면 임베드된 공지 내용을 출력함
-
 import discord
+from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
+from module.config import EVENT_CHANNEL_ID
 
-EVENT_CHANNEL_ID = 1
+class EventNoticeCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
 
-# prefix 명령어 등록
-def setup_event_commands(bot):
-    @bot.command(name="이벤트")
-    async def show_specific_event(ctx, index: int):
-        if ctx.channel.id != EVENT_CHANNEL_ID:
-            await ctx.send("❌ 이 명령어는 이벤트 채널에서만 사용할 수 있습니다.")
+    @app_commands.command(name="이벤트", description="특정 번호의 서버 이벤트 정보를 보여줍니다.")
+    @app_commands.describe(index="이벤트 번호 (1부터 시작)")
+    async def show_specific_event(self, interaction: discord.Interaction, index: int):
+        # 채널 확인은 defer 전에 수행해야 ephemeral 응답이 가능함
+        # (공개 defer 이후의 followup은 ephemeral=True가 무시됨)
+        if interaction.channel_id != EVENT_CHANNEL_ID:
+            await interaction.response.send_message("❌ 이 명령어는 이벤트 채널에서만 사용할 수 있습니다.", ephemeral=True)
             return
 
-        events = await ctx.guild.fetch_scheduled_events()
+        # 응답을 예약 (타임아웃 방지)
+        await interaction.response.defer()
+
+        events = await interaction.guild.fetch_scheduled_events()
 
         # 현재 유효한 이벤트만 필터링
         now = datetime.now(timezone.utc)
@@ -27,11 +30,13 @@ def setup_event_commands(bot):
         ]
 
         if not valid_events:
-            await ctx.send("현재 진행 중이거나 예정된 이벤트가 없습니다!")
+            await interaction.followup.send("현재 진행 중이거나 예정된 이벤트가 없습니다!")
             return
 
         if index <= 0 or index > len(valid_events):
-            await ctx.send(f"❌ 잘못된 번호입니다. (1 ~ {len(valid_events)} 사이로 입력하세요)")
+            await interaction.followup.send(
+                f"❌ 잘못된 번호입니다. (1 ~ {len(valid_events)} 사이로 입력하세요)"
+            )
             return
 
         # 유효한 이벤트 리스트에서 선택
@@ -49,15 +54,10 @@ def setup_event_commands(bot):
             remaining_str = f"<t:{unix_timestamp}:R>"
         else:
             remaining_str = "종료 시간 정보 없음"
-
         embed.add_field(name="⏳ 종료까지 남은 시간", value=remaining_str, inline=False)
 
         # 이벤트 작성자 표시
-        if event.creator:
-            creator_mention = event.creator.mention
-        else:
-            creator_mention = "알 수 없음"
-
+        creator_mention = event.creator.mention if event.creator else "알 수 없음"
         embed.add_field(name="👤 이벤트 작성자", value=creator_mention, inline=False)
 
         # 이벤트 위치(주소) 표시
@@ -68,4 +68,7 @@ def setup_event_commands(bot):
         if event.cover_image:
             embed.set_image(url=event.cover_image.url)
 
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(EventNoticeCog(bot))

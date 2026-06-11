@@ -1,6 +1,7 @@
-discord.py==2.6.4
-python-dotenv==1.2.1
-openai==2.14.0 # 2.9.0 -> 2.14.0
-google-genai==1.56.0 # 1.53.0 -> 1.56.0
-tiktoken==0.12.0
-yfinance==1.0 # 0.2.66 -> 1.0
+discord.py==2.7.1
+python-dotenv==1.2.2 # 1.2.1 -> 1.2.2 (보안 패치: GHSA-mf9w-mj56-hr94)
+openai==2.41.0 # 2.14.0 -> 2.41.0
+google-genai==2.8.0 # 1.56.0 -> 2.8.0 (Breaking change는 Interactions API 한정, generate_images 영향 없음)
+tiktoken==0.13.0 # 0.12.0 -> 0.13.0
+yfinance==1.4.1 # 1.0 -> 1.4.1
+pytz==2026.2 # finance_cog.py에서 직접 import하므로 명시적 선언

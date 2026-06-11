@@ -15,12 +15,13 @@
 | 파일명 | 설명 |
 | :--- | :--- |
 | **`main.py`** | 봇의 진입점(Entry Point)입니다. 봇을 실행하고, 다른 모듈(Cogs)들을 로드하며, 디스코드 서버와 연결하는 역할을 합니다. |
-| **`config.py`** | 프로젝트의 환경 변수(API 키, 토큰 등)와 상수(채널 ID, 게임 설정 등)를 관리하는 설정 파일입니다. |
-| **`attendance_module.py`** | **출석체크 및 포인트 시스템**을 담당합니다. 매일 출석을 통해 포인트를 획득하고, 럭키박스(도박), 랭킹 확인, 프로필 조회 등의 기능을 제공합니다. SQLite 데이터베이스(`attendance_data.db`)를 사용합니다. |
-| **`makeparty_module.py`** | **게임 파티 모집 시스템**입니다. '모집', '참가', '나가기' 등의 명령어를 통해 게임별 파티를 구성하고 역할을 분배할 수 있습니다. SQLite 데이터베이스(`party_data.db`)를 사용합니다. |
-| **`hyacine_gpt_5_module.py`** | **OpenAI GPT-5.1 기반의 대화형 AI '히아킨'** 모듈입니다. 사용자와 자연스러운 대화를 나누며, '기본(Instant)' 모드와 '고급(Thinking)' 모드를 제공합니다. 고급 모드 사용 시 포인트를 소모합니다. |
-| **`hyacine_gemini_module.py`** | **Google Gemini (Nano Banana Pro) 기반의 이미지 생성** 모듈입니다. 포인트를 소모하여 사용자가 요청한 그림을 그려줍니다. |
-| **`eventnotify_module.py`** | 디스코드 서버의 **예정된 이벤트 정보**를 조회하고 보여주는 알림 모듈입니다. |
+| **`config.py`** | 프로젝트의 환경 변수(API 키, 토큰, DB 백엔드 등)와 상수(채널 ID, 게임 설정 등)를 관리하는 설정 파일입니다. |
+| **`database.py`** | **DB 접근 추상화 계층(Repository)** 입니다. 모든 SQL이 이 파일에 모여 있으며, 기본 SQLite 외에 MySQL, Oracle 등 외부 DB 구현을 추가해 교체할 수 있습니다. |
+| **`attendance_cog.py`** | **출석체크 및 포인트 시스템**을 담당합니다. 매일 출석을 통해 포인트를 획득하고, 럭키박스(도박), 랭킹 확인, 프로필 조회 등의 기능을 제공합니다. (`attendance_data.db`) |
+| **`playwith_cog.py`** | **게임 파티 모집 시스템**입니다. '모집', '참가', '나가기' 등의 명령어를 통해 게임별 파티를 구성하고 역할을 분배할 수 있습니다. (`party_data.db`) |
+| **`hyacine_chat_cog.py`** | **OpenAI GPT 기반의 대화형 AI '히아킨'** 모듈입니다. 사용자와 자연스러운 대화를 나누며, 채널별로 '기본(GPT-5.4 mini)' 모드와 '고급(GPT-5.5 Thinking)' 모드를 전환할 수 있습니다. 고급 모드 사용 시 포인트를 소모합니다. |
+| **`hyacine_image_cog.py`** | **Google Gemini (Nano Banana 2) 기반의 이미지 생성** 모듈입니다. 포인트를 소모하여 사용자가 요청한 그림을 그려줍니다. |
+| **`eventnotice_cog.py`** | 디스코드 서버의 **예정된 이벤트 정보**를 조회하고 보여주는 알림 모듈입니다. |
 | **`forbiddenfilter_cog.py`** | **강력한 금지어 필터링 시스템**입니다. 2중 필터(기본+변칙 표기 감지)를 통해 '아1니' 같은 회피 시도까지 잡아내며, 출석 모듈과 연동하여 경고 횟수를 기록합니다. |
 | **`finance_cog.py`** | **실시간 금융 시세 조회** 모듈입니다. `/주가` 명령어로 주요 지표(주식, 코인, 유가 등)를 확인합니다. |
 
@@ -28,7 +29,7 @@
 
 ### 🏚️ Legacy Code (`single/`, `module/prefix/`)
 
-*   **`single/`**: 모듈화되기 전, 단일 파일로 기능이 구현되었던 초기 코드들입니다. 현재는 사용되지 않거나 참고용으로 보존되어 있습니다.
+*   **`single/`**: 단순한 임베드 공지 메시지를 전송할 수 있는 일회용 스크립트(`command_prefix.py`) 하나만 템플릿으로 보존되어 있습니다.
 *   **`module/prefix/`**: Slash Command가 도입되기 전, `!`와 같은 접두사(Prefix)를 사용하여 명령어를 처리하던 구버전 모듈들입니다. 현재 프로젝트의 주력은 `module/slash/`의 슬래시 명령어입니다.
 
 ---
@@ -83,45 +84,56 @@ EVENT_CHANNEL_ID = 1234567890...   # 이벤트 알림을 띄울 채널 ID
 
 ---
 
-## ☁️ Cloudtype 배포 가이드
+## ☁️ 클라우드 배포 가이드
 
-이 봇을 **Cloudtype**에 배포하여 24시간 실행하려면 다음 설정을 따라주세요.
-*참고*: 로컬 데이터베이스(SQLite)의 경우 이 봇을 재시작하거나 재배포(업데이트)하면 데이터가 소실됩니다.
-*참고*: 작성자는 실제 서비스를 위해 SQLite -> MariaDB 이주를 선택했습니다.
+이 봇은 Python 앱을 실행할 수 있는 어떤 클라우드 서비스(PaaS, VPS, 컨테이너 등)에도 배포할 수 있습니다. 서비스별 메뉴 이름은 다르지만, 공통적으로 아래 네 가지만 설정하면 됩니다.
 
-### 1. 저장소 준비
-1.  이 프로젝트를 본인의 **GitHub 비공개 저장소(Private Repo)**에 업로드합니다.
-2.  `prohibited_words.json` 파일도 저장소에 포함하거나, 아래의 '파일 마운트' 기능을 이용해야 합니다.
+### 1. 실행 환경
+*   **Python 버전**: `3.11` 이상 권장
+*   **의존성 설치 (빌드 명령어)**: `pip install -r requirements.txt`
+*   **시작 명령어**: `python -m module.slash.main` (프로젝트 루트 기준)
+*   저장소를 사용할 경우 **비공개(Private)** 로 유지하세요.
 
-### 2. Cloudtype 프로젝트 생성
-1.  Cloudtype 대시보드에서 **[새 프로젝트]** -> **[애플리케이션]** -> **[GitHub]**를 선택합니다.
-2.  업로드한 봇 저장소를 선택합니다.
-3.  **언어/프레임워크**: `Python`을 선택합니다.
-4.  **버전**: `3.11` 이상을 권장합니다.
-5.  **빌드 명령어**: `pip install -r requirements.txt` (기본값)
-6.  **시작 명령어**: `python module/slash/main.py`
+### 2. 환경 변수 (Environment Variables)
+배포 플랫폼의 환경 변수(또는 Secret) 설정에 다음을 등록합니다. 비밀 값은 반드시 Secret으로 표시하세요.
 
-### 3. 환경 변수 설정 (Environment Variables)
-배포 설정 화면의 **[환경변수]** 탭에서 다음 변수들을 추가합니다. (비밀 값은 'Secret'으로 설정하세요)
+| 변수 | 필수 | 설명 |
+| :--- | :--- | :--- |
+| `DISCORD_TOKEN` | ✅ | 디스코드 봇 토큰 |
+| `OPENAI_API_KEY` | ✅ | OpenAI API 키 (대화 기능) |
+| `GOOGLE_API_KEY` | ✅ | Google Gemini API 키 (이미지 생성) |
+| `DATA_DIR` | | SQLite DB 파일 저장 경로 (기본값: `data`) |
+| `DB_BACKEND` | | DB 백엔드 선택 (기본값: `sqlite`) |
+| `DB_URL` | | 외부 DB 접속 문자열 (외부 DB 사용 시) |
 
-*   `DISCORD_TOKEN`: 디스코드 봇 토큰
-*   `OPENAI_API_KEY`: OpenAI API 키
-*   `GOOGLE_API_KEY`: Google Gemini API 키
-*   `DATA_DIR`: `/app/data` (데이터가 저장될 경로)
+### 3. 데이터 영속성 (중요!)
+기본 SQLite 사용 시, 컨테이너 기반 플랫폼은 재배포·재시작 때 파일 시스템이 초기화되어 **DB 데이터가 소실됩니다**. 둘 중 하나를 선택하세요.
 
-### 4. 영구 저장소 설정 (Persistent Volume) **(중요!)**
-SQLite 데이터베이스(`attendance_data.db`, `party_data.db`)가 재배포 시에도 초기화되지 않도록 **파일 시스템 연결**이 필요합니다.
+*   **영구 볼륨(Persistent Volume) 마운트**: 플랫폼의 볼륨/파일 시스템 기능으로 디스크를 마운트하고, 마운트 경로를 `DATA_DIR` 환경 변수와 일치시킵니다. (예: `/app/data`)
+*   **외부 DB 사용**: MySQL, Oracle 등 관리형 DB를 쓰면 볼륨 설정이 필요 없습니다. 아래 '외부 DB 연결' 참고.
 
-1.  배포 설정의 **[파일 시스템]** 탭으로 이동합니다.
-2.  **[볼륨 추가]**를 클릭합니다.
-3.  **이름**: `bot-data` (원하는 이름)
-4.  **용량**: `1GB` (무료 플랜 기준 충분함)
-5.  **마운트 경로**: `/app/data` (**환경 변수 `DATA_DIR`과 일치해야 함**)
-6.  설정을 저장하고 배포를 시작합니다.
+### 4. 외부 DB 연결 (선택)
+DB 접근은 `module/slash/database.py`의 Repository 계층으로 추상화되어 있어, Cog 코드를 건드리지 않고 백엔드를 교체할 수 있습니다.
+
+1.  `database.py`에 `AttendanceRepository` / `PartyRepository`를 상속한 구현 클래스를 작성합니다. (SQL placeholder 등 방언 차이만 처리하면 됩니다)
+2.  같은 파일의 `create_attendance_repository` / `create_party_repository` 팩토리에 분기를 추가합니다.
+3.  환경 변수를 설정합니다: `DB_BACKEND=mysql`, `DB_URL=mysql://user:pass@host:3306/botdb`
+
+---
+
+## 🧪 테스트
+
+디스코드 연결 없이 콘솔에서 DB 계층과 핵심 로직을 검증할 수 있습니다.
+
+```bash
+python -m test.console_tests
+```
+
+테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않습니다.
 
 ---
 
 ## ⚠️ 주의사항
 
-*   이 봇은 `attendance_data.db`와 `party_data.db`라는 SQLite 로컬 DB 파일을 생성하여 데이터를 저장합니다. 봇을 재설치하거나 이동할 때 이 파일들을 백업해야 데이터가 유지됩니다.
-*   `prohibited_words.json` 파일이 `settings/` 디렉터리에 있어야 금지어 필터가 정상 작동합니다.
+*   이 봇은 기본적으로 `attendance_data.db`와 `party_data.db`라는 SQLite DB 파일을 `DATA_DIR`(기본값 `data/`)에 생성하여 데이터를 저장합니다. 봇을 재설치하거나 이동할 때 이 파일들을 백업해야 데이터가 유지됩니다.
+*   `forbidden_words.json` 파일이 `settings/` 디렉터리에 있어야 금지어 필터가 정상 작동합니다.

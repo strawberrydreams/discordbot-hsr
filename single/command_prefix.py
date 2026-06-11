@@ -1,14 +1,14 @@
 # Discord Bot / 각 채널에 보낼 임베디드 메시지 템플릿
 
 # 일회용 실행을 위한 파일이므로 prefix 명령어를 사용함
-# 실험실 채널에서 (*실험실)를 입력하면 임베드된 공지 내용을 출력함
+# 명령어 채널에서 (*명령어)를 입력하면 임베드된 공지 내용을 출력함
 
 import discord
 import os
 from discord.ext import commands
 from dotenv import load_dotenv
 
-LABORATORY_CHANNEL_ID = 1
+COMMAND_CHANNEL_ID = 1
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -31,17 +31,18 @@ async def on_ready():
     # await client.change_presence(status=discord.Status.invisible, activity=activity)
 
 # prefix 명령어 등록
-@client.command(name="실험실")
+@client.command(name="명령어")
 async def command_list(ctx):
-    if ctx.channel.id != LABORATORY_CHANNEL_ID:
-        await ctx.send("❌ 이 명령어는 실험실 채널에서만 사용할 수 있습니다.", ephemeral=True)
+    if ctx.channel.id != COMMAND_CHANNEL_ID:
+        # prefix 명령어의 ctx.send는 ephemeral을 지원하지 않음
+        await ctx.send("❌ 이 명령어는 명령어 채널에서만 사용할 수 있습니다.")
         return
-    
+
     embed = discord.Embed(
-        title="🧪 실험실 채널 안내",
+        title="⚙️ 명령어 테스트 채널 안내",
         description=(
-            "이곳은 개발자용 고급 기능 실험실입니다.\n"
-            "Discord의 자체 기능부터 외부 기능까지 모두 실험할 수 있는 테스트 공간입니다.\n"
+            "이곳은 명령어 테스트 채널입니다.\n"
+            "Discord Bot의 명령어를 실험하고 테스트할 수 있는 공간입니다.\n"
             "땅끝소초 서버의 다양한 기능을 안정적으로 적용하기 위해 사용됩니다."
         ),
         color=discord.Color.green()
@@ -50,8 +51,8 @@ async def command_list(ctx):
     embed.add_field(
         name="🔐 접근 권한 안내",
         value=(
-            "- 이 채널은 관리자 및 개발자만 접근할 수 있습니다.\n"
-            "- 일반 유저는 접근 또는 열람이 제한됩니다."
+            "- 이 채널은 관리자 및 테스트 담당자만 접근할 수 있습니다.\n"
+            "- 일반 유저는 접근 또는 열람이 제한됩니다"
         ),
         inline=False
     )
@@ -59,8 +60,8 @@ async def command_list(ctx):
     embed.add_field(
         name="🛠️ 무엇을 할 수 있나요?",
         value=(
-            "- 새로운 Discord 기능 테스트\n"
-            "- 외부 봇 또는 API 연동 기능 실험\n"
+            "- 새로운 Bot 명령어 실험\n"
+            "- 공지/역할 자동화 기능 테스트\n"
             "- 서버 공개 채널에 실제로 적용하기 전 검증 단계"
         ),
         inline=False
@@ -71,8 +72,8 @@ async def command_list(ctx):
 
     await ctx.send(embed=embed)
 
-# 1. .env 파일에서 토큰을 로드
-load_dotenv(dotenv_path="DISCORD_TOKEN.env")
+# 1. .env 파일에서 토큰을 로드 (프로젝트 루트에서 실행 기준)
+load_dotenv(dotenv_path="settings/DISCORD_TOKEN.env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 client.run(TOKEN)
