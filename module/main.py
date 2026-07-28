@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from module.backup import verify_database
+from module.backup import DATABASES, verify_database
 from module.config import BACKUP_DIR, DATA_DIR, DISCORD_TOKEN, validate_config
 
 # 실행 커맨드: python -m module.main
@@ -30,12 +30,15 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
+        for filename, required_tables in DATABASES.items():
+            verify_database(DATA_DIR / filename, required_tables)
+
         for extension in EXTENSIONS:
             await self.load_extension(extension)
             print(f"🧩 Loaded extension: {extension}")
 
-        verify_database(DATA_DIR / "attendance_data.db", {"users"})
-        verify_database(DATA_DIR / "party_data.db", {"parties", "participants"})
+        for filename, required_tables in DATABASES.items():
+            verify_database(DATA_DIR / filename, required_tables)
         await self.tree.sync()
         print("🔄 Command tree synced")
 

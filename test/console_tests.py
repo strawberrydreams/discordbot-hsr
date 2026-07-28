@@ -14,6 +14,8 @@
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
 import datetime
+import asyncio
+import importlib
 import os
 import pathlib
 import shutil
@@ -22,6 +24,7 @@ import stat
 import sys
 import tempfile
 import threading
+from unittest.mock import patch
 
 # module.* import 전에 환경 변수를 설정해야 함
 _TMP_DIR = pathlib.Path(tempfile.mkdtemp(prefix="hsr_test_"))
@@ -93,6 +96,116 @@ def test_forbidden_words_fail_fast():
         check("금지어 JSON 구조 오류 거부", False)
     except RuntimeError:
         check("금지어 JSON 구조 오류 거부", True)
+
+
+def test_startup_verifies_before_loading_cogs():
+    import module.main as main
+
+    events = []
+
+    class FakeTree:
+        async def sync(self):
+            events.append("sync")
+
+    class FakeBot:
+        tree = FakeTree()
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+
+    def verify(path, tables):
+        events.append(f"verify:{path.name}:{','.join(sorted(tables))}")
+        return {}
+
+    with patch.object(main, "verify_database", side_effect=verify):
+        asyncio.run(main.MyBot.setup_hook(FakeBot()))
+
+    expected = [
+        "verify:attendance_data.db:users",
+        "verify:party_data.db:participants,parties",
+        *(f"load:{extension}" for extension in main.EXTENSIONS),
+        "verify:attendance_data.db:users",
+        "verify:party_data.db:participants,parties",
+        "sync",
+    ]
+    check("시작 시 DB 검증-모든 Cog-재검증-sync 순서", events == expected, f"({events})")
+
+
+def test_startup_preverification_failure_stops_cogs_and_sync():
+    import module.main as main
+
+    events = []
+
+    class FakeBot:
+        class tree:
+            @staticmethod
+            async def sync():
+                events.append("sync")
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+
+    def fail_verify(path, tables):
+        events.append(f"verify:{path.name}")
+        raise RuntimeError("missing production database")
+
+    with patch.object(main, "verify_database", side_effect=fail_verify):
+        try:
+            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            check("사전 DB 검증 실패 전파", False)
+        except RuntimeError:
+            check("사전 DB 검증 실패 전파", True)
+    check("사전 DB 검증 실패 시 Cog와 sync 미실행", events == ["verify:attendance_data.db"], f"({events})")
+
+
+def test_startup_cog_failure_stops_postverification_and_sync():
+    import module.main as main
+
+    events = []
+
+    class FakeBot:
+        class tree:
+            @staticmethod
+            async def sync():
+                events.append("sync")
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+            if extension == main.EXTENSIONS[1]:
+                raise RuntimeError("broken cog")
+
+    def verify(path, tables):
+        events.append(f"verify:{path.name}")
+        return {}
+
+    with patch.object(main, "verify_database", side_effect=verify):
+        try:
+            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            check("Cog 로드 실패 전파", False)
+        except RuntimeError:
+            check("Cog 로드 실패 전파", True)
+    check(
+        "Cog 로드 실패 시 사후 검증과 sync 미실행",
+        events == [
+            "verify:attendance_data.db",
+            "verify:party_data.db",
+            f"load:{main.EXTENSIONS[0]}",
+            f"load:{main.EXTENSIONS[1]}",
+        ],
+        f"({events})",
+    )
+
+
+def test_importing_main_does_not_construct_bot():
+    sys.modules.pop("module.main", None)
+    from discord.ext import commands
+
+    with patch.object(commands.Bot, "__init__", side_effect=AssertionError("bot constructed")):
+        try:
+            importlib.import_module("module.main")
+            check("main import는 Bot을 생성하지 않음", True)
+        except AssertionError:
+            check("main import는 Bot을 생성하지 않음", False)
 
 
 def test_migration() -> SQLiteAttendanceRepository:
@@ -515,6 +628,10 @@ if __name__ == "__main__":
         test_config_paths()
         test_config_validation()
         test_forbidden_words_fail_fast()
+        test_startup_verifies_before_loading_cogs()
+        test_startup_preverification_failure_stops_cogs_and_sync()
+        test_startup_cog_failure_stops_postverification_and_sync()
+        test_importing_main_does_not_construct_bot()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_play_luckybox(repo)
