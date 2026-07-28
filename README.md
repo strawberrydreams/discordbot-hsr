@@ -1,138 +1,237 @@
-# 🤖 개인용 디스코드 봇 프로젝트 (Discord Bot HSR)
+# Discord Bot HSR 운영 런북
 
-이미지
+개인 디스코드 서버용 봇입니다. 운영 백엔드는 **SQLite만 지원**합니다. 모든 DB SQL은 `module/database.py`의 Repository 구현에 모여 있고 Cog는 Repository 인터페이스를 사용합니다. 이 내부 경계는 기능 코드와 저장 코드를 분리하기 위한 것이며, MySQL·Oracle 같은 외부 DB 배포는 구현되어 있지 않습니다.
 
-이 프로젝트는 **개인적인 디스코드 서버에서 사용하기 위해 제작된 커스텀 봇**입니다. 작성자의 개인적인 필요와 서버 환경에 맞춰 개발되었으며, 특정 커뮤니티의 편의 기능을 제공하는 데 초점을 맞추고 있습니다.
+## 공개 저장소와 로컬 비밀정보
 
-## 📂 프로젝트 구조 및 모듈 설명
+이 저장소는 공개 상태로 운영할 수 있습니다. `.env`, 실제 `settings/forbidden_words.json`, `runtime/`의 DB·백업·로그는 Git에서 추적하지 않으며 Docker 이미지에도 포함되지 않습니다. 실제 비밀 값은 운영 호스트에만 둡니다.
 
-이 프로젝트의 핵심 기능은 `module/` 디렉터리에 모듈화되어 있습니다.
+다음 파일은 예제에서 로컬로 복사해 편집하고, 어떤 경우에도 `git add -f`로 강제 추가하지 마세요.
 
-### `module/` (핵심 기능)
+- `.env`: Discord/OpenAI/Google 키, 서버 ID, 런타임 경로
+- `settings/forbidden_words.json`: 실제 금지어 목록
 
-이 디렉터리의 파일들은 디스코드의 **Slash Command (슬래시 명령어)** 기능을 기반으로 동작하는 최신 코드들입니다.
-
-| 파일명 | 설명 |
-| :--- | :--- |
-| **`main.py`** | 봇의 진입점(Entry Point)입니다. 봇을 실행하고, 다른 모듈(Cogs)들을 로드하며, 디스코드 서버와 연결하는 역할을 합니다. |
-| **`config.py`** | 프로젝트의 환경 변수(API 키, 토큰, DB 백엔드 등)와 상수(채널 ID, 게임 설정 등)를 관리하는 설정 파일입니다. |
-| **`database.py`** | **DB 접근 추상화 계층(Repository)** 입니다. 모든 SQL이 이 파일에 모여 있으며, 기본 SQLite 외에 MySQL, Oracle 등 외부 DB 구현을 추가해 교체할 수 있습니다. |
-| **`attendance_cog.py`** | **출석체크 및 포인트 시스템**을 담당합니다. 매일 출석을 통해 포인트를 획득하고, 럭키박스(도박), 랭킹 확인, 프로필 조회 등의 기능을 제공합니다. (`attendance_data.db`) |
-| **`playwith_cog.py`** | **게임 파티 모집 시스템**입니다. '모집', '참가', '나가기' 등의 명령어를 통해 게임별 파티를 구성하고 역할을 분배할 수 있습니다. (`party_data.db`) |
-| **`hyacine_chat_cog.py`** | **OpenAI GPT 기반의 대화형 AI '히아킨'** 모듈입니다. 사용자와 자연스러운 대화를 나누며, 채널별로 '기본(GPT-5.4 mini)' 모드와 '고급(GPT-5.5 Thinking)' 모드를 전환할 수 있습니다. 고급 모드 사용 시 포인트를 소모합니다. |
-| **`hyacine_image_cog.py`** | **Google Gemini (Nano Banana 2) 기반의 이미지 생성** 모듈입니다. 포인트를 소모하여 사용자가 요청한 그림을 그려줍니다. |
-| **`eventnotice_cog.py`** | 디스코드 서버의 **예정된 이벤트 정보**를 조회하고 보여주는 알림 모듈입니다. |
-| **`forbiddenfilter_cog.py`** | **강력한 금지어 필터링 시스템**입니다. 2중 필터(기본+변칙 표기 감지)를 통해 '아1니' 같은 회피 시도까지 잡아내며, 출석 모듈과 연동하여 경고 횟수를 기록합니다. |
-| **`finance_cog.py`** | **실시간 금융 시세 조회** 모듈입니다. `/주가` 명령어로 주요 지표(주식, 코인, 유가 등)를 확인합니다. |
-
----
-
-### 🏚️ Legacy Code (`single/`)
-
-*   **`single/`**: 단순한 임베드 공지 메시지를 전송할 수 있는 일회용 스크립트(`command_prefix.py`) 하나만 템플릿으로 보존되어 있습니다.
-
----
-
-## 🛠️ 사용 및 커스텀 가이드
-
-이 봇을 당신의 개인 서버에 맞게 커스텀하여 사용하려면 다음 단계가 필요합니다.
-
-### 1. 필수 설정 (`config.py` 및 환경 변수)
-
-`settings/` 디렉터리에 다음 `.env` 파일들을 생성하고 키를 입력해야 합니다.
-
-*   `DISCORD_TOKEN.env`: `DISCORD_TOKEN=your_token_here`
-*   `OPENAI_API_KEY.env`: `OPENAI_API_KEY=sk-...`
-*   `GOOGLE_API_KEY.env`: `GOOGLE_API_KEY=AIza...`
-
-또한 `module/config.py` 파일에서 다음 ID들을 본인의 서버에 맞게 수정해야 합니다.
-
-```python
-# module/config.py
-
-RECRUIT_CHANNEL_ID = 1234567890... # 파티 모집을 진행할 채널 ID
-EVENT_CHANNEL_ID = 1234567890...   # 이벤트 알림을 띄울 채널 ID
-```
-
-### 2. 주요 명령어 (Slash Commands)
-
-봇이 실행되면 디스코드 입력창에서 `/`를 눌러 다음 명령어들을 사용할 수 있습니다.
-
-#### 📝 출석 & 포인트
-*   `/출석`: 매일 포인트를 획득합니다.
-*   `/지갑`: 내 포인트 잔액을 확인합니다.
-*   `/럭키박스 [금액]`: 포인트를 걸고 도박을 합니다.
-*   `/랭킹`: 포인트 부자 순위를 봅니다.
-*   `/프로필 [유저]`: 유저의 상세 정보를 봅니다.
-
-#### 🎮 파티 모집
-*   `/모집`: (모집 채널 전용) 게임 파티 모집창을 띄웁니다.
-*   `/참가`, `/나가기`: 파티에 참여하거나 나갑니다.
-*   `/파티`: 현재 모집 중인 파티 현황을 봅니다.
-
-#### 🤖 AI (히아킨)
-*   `/대화 [내용]`: 히아킨과 대화합니다.
-*   `/이미지 [프롬프트]`: 그림을 그려달라고 요청합니다 (포인트 소모).
-*   `/고급`, `/기본`: GPT 모델을 전환합니다.
-
-#### 🛡️ 기타
-*   `/이벤트 [번호]`: 서버 이벤트를 확인합니다.
-
-#### 📈 금융
-*   `/주가`: 주요 금융 지표(S&P500, 나스닥, 국채, 유가, 비트코인 등)의 실시간 시세를 조회합니다.
-
----
-
-## ☁️ 클라우드 배포 가이드
-
-이 봇은 Python 앱을 실행할 수 있는 클라우드 서비스에 배포할 수 있습니다.
-
-### 1. 실행 환경
-*   **Python 버전**: `3.11` 이상 권장
-*   **의존성 설치 (빌드 명령어)**: `pip install -r requirements.txt`
-*   **시작 명령어**: `python -m module.main` (프로젝트 루트 기준)
-*   저장소를 사용할 경우 **비공개(Private)** 로 유지하세요.
-
-### 2. 환경 변수 (Environment Variables)
-배포 플랫폼의 환경 변수(또는 Secret) 설정에 다음을 등록합니다. 비밀 값은 반드시 Secret으로 표시하세요.
-
-| 변수 | 필수 | 설명 |
-| :--- | :--- | :--- |
-| `DISCORD_TOKEN` | ✅ | 디스코드 봇 토큰 |
-| `OPENAI_API_KEY` | ✅ | OpenAI API 키 (대화 기능) |
-| `GOOGLE_API_KEY` | ✅ | Google Gemini API 키 (이미지 생성) |
-| `DATA_DIR` | | SQLite DB 파일 저장 경로 (기본값: `data`) |
-| `DB_BACKEND` | | DB 백엔드 선택 (기본값: `sqlite`) |
-| `DB_URL` | | 외부 DB 접속 문자열 (외부 DB 사용 시) |
-
-### 3. 데이터 영속성 (중요!)
-기본 SQLite 사용 시, 컨테이너 기반 플랫폼은 재배포·재시작 때 파일 시스템이 초기화되어 **DB 데이터가 소실됩니다**. 둘 중 하나를 선택하세요.
-
-*   **영구 볼륨(Persistent Volume) 마운트**: 플랫폼의 볼륨/파일 시스템 기능으로 디스크를 마운트하고, 마운트 경로를 `DATA_DIR` 환경 변수와 일치시킵니다. (예: `/app/data`)
-*   **외부 DB 사용**: MySQL, Oracle 등 관리형 DB를 쓰면 볼륨 설정이 필요 없습니다. 아래 '외부 DB 연결' 참고.
-
-### 4. 외부 DB 연결 (선택)
-DB 접근은 `module/database.py`의 Repository 계층으로 추상화되어 있어, Cog 코드를 건드리지 않고 백엔드를 교체할 수 있습니다.
-
-1.  `database.py`에 `AttendanceRepository` / `PartyRepository`를 상속한 구현 클래스를 작성합니다. (SQL placeholder 등 방언 차이만 처리하면 됩니다)
-2.  같은 파일의 `create_attendance_repository` / `create_party_repository` 팩토리에 분기를 추가합니다.
-3.  환경 변수를 설정합니다: `DB_BACKEND=mysql`, `DB_URL=mysql://user:pass@host:3306/botdb`
-
----
-
-## 🧪 테스트
-
-디스코드 연결 없이 콘솔에서 DB 계층과 핵심 로직을 검증할 수 있습니다.
+확인:
 
 ```bash
-python -m test.console_tests
+git check-ignore -v .env settings/forbidden_words.json runtime/data/attendance_data.db
+git ls-files .env settings/forbidden_words.json runtime
 ```
 
-테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않습니다.
+두 번째 명령은 아무것도 출력하지 않아야 합니다.
 
----
+## 최초 설치
 
-## ⚠️ 주의사항
+저장소 루트에서 실행합니다. Python 3.11 이상이 필요합니다.
 
-*   이 봇은 기본적으로 `attendance_data.db`와 `party_data.db`라는 SQLite DB 파일을 `DATA_DIR`(기본값 `data/`)에 생성하여 데이터를 저장합니다. 봇을 재설치하거나 이동할 때 이 파일들을 백업해야 데이터가 유지됩니다.
-*   `forbidden_words.json` 파일이 `settings/` 디렉터리에 있어야 금지어 필터가 정상 작동합니다.
+```bash
+cp .env.example .env
+cp settings/forbidden_words.example.json settings/forbidden_words.json
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m test.console_tests
+```
+
+`.env`의 빈 키와 ID, 실제 금지어 목록을 로컬에서 편집한 뒤 런타임 디렉터리를 만듭니다.
+
+```bash
+mkdir -p runtime/data runtime/backups runtime/logs
+```
+
+봇은 기존 DB를 자동 복구하거나 새로 만들지 않고, Cog를 로드하기 전에 무결성을 검사합니다. 따라서 최초 1회에 한해 Repository 팩토리로 두 DB를 생성하거나 기존 스키마를 마이그레이션하고, 같은 프로세스에서 `module.backup.verify_database`로 검사합니다.
+
+```bash
+.venv/bin/python -c 'from module.database import create_attendance_repository, create_party_repository; from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; create_attendance_repository(); create_party_repository(); [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
+```
+
+이 명령은 **초기화 전용**이며 백업에서 데이터를 복원하지 않습니다. 기존 운영 DB가 있다면 먼저 아래 복구 절차로 검증·복원하고, 빈 DB로 덮어쓰지 마세요.
+
+초기 백업도 만들고 검사합니다.
+
+```bash
+.venv/bin/python -m module.backup create
+.venv/bin/python -m module.backup verify
+.venv/bin/python -m module.backup restore-test
+```
+
+## 실행 방식 선택
+
+**launchd와 Docker를 동시에 실행하면 안 됩니다.** 같은 Discord 토큰과 SQLite 파일을 두 프로세스가 함께 사용하게 됩니다. 운영 호스트에서는 아래 방식 중 하나만 선택하세요.
+
+### macOS LaunchAgent
+
+제공된 plist는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 템플릿의 Python, 작업 디렉터리, 로그 경로를 먼저 수정합니다.
+
+최초 설치:
+
+```bash
+mkdir -p "$HOME/Library/LaunchAgents" runtime/logs
+cp deploy/macos/com.discordbot.hsr.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
+cp deploy/macos/com.discordbot.hsr-backup.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
+```
+
+상태와 로그:
+
+```bash
+launchctl print gui/$(id -u)/com.discordbot.hsr
+tail -n 100 runtime/logs/bot.log
+tail -n 100 runtime/logs/bot-error.log
+```
+
+LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 잠들면 봇과 예약 백업도 중단됩니다.
+
+### Docker Desktop
+
+Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
+
+Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
+
+```bash
+docker compose build
+docker compose up -d
+docker compose logs --tail=100 bot
+```
+
+Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
+
+## 백업 운영
+
+수동 점검:
+
+```bash
+.venv/bin/python -m module.backup create
+.venv/bin/python -m module.backup verify
+.venv/bin/python -m module.backup restore-test
+```
+
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker 주기와 보존 기간은 `.env`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. launchd 주기는 plist의 `StartInterval`을 사용하므로 변경 시 설치된 plist도 수정하고 다시 bootstrap해야 합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+
+`runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
+
+## 검증된 백업으로 실제 복구
+
+복구는 자동화하지 않습니다. 운영자가 manifest와 각 덮어쓰기를 직접 확인해야 합니다.
+
+1. 실행 방식에 맞게 봇을 반드시 중지합니다. 복구 중간 상태가 예약 백업되지 않도록 백업 서비스도 함께 중지합니다.
+
+```bash
+# launchd
+launchctl bootout gui/$(id -u)/com.discordbot.hsr
+launchctl bootout gui/$(id -u)/com.discordbot.hsr-backup
+
+# 또는 Docker
+docker compose stop bot
+docker compose stop backup
+```
+
+2. 복구할 manifest를 직접 선택하고, 그 백업을 임시 디렉터리에 복사해 검사합니다.
+
+```bash
+ls -1 runtime/backups/*-manifest.json
+MANIFEST=runtime/backups/20260728T000000Z-manifest.json
+.venv/bin/python -c 'from pathlib import Path; from module.backup import restore_test; import sys; restore_test(Path(sys.argv[1]))' "$MANIFEST"
+```
+
+3. 현재 live DB 두 개를 타임스탬프가 붙은 비상 디렉터리에 보존합니다.
+
+```bash
+EMERGENCY_DIR="runtime/emergency-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir "$EMERGENCY_DIR"
+cp -p runtime/data/attendance_data.db runtime/data/party_data.db "$EMERGENCY_DIR"/
+ls -l "$EMERGENCY_DIR"
+```
+
+4. 선택한 백업의 타임스탬프와 파일명을 확인한 뒤, `cp -i`가 묻는 각 덮어쓰기에 운영자가 승인합니다.
+
+```bash
+STAMP=${MANIFEST##*/}
+STAMP=${STAMP%-manifest.json}
+ls -l "runtime/backups/${STAMP}-attendance_data.db" "runtime/backups/${STAMP}-party_data.db"
+cp -ip "runtime/backups/${STAMP}-attendance_data.db" runtime/data/attendance_data.db
+cp -ip "runtime/backups/${STAMP}-party_data.db" runtime/data/party_data.db
+```
+
+5. 복원된 live DB에 `PRAGMA integrity_check`와 필수 테이블 검사를 실행합니다.
+
+```bash
+.venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
+```
+
+6. 봇을 시작합니다.
+
+```bash
+# launchd
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+
+# 또는 Docker
+docker compose start bot
+docker compose start backup
+```
+
+7. 로그에 startup 오류가 없는지 확인하고 Discord에서 `/지갑`, `/랭킹`, `/파티`, `/프로필`을 읽어 포인트·순위·파티·금지어 경고 횟수를 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본을 보존하세요.
+
+## 배포
+
+변경을 모아 한 번에 배포합니다. 먼저 pull 전 커밋을 별도로 기록합니다.
+
+```bash
+git rev-parse HEAD
+```
+
+아래 순서를 바꾸지 않습니다: **테스트 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**. 테스트나 백업 명령 하나라도 실패하면 즉시 중단하며 재시작하지 않습니다.
+
+macOS:
+
+```bash
+git pull --ff-only
+.venv/bin/python -m test.console_tests
+.venv/bin/python -m module.backup create
+.venv/bin/python -m module.backup verify
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
+tail -n 100 runtime/logs/bot.log
+```
+
+Docker:
+
+```bash
+git pull --ff-only
+.venv/bin/python -m test.console_tests
+docker compose run --rm backup python -m module.backup create
+docker compose run --rm backup python -m module.backup verify
+docker compose build bot
+docker compose up -d --no-deps bot
+docker compose logs --tail=100 bot
+```
+
+## 코드 롤백
+
+시작 실패 시 pull 전에 기록한 커밋으로 돌아갑니다. 운영자가 변경 내용을 확인한 뒤 공유 브랜치라면 정상 `git revert <문제-커밋>`, 이 호스트만 임시 복구한다면 승인한 이전 커밋으로 `git checkout <이전-커밋>`을 사용합니다. `git reset --hard`는 사용하지 않습니다.
+
+코드를 되돌린 뒤 테스트를 다시 통과시키고, 선택한 실행 방식으로 한 번만 재시작합니다.
+
+```bash
+.venv/bin/python -m test.console_tests
+
+# macOS
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
+
+# 또는 Docker
+docker compose build bot
+docker compose up -d --no-deps bot
+```
+
+DB 복구가 필요한 경우에만 위의 수동 복구 절차를 별도로 따릅니다.
+
+## 호스트 한계
+
+- Mac 절전은 LaunchAgent와 Docker Desktop 컨테이너를 모두 중단시킵니다.
+- Docker 방식은 Docker Desktop이 로그인 시 시작되어야 합니다.
+- LaunchAgent는 로그인한 사용자 세션에서 실행됩니다.
+- 네트워크 또는 전원 장애가 나면 어떤 방식이든 봇이 오프라인이 됩니다.
