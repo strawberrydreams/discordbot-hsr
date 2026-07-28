@@ -320,6 +320,52 @@ def test_imports():
             check(f"import {m}", False, f"({e})")
 
 
+def test_backup_round_trip():
+    import module.backup as backup
+
+    backup.DATA_DIR = _TMP_DIR
+    backup.BACKUP_DIR = _TMP_DIR / "backups"
+    SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(77, 1234)
+    SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
+        "LOL",
+        datetime.datetime.now(),
+    )
+
+    manifest = backup.create_backup_set()
+    result = backup.verify_backup_set(manifest)
+    check("출석 DB 백업 검증", result["attendance_data.db"]["users"] == 1)
+    check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
+    backup.restore_test(manifest)
+    check("백업 복구 테스트", True)
+
+
+def test_corrupt_backup_rejected():
+    import module.backup as backup
+
+    corrupt = _TMP_DIR / "corrupt.db"
+    corrupt.write_bytes(b"not-a-sqlite-database")
+    try:
+        backup.verify_database(corrupt, {"users"})
+        check("손상 백업 거부", False)
+    except RuntimeError:
+        check("손상 백업 거부", True)
+
+
+def test_malformed_manifest_rejected():
+    import module.backup as backup
+
+    malformed = _TMP_DIR / "malformed-manifest.json"
+    malformed.write_text(
+        '{"databases": [{"source": [], "backup": "backup.db"}]}',
+        encoding="utf-8",
+    )
+    try:
+        backup.verify_backup_set(malformed)
+        check("잘못된 manifest 거부", False)
+    except RuntimeError:
+        check("잘못된 manifest 거부", True)
+
+
 if __name__ == "__main__":
     try:
         test_config_paths()
@@ -332,6 +378,9 @@ if __name__ == "__main__":
         test_cog_facade()
         test_channel_sessions()
         test_imports()
+        test_backup_round_trip()
+        test_corrupt_backup_rejected()
+        test_malformed_manifest_rejected()
     finally:
         shutil.rmtree(_TMP_DIR, ignore_errors=True)  # 임시 DB 정리
 
