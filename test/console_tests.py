@@ -564,6 +564,104 @@ def test_backup_round_trip():
     check("백업 복구 테스트", True)
 
 
+def test_invalid_backup_settings_prevent_creation():
+    import module.backup as backup
+
+    for name, value in (
+        ("BACKUP_INTERVAL_SECONDS", 0),
+        ("BACKUP_INTERVAL_SECONDS", -1),
+        ("BACKUP_RETENTION_DAYS", 0),
+        ("BACKUP_RETENTION_DAYS", -1),
+    ):
+        backup.DATA_DIR = _TMP_DIR / f"invalid-create-data-{name}-{value}"
+        backup.BACKUP_DIR = _TMP_DIR / f"invalid-create-{name}-{value}"
+        backup.BACKUP_INTERVAL_SECONDS = 21600
+        backup.BACKUP_RETENTION_DAYS = 30
+        setattr(backup, name, value)
+
+        try:
+            backup.create_backup_set()
+            rejected = False
+        except Exception as exc:
+            rejected = isinstance(exc, RuntimeError) and name in str(exc)
+
+        check(f"{name}={value} 백업 생성 거부", rejected)
+        check(
+            f"{name}={value} 생성 부작용 없음",
+            not backup.BACKUP_DIR.exists(),
+        )
+    backup.BACKUP_INTERVAL_SECONDS = 21600
+    backup.BACKUP_RETENTION_DAYS = 30
+
+
+def test_invalid_retention_prevents_pruning():
+    import module.backup as backup
+
+    for value in (0, -1):
+        backup.DATA_DIR = _TMP_DIR / f"invalid-prune-data-{value}"
+        backup.BACKUP_DIR = _TMP_DIR / f"invalid-prune-backups-{value}"
+        backup.BACKUP_INTERVAL_SECONDS = 21600
+        backup.BACKUP_RETENTION_DAYS = 30
+        SQLiteAttendanceRepository(
+            backup.DATA_DIR / "attendance_data.db"
+        ).add_points(1, 100)
+        SQLitePartyRepository(
+            backup.DATA_DIR / "party_data.db"
+        ).create_party("LOL", datetime.datetime.now())
+        created_at = datetime.datetime(
+            2026,
+            1,
+            1,
+            tzinfo=datetime.timezone.utc,
+        )
+        manifest = backup.create_backup_set(created_at)
+        backup.BACKUP_RETENTION_DAYS = value
+
+        try:
+            backup.prune_backups(created_at + datetime.timedelta(days=1))
+            rejected = False
+        except RuntimeError as exc:
+            rejected = "BACKUP_RETENTION_DAYS" in str(exc)
+
+        check(f"BACKUP_RETENTION_DAYS={value} 정리 거부", rejected)
+        check(f"BACKUP_RETENTION_DAYS={value} 백업 보존", manifest.exists())
+    backup.BACKUP_RETENTION_DAYS = 30
+
+
+def test_invalid_interval_prevents_loop_entry():
+    import module.backup as backup
+
+    for value in (0, -1):
+        backup.DATA_DIR = _TMP_DIR / f"invalid-loop-data-{value}"
+        backup.BACKUP_DIR = _TMP_DIR / f"invalid-loop-backups-{value}"
+        backup.BACKUP_INTERVAL_SECONDS = value
+        backup.BACKUP_RETENTION_DAYS = 30
+
+        with (
+            patch.object(sys, "argv", ["backup", "loop"]),
+            patch.object(
+                backup.time,
+                "sleep",
+                side_effect=AssertionError("backup loop entered"),
+            ),
+        ):
+            try:
+                backup.main()
+                rejected = False
+            except Exception as exc:
+                rejected = (
+                    isinstance(exc, RuntimeError)
+                    and "BACKUP_INTERVAL_SECONDS" in str(exc)
+                )
+
+        check(f"BACKUP_INTERVAL_SECONDS={value} loop 거부", rejected)
+        check(
+            f"BACKUP_INTERVAL_SECONDS={value} loop 부작용 없음",
+            not backup.BACKUP_DIR.exists(),
+        )
+    backup.BACKUP_INTERVAL_SECONDS = 21600
+
+
 def test_backup_same_timestamp_rejected():
     import module.backup as backup
 
@@ -715,6 +813,34 @@ def test_malformed_manifest_rejected():
         check("잘못된 manifest 거부", True)
 
 
+def test_prune_skips_invalid_utf8_manifest():
+    import module.backup as backup
+
+    backup.BACKUP_DIR = _TMP_DIR / "invalid-utf8-backups"
+    backup.BACKUP_RETENTION_DAYS = 30
+    backup.BACKUP_DIR.mkdir()
+    expired = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
+    current = backup.BACKUP_DIR / "20260728T000000Z-manifest.json"
+    unrelated = backup.BACKUP_DIR / "keep-me.txt"
+    expired.write_bytes(b"\xff")
+    current.write_bytes(b"\xff")
+    unrelated.write_text("keep", encoding="utf-8")
+
+    try:
+        deleted = backup.prune_backups(
+            datetime.datetime(2026, 7, 28, tzinfo=datetime.timezone.utc)
+        )
+        skipped = deleted == 0
+    except Exception:
+        skipped = False
+
+    check("잘못된 UTF-8 manifest 정리 중 건너뜀", skipped)
+    check(
+        "잘못된 UTF-8 manifest가 현재/무관 데이터 보존",
+        expired.exists() and current.exists() and unrelated.exists(),
+    )
+
+
 if __name__ == "__main__":
     try:
         test_config_paths()
@@ -736,11 +862,15 @@ if __name__ == "__main__":
         test_channel_sessions()
         test_imports()
         test_backup_round_trip()
+        test_invalid_backup_settings_prevent_creation()
+        test_invalid_retention_prevents_pruning()
+        test_invalid_interval_prevents_loop_entry()
         test_backup_same_timestamp_rejected()
         test_prune_requires_timestamp_bound_filenames()
         test_backup_publication_is_synced()
         test_corrupt_backup_rejected()
         test_malformed_manifest_rejected()
+        test_prune_skips_invalid_utf8_manifest()
     finally:
         shutil.rmtree(_TMP_DIR, ignore_errors=True)  # 임시 DB 정리
 

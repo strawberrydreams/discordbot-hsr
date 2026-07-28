@@ -27,7 +27,7 @@ git ls-files --error-unmatch .env.example
 
 ## 최초 설치
 
-저장소 루트에서 실행합니다. Python 3.11 이상이 필요합니다.
+저장소 루트에서 실행합니다. Python 3.12 이상이 필요합니다.
 
 ```bash
 touch .env.secrets .env.runtime

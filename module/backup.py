@@ -25,6 +25,16 @@ DATABASES = {
 }
 
 
+def _require_positive(name: str, value: int) -> None:
+    if value <= 0:
+        raise RuntimeError(f"{name}는 양의 정수여야 합니다.")
+
+
+def _validate_backup_settings() -> None:
+    _require_positive("BACKUP_INTERVAL_SECONDS", BACKUP_INTERVAL_SECONDS)
+    _require_positive("BACKUP_RETENTION_DAYS", BACKUP_RETENTION_DAYS)
+
+
 def verify_database(path: Path, required_tables: set[str]) -> dict[str, int]:
     if not path.is_file():
         raise RuntimeError(f"DB 파일이 없습니다: {path}")
@@ -112,6 +122,7 @@ def _create_backup_directory() -> None:
 
 
 def create_backup_set(now: datetime | None = None) -> Path:
+    _validate_backup_settings()
     _create_backup_directory()
     with (BACKUP_DIR / ".backup.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -181,7 +192,7 @@ def _load_manifest(manifest_path: Path) -> dict:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         items = manifest["databases"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RuntimeError(f"백업 manifest를 읽을 수 없습니다: {manifest_path}") from exc
 
     if not isinstance(items, list):
@@ -261,6 +272,7 @@ def _under_data_dir(path: Path) -> bool:
 
 
 def prune_backups(now: datetime | None = None) -> int:
+    _require_positive("BACKUP_RETENTION_DAYS", BACKUP_RETENTION_DAYS)
     cutoff = _utc(now) - timedelta(days=BACKUP_RETENTION_DAYS)
     deleted = 0
 
@@ -326,6 +338,7 @@ def main() -> int:
         restore_test(latest_manifest())
         return 0
 
+    _validate_backup_settings()
     while True:
         try:
             print(create_backup_set())
