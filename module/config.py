@@ -6,7 +6,16 @@ from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+SECRETS_ENV_FILE = PROJECT_ROOT / ".env.secrets"
+RUNTIME_ENV_FILE = PROJECT_ROOT / ".env.runtime"
+
+
+def _load_env_files(project_root: Path = PROJECT_ROOT) -> None:
+    load_dotenv(project_root / ".env.secrets")
+    load_dotenv(project_root / ".env.runtime")
+
+
+_load_env_files()
 
 
 def _path_from_env(name: str, default: str) -> Path:

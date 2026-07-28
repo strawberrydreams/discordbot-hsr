@@ -4,6 +4,8 @@
 .venv
 venv
 .env
+.env.secrets
+.env.runtime
 settings/*.env
 settings/forbidden_words.json
 runtime

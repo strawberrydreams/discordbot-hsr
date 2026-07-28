@@ -21,13 +21,17 @@ import pathlib
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 from unittest.mock import patch
 
+from dotenv import dotenv_values
+
 # module.* import 전에 환경 변수를 설정해야 함
 _TMP_DIR = pathlib.Path(tempfile.mkdtemp(prefix="hsr_test_"))
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 os.environ["DATA_DIR"] = str(_TMP_DIR)
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
@@ -77,6 +81,88 @@ def test_config_validation():
             check("Discord 토큰 누락 거부", "DISCORD_TOKEN" in str(exc))
     finally:
         config.DISCORD_TOKEN = original
+
+
+def test_split_env_loading():
+    import module.config as config
+
+    root = _TMP_DIR / "split-env"
+    root.mkdir()
+    (root / ".env.secrets").write_text(
+        "OPENAI_API_KEY=file-secret\n"
+        "GOOGLE_API_KEY=file-google\n"
+        "OVERLAP_TEST=secrets-win\n",
+        encoding="utf-8",
+    )
+    (root / ".env.runtime").write_text(
+        "RECRUIT_CHANNEL_ID=123\n"
+        "OVERLAP_TEST=runtime-loses\n",
+        encoding="utf-8",
+    )
+
+    names = (
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "RECRUIT_CHANNEL_ID",
+        "OVERLAP_TEST",
+    )
+    original = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        os.environ["GOOGLE_API_KEY"] = "process-wins"
+        config._load_env_files(root)
+        check("secrets 파일 로드", os.environ["OPENAI_API_KEY"] == "file-secret")
+        check("runtime 파일 로드", os.environ["RECRUIT_CHANNEL_ID"] == "123")
+        check("프로세스 환경 우선", os.environ["GOOGLE_API_KEY"] == "process-wins")
+        check("secrets 파일 우선", os.environ["OVERLAP_TEST"] == "secrets-win")
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_public_env_contract():
+    example = dotenv_values(PROJECT_ROOT / ".env.example")
+    expected = {
+        "DISCORD_TOKEN",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "RECRUIT_CHANNEL_ID",
+        "EVENT_CHANNEL_ID",
+        "DATA_DIR",
+        "BACKUP_DIR",
+        "FORBIDDEN_WORDS_FILE",
+        "BACKUP_INTERVAL_SECONDS",
+        "BACKUP_RETENTION_DAYS",
+        "DB_BACKEND",
+    }
+    check("공개 env 변수 계약", set(example) == expected)
+    check(
+        "실제 env 파일 ignore",
+        all(
+            subprocess.run(
+                ["git", "check-ignore", "-q", name],
+                cwd=PROJECT_ROOT,
+                check=False,
+            ).returncode
+            == 0
+            for name in (".env", ".env.secrets", ".env.runtime")
+        ),
+    )
+    check(
+        "공개 env 예제 추적",
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", ".env.example"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0,
+    )
 
 
 def test_forbidden_words_fail_fast():
@@ -627,6 +713,8 @@ if __name__ == "__main__":
     try:
         test_config_paths()
         test_config_validation()
+        test_split_env_loading()
+        test_public_env_contract()
         test_forbidden_words_fail_fast()
         test_startup_verifies_before_loading_cogs()
         test_startup_preverification_failure_stops_cogs_and_sync()

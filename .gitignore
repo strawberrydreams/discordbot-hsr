@@ -2,6 +2,8 @@
 
 # Secrets and private moderation data
 .env
+.env.secrets
+.env.runtime
 settings/*.env
 settings/forbidden_words.json
 
