@@ -98,8 +98,21 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def create_backup_set(now: datetime | None = None) -> Path:
+def _create_backup_directory() -> None:
+    missing = []
+    directory = BACKUP_DIR
+    while not directory.exists():
+        missing.append(directory)
+        directory = directory.parent
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    for created in missing:
+        _fsync_directory(created)
+    if missing:
+        _fsync_directory(directory)
+
+
+def create_backup_set(now: datetime | None = None) -> Path:
+    _create_backup_directory()
     with (BACKUP_DIR / ".backup.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         return _create_backup_set(now)

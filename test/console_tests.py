@@ -399,7 +399,7 @@ def test_backup_publication_is_synced():
     import module.backup as backup
 
     backup.DATA_DIR = _TMP_DIR / "durability_data"
-    backup.BACKUP_DIR = _TMP_DIR / "durability_backups"
+    backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     ).add_points(1, 100)
@@ -408,8 +408,10 @@ def test_backup_publication_is_synced():
         datetime.datetime.now(),
     )
     events = []
+    synced_directories = []
     real_fsync = backup.os.fsync
     real_replace = backup.os.replace
+    real_fsync_directory = backup._fsync_directory
 
     def recording_fsync(descriptor):
         kind = "dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
@@ -423,26 +425,42 @@ def test_backup_publication_is_synced():
             "replace:manifest" if name.endswith("-manifest.json") else "replace:db"
         )
 
+    def recording_fsync_directory(path):
+        synced_directories.append(pathlib.Path(path))
+        real_fsync_directory(path)
+
     backup.os.fsync = recording_fsync
     backup.os.replace = recording_replace
+    backup._fsync_directory = recording_fsync_directory
     try:
         fixed = datetime.datetime(2026, 7, 28, 13, tzinfo=datetime.timezone.utc)
         backup.create_backup_set(fixed)
     finally:
         backup.os.fsync = real_fsync
         backup.os.replace = real_replace
+        backup._fsync_directory = real_fsync_directory
 
+    publication_events = events[-8:]
     check(
         "DB 파일은 공개 전에 동기화",
-        events[:4] == ["fsync:file", "fsync:file", "replace:db", "replace:db"],
+        publication_events[:4]
+        == ["fsync:file", "fsync:file", "replace:db", "replace:db"],
     )
     check(
         "DB rename은 manifest 공개 전에 디렉터리 동기화",
-        events[4:6] == ["fsync:dir", "fsync:file"],
+        publication_events[4:6] == ["fsync:dir", "fsync:file"],
     )
     check(
         "manifest rename 후 디렉터리 동기화",
-        events[6:] == ["replace:manifest", "fsync:dir"],
+        publication_events[6:] == ["replace:manifest", "fsync:dir"],
+    )
+    check(
+        "새 백업 디렉터리의 모든 상위 entry 동기화",
+        {
+            backup.BACKUP_DIR.parent,
+            backup.BACKUP_DIR.parent.parent,
+            _TMP_DIR,
+        }.issubset(set(synced_directories)),
     )
 
 
