@@ -76,6 +76,25 @@ def test_config_validation():
         config.DISCORD_TOKEN = original
 
 
+def test_forbidden_words_fail_fast():
+    from module.forbiddenfilter_cog import load_forbidden_words
+
+    missing = _TMP_DIR / "missing-forbidden.json"
+    try:
+        load_forbidden_words(missing)
+        check("금지어 파일 누락 거부", False)
+    except RuntimeError:
+        check("금지어 파일 누락 거부", True)
+
+    invalid = _TMP_DIR / "invalid-forbidden.json"
+    invalid.write_text("{}", encoding="utf-8")
+    try:
+        load_forbidden_words(invalid)
+        check("금지어 JSON 구조 오류 거부", False)
+    except RuntimeError:
+        check("금지어 JSON 구조 오류 거부", True)
+
+
 def test_migration() -> SQLiteAttendanceRepository:
     print("\n[1] SQLite 마이그레이션")
     db_path = _TMP_DIR / "attendance_migration.db"
@@ -495,6 +514,7 @@ if __name__ == "__main__":
     try:
         test_config_paths()
         test_config_validation()
+        test_forbidden_words_fail_fast()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_play_luckybox(repo)

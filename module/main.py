@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
-from module.config import DISCORD_TOKEN
+from module.backup import verify_database
+from module.config import BACKUP_DIR, DATA_DIR, DISCORD_TOKEN, validate_config
 
 # 실행 커맨드: python -m module.main
 
@@ -9,6 +10,16 @@ intents = discord.Intents.default()
 intents.guild_scheduled_events = True
 intents.message_content = True
 intents.members = True
+
+EXTENSIONS = (
+    "module.eventnotice_cog",
+    "module.playwith_cog",
+    "module.forbiddenfilter_cog",
+    "module.hyacine_chat_cog",
+    "module.hyacine_image_cog",
+    "module.attendance_cog",
+    "module.finance_cog",
+)
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -19,27 +30,12 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        # Load Extensions (Cogs)
-        extensions = [
-            "module.eventnotice_cog",
-            "module.playwith_cog",
-            "module.forbiddenfilter_cog",
-            "module.hyacine_chat_cog",
-            "module.hyacine_image_cog",
-            "module.attendance_cog",
-            "module.finance_cog"
-        ]
-        
-        for ext in extensions:
-            try:
-                await self.load_extension(ext)
-                print(f"🧩 Loaded extension: {ext}")
-            except Exception as e:
-                print(f"❌ Failed to load extension {ext}: {e}")
+        for extension in EXTENSIONS:
+            await self.load_extension(extension)
+            print(f"🧩 Loaded extension: {extension}")
 
-        # Sync commands
-        # Note: Syncing globally can take up to an hour. For development, sync to specific guild.
-        # await self.tree.sync(guild=discord.Object(id=...)) 
+        verify_database(DATA_DIR / "attendance_data.db", {"users"})
+        verify_database(DATA_DIR / "party_data.db", {"parties", "participants"})
         await self.tree.sync()
         print("🔄 Command tree synced")
 
@@ -56,10 +52,11 @@ class MyBot(commands.Bot):
         # await client.change_presence(status=discord.Status.dnd, activity=activity)
         # await client.change_presence(status=discord.Status.invisible, activity=activity)
 
-bot = MyBot()
+def main() -> None:
+    validate_config()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    MyBot().run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
-    else:
-        print("❌ DISCORD_TOKEN not found in environment variables.")
+    main()

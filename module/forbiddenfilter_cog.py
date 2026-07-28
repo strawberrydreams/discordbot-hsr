@@ -4,6 +4,7 @@ import json
 import re
 import logging
 import unicodedata
+from pathlib import Path
 from typing import List, Optional
 from discord.ext import commands
 
@@ -75,6 +76,23 @@ def _build_pattern(terms: List[str]) -> re.Pattern:
     escaped = [re.escape(t) for t in terms if t]
     return re.compile("|".join(escaped))
 
+
+def load_forbidden_words(path: Path) -> List[str]:
+    if not path.is_file():
+        raise RuntimeError(f"금지어 파일이 없습니다: {path}")
+    try:
+        with path.open(encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"금지어 파일을 읽을 수 없습니다: {path}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError("금지어 JSON 최상단은 배열이어야 합니다.")
+    words = [_normalize_term(str(word)) for word in data if str(word).strip()]
+    if not words:
+        raise RuntimeError("금지어 목록이 비어 있습니다.")
+    return words
+
+
 class ForbiddenFilterCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -82,24 +100,9 @@ class ForbiddenFilterCog(commands.Cog):
         self._banned_pattern: Optional[re.Pattern] = None
         self.load_prohibited_words()
 
-    def _read_words(self) -> List[str]:
-        if not DATA_FILE.exists():
-            logging.warning("⚠️ %s 파일이 없습니다. 필터가 비활성화됩니다.", DATA_FILE.name)
-            return []
-        try:
-            with DATA_FILE.open(encoding="utf-8") as fp:
-                data = json.load(fp)
-            if not isinstance(data, list):
-                raise ValueError("JSON 최상단은 배열이어야 합니다.")
-            # JSON의 각 항목을 정규화하여 저장
-            return [_normalize_term(str(w)) for w in data if str(w).strip()]
-        except Exception as e:
-            logging.error("❌ %s 로드 실패: %s", DATA_FILE.name, e)
-            return []
-
     def load_prohibited_words(self) -> List[str]:
         """JSON을 읽어 내부 캐시에 저장하고 패턴을 갱신합니다."""
-        self._banned = self._read_words()
+        self._banned = load_forbidden_words(DATA_FILE)
         self._banned_pattern = _build_pattern(self._banned)
         logging.info("📥 금지어 %d개 로드", len(self._banned))
         return self._banned
