@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -339,6 +340,112 @@ def test_backup_round_trip():
     check("백업 복구 테스트", True)
 
 
+def test_backup_same_timestamp_rejected():
+    import module.backup as backup
+
+    backup.DATA_DIR = _TMP_DIR / "collision_data"
+    backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
+    attendance = SQLiteAttendanceRepository(
+        backup.DATA_DIR / "attendance_data.db"
+    )
+    attendance.add_points(1, 100)
+    SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
+        "LOL",
+        datetime.datetime.now(),
+    )
+    fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
+    manifest = backup.create_backup_set(fixed)
+
+    attendance.add_points(2, 200)
+    try:
+        backup.create_backup_set(fixed)
+        check("동일 시각 백업 충돌 거부", False)
+    except RuntimeError:
+        check("동일 시각 백업 충돌 거부", True)
+    result = backup.verify_backup_set(manifest)
+    check("충돌 후 기존 백업 보존", result["attendance_data.db"]["users"] == 1)
+
+
+def test_prune_requires_timestamp_bound_filenames():
+    import module.backup as backup
+
+    backup.DATA_DIR = _TMP_DIR / "retention_data"
+    backup.BACKUP_DIR = _TMP_DIR / "retention_backups"
+    backup.BACKUP_RETENTION_DAYS = 30
+    SQLiteAttendanceRepository(
+        backup.DATA_DIR / "attendance_data.db"
+    ).add_points(1, 100)
+    SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
+        "LOL",
+        datetime.datetime.now(),
+    )
+    current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
+    manifest = backup.create_backup_set(current)
+    copied = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
+    shutil.copy2(manifest, copied)
+
+    now = datetime.datetime(2026, 7, 28, tzinfo=datetime.timezone.utc)
+    deleted = backup.prune_backups(now)
+    try:
+        backup.verify_backup_set(manifest)
+        preserved = True
+    except RuntimeError:
+        preserved = False
+    check("manifest 시각과 다른 백업 파일은 정리하지 않음", deleted == 0)
+    check("복사된 과거 manifest가 최신 백업을 보존", preserved)
+
+
+def test_backup_publication_is_synced():
+    import module.backup as backup
+
+    backup.DATA_DIR = _TMP_DIR / "durability_data"
+    backup.BACKUP_DIR = _TMP_DIR / "durability_backups"
+    SQLiteAttendanceRepository(
+        backup.DATA_DIR / "attendance_data.db"
+    ).add_points(1, 100)
+    SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
+        "LOL",
+        datetime.datetime.now(),
+    )
+    events = []
+    real_fsync = backup.os.fsync
+    real_replace = backup.os.replace
+
+    def recording_fsync(descriptor):
+        kind = "dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        events.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def recording_replace(source, destination):
+        real_replace(source, destination)
+        name = pathlib.Path(destination).name
+        events.append(
+            "replace:manifest" if name.endswith("-manifest.json") else "replace:db"
+        )
+
+    backup.os.fsync = recording_fsync
+    backup.os.replace = recording_replace
+    try:
+        fixed = datetime.datetime(2026, 7, 28, 13, tzinfo=datetime.timezone.utc)
+        backup.create_backup_set(fixed)
+    finally:
+        backup.os.fsync = real_fsync
+        backup.os.replace = real_replace
+
+    check(
+        "DB 파일은 공개 전에 동기화",
+        events[:4] == ["fsync:file", "fsync:file", "replace:db", "replace:db"],
+    )
+    check(
+        "DB rename은 manifest 공개 전에 디렉터리 동기화",
+        events[4:6] == ["fsync:dir", "fsync:file"],
+    )
+    check(
+        "manifest rename 후 디렉터리 동기화",
+        events[6:] == ["replace:manifest", "fsync:dir"],
+    )
+
+
 def test_corrupt_backup_rejected():
     import module.backup as backup
 
@@ -379,6 +486,9 @@ if __name__ == "__main__":
         test_channel_sessions()
         test_imports()
         test_backup_round_trip()
+        test_backup_same_timestamp_rejected()
+        test_prune_requires_timestamp_bound_filenames()
+        test_backup_publication_is_synced()
         test_corrupt_backup_rejected()
         test_malformed_manifest_rejected()
     finally:

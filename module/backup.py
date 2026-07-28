@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -84,10 +85,35 @@ def _temporary_path(prefix: str) -> Path:
     return Path(name)
 
 
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as fp:
+        os.fsync(fp.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def create_backup_set(now: datetime | None = None) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    with (BACKUP_DIR / ".backup.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _create_backup_set(now)
+
+
+def _create_backup_set(now: datetime | None) -> Path:
     created_at = _utc(now)
     timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
+    destinations = [
+        *(BACKUP_DIR / f"{timestamp}-{source}" for source in DATABASES),
+        BACKUP_DIR / f"{timestamp}-manifest.json",
+    ]
+    if any(path.exists() for path in destinations):
+        raise RuntimeError(f"같은 시각의 백업이 이미 있습니다: {timestamp}")
     temporary_paths: list[Path] = []
     pending: list[tuple[Path, Path, str, dict[str, int]]] = []
 
@@ -101,8 +127,11 @@ def create_backup_set(now: datetime | None = None) -> Path:
             counts = verify_database(temporary, required_tables)
             pending.append((temporary, final, source_name, counts))
 
+        for temporary, _, _, _ in pending:
+            _fsync_file(temporary)
         for temporary, final, _, _ in pending:
             os.replace(temporary, final)
+        _fsync_directory(BACKUP_DIR)
 
         manifest = {
             "created_at": created_at.isoformat(),
@@ -120,11 +149,13 @@ def create_backup_set(now: datetime | None = None) -> Path:
         manifest_path = BACKUP_DIR / f"{timestamp}-manifest.json"
         manifest_temporary = _temporary_path(f"{timestamp}-manifest.json")
         temporary_paths.append(manifest_temporary)
-        manifest_temporary.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with manifest_temporary.open("w", encoding="utf-8") as fp:
+            json.dump(manifest, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+            fp.flush()
+            os.fsync(fp.fileno())
         os.replace(manifest_temporary, manifest_path)
+        _fsync_directory(BACKUP_DIR)
     finally:
         for temporary in temporary_paths:
             temporary.unlink(missing_ok=True)
@@ -234,6 +265,11 @@ def prune_backups(now: datetime | None = None) -> int:
 
         try:
             manifest = _load_manifest(manifest_path)
+            if any(
+                item["backup"] != f"{timestamp}-{item['source']}"
+                for item in manifest["databases"]
+            ):
+                continue
             verify_backup_set(manifest_path)
             files = [
                 manifest_path.parent / item["backup"]
