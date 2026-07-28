@@ -116,115 +116,197 @@ Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 
 ## 검증된 백업으로 실제 복구
 
-복구는 자동화하지 않습니다. 운영자가 manifest와 각 덮어쓰기를 직접 확인해야 합니다.
-
-1. 실행 방식에 맞게 봇을 반드시 중지합니다. 복구 중간 상태가 예약 백업되지 않도록 백업 서비스도 함께 중지합니다.
+복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 두 덮어쓰기를 각각 승인합니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
 
 ```bash
-# launchd
-launchctl bootout gui/$(id -u)/com.discordbot.hsr
-launchctl bootout gui/$(id -u)/com.discordbot.hsr-backup
+(
+set -euo pipefail
 
-# 또는 Docker
-docker compose stop bot
-docker compose stop backup
-```
-
-2. 복구할 manifest를 직접 선택하고, 그 백업을 임시 디렉터리에 복사해 검사합니다.
-
-```bash
-ls -1 runtime/backups/*-manifest.json
+DEPLOYMENT=launchd
 MANIFEST=runtime/backups/20260728T000000Z-manifest.json
-.venv/bin/python -c 'from pathlib import Path; from module.backup import restore_test; import sys; restore_test(Path(sys.argv[1]))' "$MANIFEST"
-```
 
-3. 현재 live DB 두 개를 타임스탬프가 붙은 비상 디렉터리에 보존합니다.
+case "$DEPLOYMENT" in
+  launchd)
+    launchd_domain="gui/$(id -u)"
+    stop_launchd_job() {
+      launchd_target="$launchd_domain/$1"
+      if launchctl print "$launchd_target" >/dev/null 2>&1; then
+        launchctl bootout --wait "$launchd_target"
+      fi
+      if launchctl print "$launchd_target" >/dev/null 2>&1; then
+        echo "launchd job이 아직 실행 중입니다: $launchd_target" >&2
+        return 1
+      fi
+    }
+    stop_launchd_job com.discordbot.hsr
+    stop_launchd_job com.discordbot.hsr-backup
+    ;;
+  docker)
+    docker compose stop bot backup
+    running_services=$(docker compose ps --status running --services)
+    if grep -Eq '^(bot|backup)$' <<<"$running_services"; then
+      echo "Compose 서비스가 아직 실행 중입니다." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "DEPLOYMENT는 launchd 또는 docker여야 합니다." >&2
+    exit 1
+    ;;
+esac
 
-```bash
-EMERGENCY_DIR="runtime/emergency-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir "$EMERGENCY_DIR"
+test -f "$MANIFEST"
+RESTORE_STAGE=$(mktemp -d runtime/restore-stage.XXXXXX)
+.venv/bin/python - "$MANIFEST" "$RESTORE_STAGE" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from module.backup import restore_test
+
+manifest_path = Path(sys.argv[1])
+stage = Path(sys.argv[2])
+document = json.loads(manifest_path.read_text(encoding="utf-8"))
+items = document.get("databases")
+expected = {"attendance_data.db", "party_data.db"}
+entries = {}
+backup_names = set()
+
+if not isinstance(items, list):
+    raise RuntimeError("manifest databases가 목록이 아닙니다.")
+for item in items:
+    if not isinstance(item, dict):
+        raise RuntimeError("잘못된 manifest DB 항목입니다.")
+    source = item.get("source")
+    backup = item.get("backup")
+    if (
+        not isinstance(source, str)
+        or source not in expected
+        or source in entries
+        or not isinstance(backup, str)
+        or not backup
+        or Path(backup).name != backup
+        or backup in backup_names
+    ):
+        raise RuntimeError("안전하지 않거나 중복된 manifest DB 항목입니다.")
+    entries[source] = manifest_path.parent / backup
+    backup_names.add(backup)
+if set(entries) != expected:
+    raise RuntimeError("manifest에 두 운영 DB가 정확히 한 번씩 있어야 합니다.")
+
+restore_test(manifest_path)
+for source, backup_path in entries.items():
+    shutil.copy2(backup_path, stage / source)
+PY
+
+EMERGENCY_DIR=$(mktemp -d runtime/emergency.XXXXXX)
 cp -p runtime/data/attendance_data.db runtime/data/party_data.db "$EMERGENCY_DIR"/
-ls -l "$EMERGENCY_DIR"
-```
+cmp -s runtime/data/attendance_data.db "$EMERGENCY_DIR/attendance_data.db"
+cmp -s runtime/data/party_data.db "$EMERGENCY_DIR/party_data.db"
+ls -l "$EMERGENCY_DIR" "$RESTORE_STAGE"
 
-4. 선택한 백업의 타임스탬프와 파일명을 확인한 뒤, `cp -i`가 묻는 각 덮어쓰기에 운영자가 승인합니다.
+cp -ip "$RESTORE_STAGE/attendance_data.db" runtime/data/attendance_data.db
+cp -ip "$RESTORE_STAGE/party_data.db" runtime/data/party_data.db
+cmp -s "$RESTORE_STAGE/attendance_data.db" runtime/data/attendance_data.db
+cmp -s "$RESTORE_STAGE/party_data.db" runtime/data/party_data.db
 
-```bash
-STAMP=${MANIFEST##*/}
-STAMP=${STAMP%-manifest.json}
-ls -l "runtime/backups/${STAMP}-attendance_data.db" "runtime/backups/${STAMP}-party_data.db"
-cp -ip "runtime/backups/${STAMP}-attendance_data.db" runtime/data/attendance_data.db
-cp -ip "runtime/backups/${STAMP}-party_data.db" runtime/data/party_data.db
-```
-
-5. 복원된 live DB에 `PRAGMA integrity_check`와 필수 테이블 검사를 실행합니다.
-
-```bash
 .venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
+
+case "$DEPLOYMENT" in
+  launchd)
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
+    ;;
+  docker)
+    docker compose start backup
+    docker compose start bot
+    ;;
+esac
+)
 ```
 
-6. 봇을 시작합니다.
-
-```bash
-# launchd
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
-
-# 또는 Docker
-docker compose start bot
-docker compose start backup
-```
-
-7. 로그에 startup 오류가 없는지 확인하고 Discord에서 `/지갑`, `/랭킹`, `/파티`, `/프로필`을 읽어 포인트·순위·파티·금지어 경고 횟수를 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본을 보존하세요.
+로그에 startup 오류가 없는지 확인하고 Discord에서 `/지갑`, `/랭킹`, `/파티`, `/프로필`을 읽어 포인트·순위·파티·금지어 경고 횟수를 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
 
 ## 배포
 
-변경을 모아 한 번에 배포합니다. 먼저 pull 전 커밋을 별도로 기록합니다.
-
-```bash
-git rev-parse HEAD
-```
-
-아래 순서를 바꾸지 않습니다: **테스트 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**. 테스트나 백업 명령 하나라도 실패하면 즉시 중단하며 재시작하지 않습니다.
+변경을 모아 한 번에 배포합니다. 아래 순서를 바꾸지 않습니다: **테스트 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
 macOS:
 
 ```bash
+(
+set -euo pipefail
+git rev-parse HEAD
 git pull --ff-only
 .venv/bin/python -m test.console_tests
 .venv/bin/python -m module.backup create
 .venv/bin/python -m module.backup verify
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 tail -n 100 runtime/logs/bot.log
+)
 ```
 
 Docker:
 
 ```bash
+(
+set -euo pipefail
+git rev-parse HEAD
 git pull --ff-only
 .venv/bin/python -m test.console_tests
-docker compose run --rm backup python -m module.backup create
-docker compose run --rm backup python -m module.backup verify
-docker compose build bot
-docker compose up -d --no-deps bot
+BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
+test -n "$BACKUP_MANIFEST"
+docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
+docker compose build bot backup
+docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
+docker compose up -d --no-deps bot backup
 docker compose logs --tail=100 bot
+)
 ```
 
 ## 코드 롤백
 
-시작 실패 시 pull 전에 기록한 커밋으로 돌아갑니다. 운영자가 변경 내용을 확인한 뒤 공유 브랜치라면 정상 `git revert <문제-커밋>`, 이 호스트만 임시 복구한다면 승인한 이전 커밋으로 `git checkout <이전-커밋>`을 사용합니다. `git reset --hard`는 사용하지 않습니다.
+시작 실패 시 블록이 출력한 pull 전 커밋으로 돌아갑니다. 운영자가 변경 내용을 확인한 뒤 `ROLLBACK_MODE=revert`에는 문제 커밋을, 이 호스트만 임시 복구하는 `ROLLBACK_MODE=checkout`에는 이전 커밋을 `TARGET_COMMIT`으로 넣습니다. `git reset --hard`는 사용하지 않습니다.
 
-코드를 되돌린 뒤 테스트를 다시 통과시키고, 선택한 실행 방식으로 한 번만 재시작합니다.
+macOS:
 
 ```bash
+(
+set -euo pipefail
+ROLLBACK_MODE=revert
+TARGET_COMMIT=replace-with-reviewed-commit
+
+case "$ROLLBACK_MODE" in
+  revert) git revert "$TARGET_COMMIT" ;;
+  checkout) git checkout "$TARGET_COMMIT" ;;
+  *) echo "ROLLBACK_MODE는 revert 또는 checkout이어야 합니다." >&2; exit 1 ;;
+esac
+
 .venv/bin/python -m test.console_tests
-
-# macOS
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
+)
+```
 
-# 또는 Docker
-docker compose build bot
-docker compose up -d --no-deps bot
+Docker:
+
+```bash
+(
+set -euo pipefail
+ROLLBACK_MODE=revert
+TARGET_COMMIT=replace-with-reviewed-commit
+
+case "$ROLLBACK_MODE" in
+  revert) git revert "$TARGET_COMMIT" ;;
+  checkout) git checkout "$TARGET_COMMIT" ;;
+  *) echo "ROLLBACK_MODE는 revert 또는 checkout이어야 합니다." >&2; exit 1 ;;
+esac
+
+.venv/bin/python -m test.console_tests
+docker compose build bot backup
+docker compose run --rm --no-deps backup python -m module.backup verify
+docker compose up -d --no-deps bot backup
+)
 ```
 
 DB 복구가 필요한 경우에만 위의 수동 복구 절차를 별도로 따릅니다.
