@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>Label</key>
+<string>com.discordbot.hsr-backup</string>
+<key>ProgramArguments</key>
+<array>
+  <string>/Users/strawberrydreams/coding/discordbot-hsr/.venv/bin/python</string>
+  <string>-m</string>
+  <string>module.backup</string>
+  <string>create</string>
+</array>
+<key>WorkingDirectory</key>
+<string>/Users/strawberrydreams/coding/discordbot-hsr</string>
+<key>RunAtLoad</key>
+<true/>
+<key>StartInterval</key>
+<integer>21600</integer>
+<key>StandardOutPath</key>
+<string>/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup.log</string>
+<key>StandardErrorPath</key>
+<string>/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup-error.log</string>
+</dict>
+</plist>
