@@ -4,28 +4,34 @@
 
 ## 공개 저장소와 로컬 비밀정보
 
-이 저장소는 공개 상태로 운영할 수 있습니다. `.env`, 실제 `settings/forbidden_words.json`, `runtime/`의 DB·백업·로그는 Git에서 추적하지 않으며 Docker 이미지에도 포함되지 않습니다. 실제 비밀 값은 운영 호스트에만 둡니다.
+이 저장소는 공개 상태로 운영할 수 있습니다. `.env.secrets`, `.env.runtime`, 실제 `settings/forbidden_words.json`, `runtime/`의 DB·백업·로그는 Git에서 추적하지 않으며 Docker 이미지에도 포함되지 않습니다. 실제 비밀 값은 운영 호스트에만 둡니다.
 
-다음 파일은 예제에서 로컬로 복사해 편집하고, 어떤 경우에도 `git add -f`로 강제 추가하지 마세요.
+실제 운영 파일은 어떤 경우에도 `git add -f`로 강제 추가하지 마세요.
 
-- `.env`: Discord/OpenAI/Google 키, 서버 ID, 런타임 경로
+- `.env.secrets`: Discord/OpenAI/Google 자격 증명
+- `.env.runtime`: 채널 ID, 경로, 백업 설정, SQLite 백엔드
+- `.env.example`: 두 파일을 위한 Git 추적 공개 카탈로그
 - `settings/forbidden_words.json`: 실제 금지어 목록
 
 확인:
 
 ```bash
-git check-ignore -v .env settings/forbidden_words.json runtime/data/attendance_data.db
-git ls-files .env settings/forbidden_words.json runtime
+git check-ignore -v .env .env.secrets .env.runtime \
+  settings/forbidden_words.json runtime/data/attendance_data.db
+git ls-files .env .env.secrets .env.runtime \
+  settings/forbidden_words.json runtime
+git ls-files --error-unmatch .env.example
 ```
 
-두 번째 명령은 아무것도 출력하지 않아야 합니다.
+두 번째 명령은 아무것도 출력하지 않아야 하고, 세 번째 명령은 `.env.example`을 출력해야 합니다.
 
 ## 최초 설치
 
 저장소 루트에서 실행합니다. Python 3.11 이상이 필요합니다.
 
 ```bash
-cp .env.example .env
+touch .env.secrets .env.runtime
+chmod 600 .env.secrets .env.runtime
 cp settings/forbidden_words.example.json settings/forbidden_words.json
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
@@ -33,7 +39,7 @@ python3 -m venv .venv
 .venv/bin/python -m test.console_tests
 ```
 
-`.env`의 빈 키와 ID, 실제 금지어 목록을 로컬에서 편집한 뒤 런타임 디렉터리를 만듭니다.
+`.env.example`의 secrets 섹션에 있는 세 자격 증명 이름(`DISCORD_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`)만 `.env.secrets`로 옮기고, 나머지 이름은 모두 `.env.runtime`으로 옮깁니다. `.env.example` 전체를 어느 파일에도 복사하지 마세요. `RECRUIT_CHANNEL_ID`와 `EVENT_CHANNEL_ID`는 실제 양의 정수여야 하며, 비어 있거나 잘못되면 봇은 Cog를 로드하기 전에 시작을 거부합니다. 실제 금지어 목록도 로컬에서 편집한 뒤 런타임 디렉터리를 만듭니다.
 
 ```bash
 mkdir -p runtime/data runtime/backups runtime/logs
@@ -88,7 +94,7 @@ LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 �
 
 ### Docker Desktop
 
-Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
+Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
 
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 
@@ -110,7 +116,7 @@ Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 .venv/bin/python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker 주기와 보존 기간은 `.env`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. launchd 주기는 plist의 `StartInterval`을 사용하므로 변경 시 설치된 plist도 수정하고 다시 bootstrap해야 합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker 주기와 보존 기간은 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. launchd 주기는 plist의 `StartInterval`을 사용합니다. 변경 시 설치된 백업 plist도 수정하고, 이미 로드된 job을 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내린 뒤 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록해야 합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
 
 `runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
 
@@ -200,7 +206,7 @@ for source, backup_path in entries.items():
     shutil.copy2(backup_path, stage / source)
 PY
 
-EMERGENCY_DIR=$(mktemp -d runtime/emergency.XXXXXX)
+EMERGENCY_DIR=$(mktemp -d "runtime/emergency.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
 cp -p runtime/data/attendance_data.db runtime/data/party_data.db "$EMERGENCY_DIR"/
 cmp -s runtime/data/attendance_data.db "$EMERGENCY_DIR/attendance_data.db"
 cmp -s runtime/data/party_data.db "$EMERGENCY_DIR/party_data.db"
