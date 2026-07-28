@@ -94,7 +94,7 @@ LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 �
 
 ### Docker Desktop
 
-Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
+Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
 
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 

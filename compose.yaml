@@ -2,8 +2,8 @@ services:
   bot:
     build: .
     env_file:
-      - .env.secrets
       - .env.runtime
+      - .env.secrets
     command: ["python", "-m", "module.main"]
     restart: unless-stopped
     stop_grace_period: 30s
@@ -15,8 +15,8 @@ services:
   backup:
     build: .
     env_file:
-      - .env.secrets
       - .env.runtime
+      - .env.secrets
     command: ["python", "-m", "module.backup", "loop"]
     restart: unless-stopped
     volumes:

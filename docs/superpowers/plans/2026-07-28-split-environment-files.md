@@ -4,7 +4,7 @@
 
 **Goal:** 공개 `.env.example`은 유지하면서 실제 자격 증명과 일반 런타임 설정을 `.env.secrets`와 `.env.runtime`으로 분리한다.
 
-**Architecture:** `module/config.py`는 프로젝트 루트의 secrets 파일을 먼저, runtime 파일을 다음에 `override=False`로 로드한다. Git과 Docker는 실제 두 파일과 기존 `.env`를 제외하고, Compose는 두 파일을 서비스 환경으로 함께 주입한다. 기존 로컬 `.env`는 값이 출력되지 않는 일회성 이전 절차로 분리한 뒤 삭제한다.
+**Architecture:** `module/config.py`의 직접 로드는 secrets 파일을 먼저, runtime 파일을 다음에 `override=False`로 읽으므로 먼저 읽은 secrets 값이 우선한다. Compose는 나중 `env_file`이 중복 이름을 덮어쓰므로 runtime 파일을 먼저, secrets 파일을 마지막에 나열해 같은 우선순위를 유지한다. Git과 Docker는 실제 두 파일과 기존 `.env`를 제외한다. 기존 로컬 `.env`는 값이 출력되지 않는 일회성 이전 절차로 분리한 뒤 삭제한다.
 
 **Tech Stack:** Python 3.12+, python-dotenv 1.2.2, Docker Compose, Git
 
@@ -16,7 +16,8 @@
 - 실제 `.env.secrets`, `.env.runtime`, 기존 `.env`는 Git과 Docker 이미지에서 제외한다.
 - `.env.secrets`에는 `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`만 둔다.
 - `.env.runtime`에는 채널 ID, 경로, 백업 주기·보존 기간, `DB_BACKEND`만 둔다.
-- 프로세스 환경변수가 두 파일보다 우선하고, 파일끼리는 `.env.secrets`가 `.env.runtime`보다 우선한다.
+- Python 직접 로드는 프로세스 환경변수가 두 파일보다 우선하며, secrets를 먼저 `override=False`로 읽어 `.env.secrets`가 `.env.runtime`보다 우선한다.
+- Compose는 나중 파일이 중복 이름을 덮어쓰므로 `.env.runtime` 다음에 `.env.secrets`를 나열해 secrets를 우선한다.
 - 실제 두 파일의 권한은 `0600`으로 유지한다.
 - 기존 `.env`는 두 결과 파일을 검증한 뒤에만 삭제한다.
 - 비밀 값은 명령문, stdout/stderr, 보고서, Git 객체, Docker build context 또는 이미지에 노출하지 않는다.
@@ -38,7 +39,7 @@
 - `.dockerignore`: 실제 세 env 파일을 build context에서 제외한다.
 - `.env.example`: 하나의 공개 카탈로그 안에서 secrets/runtime 섹션을 구분한다.
 - `module/config.py`: 두 파일의 절대 경로와 로딩 순서를 정의한다.
-- `test/console_tests.py`: 파일 분리, 우선순위, 공개 계약을 검증한다.
+- `test/console_tests.py`: 파일 분리, 우선순위, 공개 계약, Compose env 파일 순서를 검증한다.
 - `test/hello_prefix.py`: Discord 토큰을 `.env.secrets`에서 읽는다.
 - `compose.yaml`: 두 서비스에 실제 두 env 파일을 주입한다.
 - `README.md`: 초기 설정, 개인정보 경계, Docker, 백업 설정 안내를 갱신한다.
@@ -446,9 +447,10 @@ No Git commit is created because this task changes ignored local state only.
 **Files:**
 - Modify: `compose.yaml`
 - Modify: `README.md`
+- Modify: `test/console_tests.py`
 
 **Interfaces:**
-- Consumes: `.env.secrets`, `.env.runtime`
+- Consumes: `.env.runtime`, `.env.secrets`
 - Produces: both env files injected into `bot` and `backup`
 
 - [ ] **Step 1: Update Compose**
@@ -464,9 +466,12 @@ with:
 
 ```yaml
 env_file:
-  - .env.secrets
   - .env.runtime
+  - .env.secrets
 ```
+
+Compose는 나중 `env_file`이 중복 이름을 덮어쓰므로 runtime을 먼저,
+secrets를 마지막에 두어 자격 증명 우선순위를 유지한다.
 
 No port, replica, volume, restart, or command changes are allowed.
 
@@ -524,7 +529,8 @@ Expected:
 
 - Compose config exits 0 and reports only `backup` and `bot`.
 - Both plist files report `OK`.
-- Console tests pass.
+- Console tests pass, including the source-level assertion that both services
+  list runtime before secrets without resolving environment values.
 - Diff check has no output.
 
 - [ ] **Step 4: Verify the Docker image privacy boundary**

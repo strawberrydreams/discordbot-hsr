@@ -165,6 +165,12 @@ def test_public_env_contract():
     )
 
 
+def test_compose_env_file_order():
+    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    expected = "    env_file:\n      - .env.runtime\n      - .env.secrets\n"
+    check("Compose 두 서비스 secrets 파일 우선", compose.count(expected) == 2)
+
+
 def test_forbidden_words_fail_fast():
     from module.forbiddenfilter_cog import load_forbidden_words
 
@@ -715,6 +721,7 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
+        test_compose_env_file_order()
         test_forbidden_words_fail_fast()
         test_startup_verifies_before_loading_cogs()
         test_startup_preverification_failure_stops_cogs_and_sync()
