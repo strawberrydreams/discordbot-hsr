@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    command: ["python", "-m", "module.main"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./runtime/data:/app/runtime/data
+      - ./runtime/backups:/app/runtime/backups
+      - ./settings/forbidden_words.json:/app/settings/forbidden_words.json:ro
+
+  backup:
+    build: .
+    env_file:
+      - .env
+    command: ["python", "-m", "module.backup", "loop"]
+    restart: unless-stopped
+    volumes:
+      - ./runtime/data:/app/runtime/data:ro
+      - ./runtime/backups:/app/runtime/backups
