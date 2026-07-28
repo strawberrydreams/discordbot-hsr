@@ -3,6 +3,7 @@
 
 import discord # discord.py 라이브러리 참조 (별도 설치 필요)
 import os
+from pathlib import Path
 from discord.ext import commands # Discord 확장 명령어 세트 참조
 from dotenv import load_dotenv
 
@@ -18,7 +19,8 @@ client = commands.Bot(command_prefix='*', intents=intents) # 실제 명령어 �
 async def hello(ctx):
     await ctx.send('안녕하세요')
 
-load_dotenv(dotenv_path="../settings/DISCORD_TOKEN.env")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 client.run(TOKEN)

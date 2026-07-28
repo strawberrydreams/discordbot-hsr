@@ -51,6 +51,30 @@ def check(name: str, condition: bool, detail: str = ""):
         print(f"  ❌ {name} {detail}")
 
 
+def test_config_paths():
+    import module.config as config
+
+    check("PROJECT_ROOT는 절대 경로", config.PROJECT_ROOT.is_absolute())
+    check("DATA_DIR는 절대 경로", config.DATA_DIR.is_absolute())
+    check("BACKUP_DIR는 절대 경로", config.BACKUP_DIR.is_absolute())
+    check("금지어 경로는 절대 경로", config.FORBIDDEN_WORDS_FILE.is_absolute())
+
+
+def test_config_validation():
+    import module.config as config
+
+    original = config.DISCORD_TOKEN
+    config.DISCORD_TOKEN = None
+    try:
+        try:
+            config.validate_config()
+            check("Discord 토큰 누락 거부", False)
+        except RuntimeError as exc:
+            check("Discord 토큰 누락 거부", "DISCORD_TOKEN" in str(exc))
+    finally:
+        config.DISCORD_TOKEN = original
+
+
 def test_migration() -> SQLiteAttendanceRepository:
     print("\n[1] SQLite 마이그레이션")
     db_path = _TMP_DIR / "attendance_migration.db"
@@ -211,7 +235,7 @@ def test_factory():
     p_repo = create_party_repository()
     check("sqlite 백엔드: AttendanceRepository 생성", isinstance(a_repo, SQLiteAttendanceRepository))
     check("sqlite 백엔드: PartyRepository 생성", isinstance(p_repo, SQLitePartyRepository))
-    check("DB 파일이 DATA_DIR 아래에 생성됨", a_repo.db_path.parent == _TMP_DIR)
+    check("DB 파일이 DATA_DIR 아래에 생성됨", a_repo.db_path.parent == _TMP_DIR.resolve())
 
     # 미지원 백엔드는 명확한 에러를 내야 함
     original = database.DB_BACKEND
@@ -298,6 +322,8 @@ def test_imports():
 
 if __name__ == "__main__":
     try:
+        test_config_paths()
+        test_config_validation()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_play_luckybox(repo)
