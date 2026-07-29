@@ -68,7 +68,7 @@ class AttendanceCog(commands.Cog):
         embed.add_field(name="현재 포인트", value=f"{new_points:,} P", inline=False)
         embed.set_footer(text=f"{inter.user.display_name}님의 지갑이 두둑해졌어요!")
 
-        await inter.response.send_message(embed=embed)
+        await inter.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="지갑", description="내 포인트 잔액을 확인합니다.")
     async def _wallet(self, inter: discord.Interaction):
@@ -81,7 +81,7 @@ class AttendanceCog(commands.Cog):
         )
         embed.add_field(name="보유 포인트", value=f"**{points:,}** P", inline=False)
 
-        await inter.response.send_message(embed=embed)
+        await inter.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="럭키박스", description="포인트를 걸고 20% ~ 300% 대박을 노려보세요! (확률 랜덤)")
     @app_commands.describe(금액="베팅할 포인트 금액")
@@ -166,7 +166,7 @@ class AttendanceCog(commands.Cog):
         embed.add_field(name="💰 보유 포인트", value=f"{points:,} P", inline=True)
         embed.add_field(name="🚫 금지어 경고", value=f"{forbidden_count}회", inline=True)
 
-        await inter.response.send_message(embed=embed)
+        await inter.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AttendanceCog(bot))

@@ -72,12 +72,12 @@ class PlayWithCog(commands.Cog):
 
         if not available_games:
             embed.description = "⚠️ 모든 게임에 대해 파티가 이미 생성되어 있습니다."
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
         view = View()
         view.add_item(GameSelect(self, available_games))
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="나가기", description="현재 참가 중인 파티에서 나갑니다.")
     async def 나가기(self, interaction: discord.Interaction):
