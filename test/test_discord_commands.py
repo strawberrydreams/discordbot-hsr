@@ -2,6 +2,7 @@ import pathlib
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import discord
@@ -25,6 +26,17 @@ class RecordingResponse:
 
     def is_done(self):
         return bool(self.messages)
+
+    async def defer(self):
+        self.deferred = True
+
+
+class RecordingFollowup:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, *args, **kwargs):
+        self.messages.append((args, kwargs))
 
 
 class FakeUser:
@@ -53,7 +65,34 @@ class FakeInteraction:
         self.channel_id = channel_id
         self.user = FakeUser()
         self.response = RecordingResponse()
+        self.followup = RecordingFollowup()
         self.guild = guild
+
+
+class RecordingAttendance:
+    def __init__(self, refund_error=None):
+        self.deductions = []
+        self.refunds = []
+        self.refund_error = refund_error
+
+    def deduct_points(self, user_id, amount):
+        self.deductions.append((user_id, amount))
+        return True
+
+    def add_points(self, user_id, amount):
+        if self.refund_error:
+            raise self.refund_error
+        self.refunds.append((user_id, amount))
+
+
+class DisappearingAttendanceBot:
+    def __init__(self, attendance):
+        self.attendance = attendance
+        self.calls = 0
+
+    def get_cog(self, name):
+        self.calls += 1
+        return self.attendance if self.calls == 1 else None
 
 
 class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -104,6 +143,70 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         message = interaction.response.messages[-1][0][0]
         for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
             self.assertIn(text, message)
+
+    async def test_pre_api_exception_refunds_with_the_original_attendance_cog(self):
+        attendance = RecordingAttendance()
+        bot = DisappearingAttendanceBot(attendance)
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.bot = bot
+
+        def fail_before_api(*args):
+            raise RuntimeError("attachment processing failed")
+
+        self.cog.build_user_parts = fail_before_api
+
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+            )
+
+        self.assertEqual(attendance.deductions, [(123, 2_000)])
+        self.assertEqual(attendance.refunds, [(123, 2_000)])
+        self.assertEqual(bot.calls, 1)
+        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
+
+    async def test_empty_response_refunds_charged_points(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.bot = DisappearingAttendanceBot(attendance)
+
+        async def empty_response(**kwargs):
+            return SimpleNamespace(output_text="")
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=empty_response)
+        )
+
+        with patch("module.hyacine_chat_cog.traceback.print_exc"):
+            await self.cog._run_talk(
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+            )
+
+        self.assertEqual(attendance.refunds, [(123, 2_000)])
+        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
+
+    async def test_refund_note_is_omitted_when_refund_fails(self):
+        attendance = RecordingAttendance(refund_error=RuntimeError("database unavailable"))
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.bot = DisappearingAttendanceBot(attendance)
+
+        async def empty_response(**kwargs):
+            return SimpleNamespace(output_text="")
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=empty_response)
+        )
+
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+            )
+
+        self.assertNotIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
 
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):

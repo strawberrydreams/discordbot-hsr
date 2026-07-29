@@ -164,6 +164,9 @@ class HyacineChatCog(commands.Cog):
         cost: int,
     ):
         session = self.get_session(inter.channel_id)
+        attendance_cog = None
+        charged = False
+        refunded = False
 
         if cost > 0:
             attendance_cog = self.bot.get_cog("AttendanceCog")
@@ -175,16 +178,30 @@ class HyacineChatCog(commands.Cog):
                 current = attendance_cog.get_points(inter.user.id)
                 await inter.response.send_message(f"❌ 고급 모델(Thinking)은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
                 return
+            charged = True
 
-        await inter.response.defer()
-
-        parts = self.build_user_parts(내용, 이미지)
-        self.trim(session)
-
-        # 최근 10개 메시지 (5턴) 사용
-        recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
+        def refund_points():
+            nonlocal refunded
+            if not charged or refunded:
+                return refunded
+            try:
+                attendance_cog.add_points(inter.user.id, cost)
+            except Exception:
+                print(f"❌ [hyacine_chat] 포인트 환불 실패 (channel={inter.channel_id})")
+                traceback.print_exc()
+                return False
+            refunded = True
+            return True
 
         try:
+            await inter.response.defer()
+
+            parts = self.build_user_parts(내용, 이미지)
+            self.trim(session)
+
+            # 최근 10개 메시지 (5턴) 사용
+            recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
+
             max_tokens = self.MAX_ASSISTANT_DEEP if model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
 
             kwargs = {
@@ -200,7 +217,11 @@ class HyacineChatCog(commands.Cog):
             reply = (resp.output_text or "").strip()
 
             if not reply.strip():
-                await inter.followup.send("⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요.")
+                refund_note = " (포인트 환불됨)" if refund_points() else ""
+                await inter.followup.send(
+                    "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
+                    + refund_note
+                )
                 return
 
             session.last_usage = {
@@ -218,14 +239,10 @@ class HyacineChatCog(commands.Cog):
             await self.send_chunked_followup(inter, reply)
 
         except Exception:
-            if cost > 0:
-                attendance_cog = self.bot.get_cog("AttendanceCog")
-                if attendance_cog: attendance_cog.add_points(inter.user.id, cost)
-
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
-            refund_note = " (포인트 환불됨)" if cost > 0 else ""
+            refund_note = " (포인트 환불됨)" if refund_points() else ""
             await inter.followup.send(f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}")
 
     @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다.")
