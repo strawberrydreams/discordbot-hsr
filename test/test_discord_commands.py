@@ -9,6 +9,7 @@ import discord
 from module.attendance_cog import AttendanceCog
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
+from module.hyacine_chat_cog import HyacineChatCog
 from module.playwith_cog import PlayWithCog
 import module.playwith_cog as playwith_cog
 
@@ -53,6 +54,56 @@ class FakeInteraction:
         self.user = FakeUser()
         self.response = RecordingResponse()
         self.guild = guild
+
+
+class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
+        self.openai_key.start()
+        self.addCleanup(self.openai_key.stop)
+        self.cog = HyacineChatCog(bot=None)
+
+    def test_chat_command_set_replaces_switching_commands(self):
+        names = {command.name for command in self.cog.get_app_commands()}
+
+        self.assertTrue({"기본대화", "고급대화"}.issubset(names))
+        self.assertFalse({"대화", "기본", "고급"} & names)
+
+    async def test_basic_and_advanced_commands_route_exact_model_settings(self):
+        calls = []
+
+        async def record_run_talk(*args):
+            calls.append(args)
+
+        self.cog._run_talk = record_run_talk
+        basic = FakeInteraction(channel_id=1)
+        advanced = FakeInteraction(channel_id=1)
+
+        await HyacineChatCog._light_talk.callback(self.cog, basic, "기본 대화")
+        await HyacineChatCog._deep_talk.callback(self.cog, advanced, "고급 대화")
+
+        self.assertEqual(
+            calls,
+            [
+                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 0),
+                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000),
+            ],
+        )
+
+    async def test_status_lists_both_models_and_last_usage(self):
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.get_session(1).last_usage = {
+            "model": "gpt-5.6-sol",
+            "input_tokens": 12,
+            "output_tokens": 34,
+            "total_tokens": 46,
+        }
+
+        await HyacineChatCog._status.callback(self.cog, interaction)
+
+        message = interaction.response.messages[-1][0][0]
+        for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
+            self.assertIn(text, message)
 
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):

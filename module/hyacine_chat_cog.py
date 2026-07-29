@@ -9,19 +9,15 @@ from discord import app_commands
 from discord.ext import commands
 from module.config import OPENAI_API_KEY
 
-# GPT-5.5 Update (2026-06)
-# chat-latest 계열은 라인업에서 빠졌으므로, 기본 모드는 저비용 mini + reasoning "none"으로 대체
-LIGHT_MODEL = "gpt-5.4-mini" # 기본 (Instant): 저지연/저비용, reasoning effort "none"
-DEEP_MODEL  = "gpt-5.5"      # 고급 (Thinking): 최신 프론티어 모델, reasoning effort "medium"
+LIGHT_MODEL = "gpt-5.6-terra"
+DEEP_MODEL = "gpt-5.6-sol"
 
 
 class ChannelSession:
-    """채널 하나의 대화 상태 (히스토리, 모델, 사용량).
+    """채널 하나의 대화 상태 (히스토리, 사용량).
     채널별로 분리하여 다른 채널의 대화 내용이 섞이지 않도록 한다."""
 
     def __init__(self, system_prompt: str):
-        self.model = LIGHT_MODEL
-        self.reasoning_effort = "none"  # Light 모델 기본값 (Instant)
         self.history: deque[Dict[str, Any]] = deque(
             [{"role": "system", "content": system_prompt}],
             maxlen=120
@@ -158,20 +154,18 @@ class HyacineChatCog(commands.Cog):
                 continue
             await inter.followup.send(p)
 
-    @app_commands.command(name="대화", description=f"Hyacine과 대화 (현재 모델: /상태 명령어로 확인)")
-    @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
-    async def _talk(
+    async def _run_talk(
         self,
         inter: discord.Interaction,
         내용: str,
-        이미지: Optional[discord.Attachment] = None,
+        이미지: Optional[discord.Attachment],
+        model: str,
+        reasoning_effort: str,
+        cost: int,
     ):
         session = self.get_session(inter.channel_id)
 
-        # Check Points for Deep Model
-        cost = 0
-        if session.model == DEEP_MODEL:
-            cost = 2000
+        if cost > 0:
             attendance_cog = self.bot.get_cog("AttendanceCog")
             if not attendance_cog:
                 await inter.response.send_message("❌ 출석체크 모듈 오류.", ephemeral=True)
@@ -191,18 +185,14 @@ class HyacineChatCog(commands.Cog):
         recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
 
         try:
-            # Determine max tokens based on a model
-            max_tokens = self.MAX_ASSISTANT_DEEP if session.model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
+            max_tokens = self.MAX_ASSISTANT_DEEP if model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
 
-            # OpenAI Responses API
-            # GPT-5.4/5.5는 모두 reasoning 모델이며 effort 기본값이 "medium"이므로,
-            # 기본 모드가 의도치 않게 추론(비용/지연 증가)하지 않도록 항상 명시한다.
             kwargs = {
-                "model": session.model,
+                "model": model,
                 "instructions": self.system_prompt,
                 "input": recent_turns + [{"role": "user", "content": parts}],
                 "max_output_tokens": max_tokens,
-                "reasoning": {"effort": session.reasoning_effort},
+                "reasoning": {"effort": reasoning_effort},
             }
 
             resp = await self.client.responses.create(**kwargs)
@@ -233,33 +223,38 @@ class HyacineChatCog(commands.Cog):
                 if attendance_cog: attendance_cog.add_points(inter.user.id, cost)
 
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
-            print(f"❌ [hyacine_chat] '{session.model}' 호출 실패 (channel={inter.channel_id})")
+            print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
             refund_note = " (포인트 환불됨)" if cost > 0 else ""
             await inter.followup.send(f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}")
 
-    @app_commands.command(name="고급", description="이 채널을 GPT-5.5 Thinking 모델로 전환 (고급)")
-    async def _deep(self, inter: discord.Interaction):
-        session = self.get_session(inter.channel_id)
-        session.model = DEEP_MODEL
-        session.reasoning_effort = "medium" # Medium thinking
-        await inter.response.send_message("🌌 이 채널에서는 더 깊은 별빛으로 대화할게요~ (GPT-5.5 Thinking)")
+    @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다.")
+    @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
+    async def _light_talk(
+        self,
+        inter: discord.Interaction,
+        내용: str,
+        이미지: Optional[discord.Attachment] = None,
+    ):
+        await self._run_talk(inter, 내용, 이미지, LIGHT_MODEL, "none", 0)
 
-    @app_commands.command(name="기본", description="이 채널을 GPT-5.4 mini 모델로 전환 (기본)")
-    async def _light(self, inter: discord.Interaction):
-        session = self.get_session(inter.channel_id)
-        session.model = LIGHT_MODEL
-        session.reasoning_effort = "none" # Instant response
-        await inter.response.send_message("✨ 이 채널은 다시 가벼운 별바람으로 돌아왔어요~ (GPT-5.4 mini Instant)")
+    @app_commands.command(name="고급대화", description="GPT-5.6 Sol과 깊이 대화합니다. (2,000 P)")
+    @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
+    async def _deep_talk(
+        self,
+        inter: discord.Interaction,
+        내용: str,
+        이미지: Optional[discord.Attachment] = None,
+    ):
+        await self._run_talk(inter, 내용, 이미지, DEEP_MODEL, "medium", 2_000)
 
     @app_commands.command(name="상태", description="이 채널의 현재 상태 확인")
     async def _status(self, inter: discord.Interaction):
         session = self.get_session(inter.channel_id)
-        max_tokens = self.MAX_ASSISTANT_DEEP if session.model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
         msg = (
-            f"- **현재 모델 (이 채널):** `{session.model}`\n"
-            f"Reasoning Effort: `{session.reasoning_effort}`\n"
-            f"출력 토큰 제한: `{max_tokens:,}`\n"
+            "- **대화 명령**\n"
+            f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`, 무료)\n"
+            f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`, 2,000 P)\n"
         )
         if session.last_usage:
             msg += (

@@ -8,7 +8,7 @@
 #   4. PartyRepository CRUD (파티 생성/참가/탈퇴/만료 정리)
 #   5. Repository 팩토리 (sqlite 선택, 미지원 백엔드 거부)
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
-#   7. 채널별 대화 세션 분리 (히스토리, 모델 전환 독립)
+#   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
@@ -44,7 +44,7 @@ from module.database import (
     create_party_repository,
 )
 from module.attendance_cog import AttendanceCog
-from module.hyacine_chat_cog import HyacineChatCog, LIGHT_MODEL, DEEP_MODEL
+from module.hyacine_chat_cog import HyacineChatCog
 
 PASS = 0
 FAIL = 0
@@ -499,15 +499,6 @@ def test_channel_sessions():
 
     check("두 채널은 서로 다른 세션 객체", s1 is not s2)
     check("같은 채널은 같은 세션 재사용", cog.get_session(111) is s1)
-    check("초기 모델은 LIGHT", s1.model == LIGHT_MODEL and s2.model == LIGHT_MODEL)
-
-    # 채널 111만 고급 모델로 전환 (/고급 명령어와 동일한 동작)
-    s1.model = DEEP_MODEL
-    s1.reasoning_effort = "medium"
-    check("채널 111만 DEEP으로 전환됨", s1.model == DEEP_MODEL)
-    check("채널 222는 LIGHT 유지", s2.model == LIGHT_MODEL)
-    check("채널 222의 reasoning effort 독립", s2.reasoning_effort == "none")
-
     # 히스토리 분리
     s1.history.append({"role": "user", "content": "채널 111의 비밀 이야기"})
     s1.history.append({"role": "assistant", "content": "네, 기억할게요"})
