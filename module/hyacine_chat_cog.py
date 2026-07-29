@@ -243,7 +243,15 @@ class HyacineChatCog(commands.Cog):
             print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
             refund_note = " (포인트 환불됨)" if refund_points() else ""
-            await inter.followup.send(f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}")
+            error_message = f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}"
+            try:
+                if inter.response.is_done():
+                    await inter.followup.send(error_message)
+                else:
+                    await inter.response.send_message(error_message)
+            except Exception:
+                print(f"❌ [hyacine_chat] 오류 메시지 전송 실패 (channel={inter.channel_id})")
+                traceback.print_exc()
 
     @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다.")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")

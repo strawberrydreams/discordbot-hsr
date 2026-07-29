@@ -18,6 +18,7 @@ import module.playwith_cog as playwith_cog
 class RecordingResponse:
     def __init__(self):
         self.messages = []
+        self.deferred = False
 
     async def send_message(self, *args, **kwargs):
         if self.messages:
@@ -25,7 +26,7 @@ class RecordingResponse:
         self.messages.append((args, kwargs))
 
     def is_done(self):
-        return bool(self.messages)
+        return self.deferred or bool(self.messages)
 
     async def defer(self):
         self.deferred = True
@@ -207,6 +208,27 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
+
+    async def test_failed_defer_refunds_and_uses_initial_response(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.bot = DisappearingAttendanceBot(attendance)
+
+        async def fail_defer():
+            raise RuntimeError("defer transport failed")
+
+        interaction.response.defer = fail_defer
+
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+            )
+
+        self.assertEqual(attendance.refunds, [(123, 2_000)])
+        self.assertEqual(interaction.followup.messages, [])
+        self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
 
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
