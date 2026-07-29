@@ -14,6 +14,12 @@ class PlayWithCog(commands.Cog):
         self.db = repository or create_party_repository()
         self.cleanup_parties.start()
         self.shared_views = {}
+        for game in GAMES:
+            view = View(timeout=None)
+            view.add_item(JoinButton(self, game))
+            self.shared_views[game] = view
+            if bot is not None:
+                bot.add_view(view)
 
     def cog_unload(self):
         self.cleanup_parties.cancel()
@@ -108,7 +114,6 @@ class PlayWithCog(commands.Cog):
             await interaction.response.send_message("❌ 이 명령어는 모집 채널에서만 사용할 수 있습니다.", ephemeral=True)
             return
 
-        has_party = False
         embeds = []
 
         for game, info in GAMES.items():
@@ -121,7 +126,6 @@ class PlayWithCog(commands.Cog):
                 self.delete_party(game)
                 continue
 
-            has_party = True
             role_members = {}
             player_lines = []
 
@@ -154,9 +158,8 @@ class PlayWithCog(commands.Cog):
 
             embeds.append(embed)
 
-        if has_party:
-            for embed in embeds:
-                await interaction.response.send_message(embed=embed)
+        if embeds:
+            await interaction.response.send_message(embeds=embeds)
         else:
             await interaction.response.send_message("📭 현재 모집 중인 파티가 없습니다.")
 
@@ -210,12 +213,7 @@ async def send_party_embed(cog, interaction, game):
     if info["roles"]:
         embed.add_field(name="역할 목록", value=", ".join(info["roles"]), inline=False)
 
-    if game not in cog.shared_views:
-        view = View(timeout=None) # Persistent view recommended, but keeping simple for now
-        view.add_item(JoinButton(cog, game))
-        cog.shared_views[game] = view
-    else:
-        view = cog.shared_views[game]
+    view = cog.shared_views[game]
 
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed, view=view)
@@ -224,7 +222,11 @@ async def send_party_embed(cog, interaction, game):
 
 class JoinButton(Button):
     def __init__(self, cog, game):
-        super().__init__(label="참가하기", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="참가하기",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"party:join:{game}",
+        )
         self.cog = cog
         self.game = game
 

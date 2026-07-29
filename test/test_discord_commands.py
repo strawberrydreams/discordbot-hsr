@@ -18,6 +18,8 @@ class RecordingResponse:
         self.messages = []
 
     async def send_message(self, *args, **kwargs):
+        if self.messages:
+            raise RuntimeError("interaction already has an initial response")
         self.messages.append((args, kwargs))
 
     def is_done(self):
@@ -40,6 +42,9 @@ class FakeGuild:
     async def fetch_scheduled_events(self):
         self.fetch_scheduled_events_calls += 1
         return []
+
+    def get_member(self, user_id):
+        return FakeUser()
 
 
 class FakeInteraction:
@@ -97,3 +102,42 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
         self.assertEqual(guild.fetch_scheduled_events_calls, 0)
+
+
+class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_party_status_sends_multiple_embeds_in_one_initial_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            games = list(playwith_cog.GAMES)[:2]
+            for user_id, game in enumerate(games, start=1):
+                repository.create_party(game, datetime.now().isoformat())
+                repository.add_participant(game, user_id)
+
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
+
+            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+                await PlayWithCog.파티.callback(cog, interaction)
+
+        self.assertEqual(len(interaction.response.messages), 1)
+        self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 2)
+
+    def test_join_views_are_persistent_and_registered_at_cog_load(self):
+        class Bot:
+            def __init__(self):
+                self.views = []
+
+            def add_view(self, view):
+                self.views.append(view)
+
+        bot = Bot()
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=bot, repository=repository)
+
+        self.assertEqual(len(bot.views), len(playwith_cog.GAMES))
+        for game, view in cog.shared_views.items():
+            self.assertTrue(view.is_persistent())
+            self.assertEqual(view.children[0].custom_id, f"party:join:{game}")
