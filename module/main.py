@@ -5,7 +5,13 @@ from typing import BinaryIO
 import discord
 from discord.ext import commands
 from module.backup import DATABASES, verify_database
-from module.config import BACKUP_DIR, DATA_DIR, DISCORD_TOKEN, validate_config
+from module.config import (
+    BACKUP_DIR,
+    DATA_DIR,
+    DISCORD_GUILD_ID,
+    DISCORD_TOKEN,
+    validate_config,
+)
 
 # 실행 커맨드: python -m module.main
 
@@ -61,8 +67,10 @@ class MyBot(commands.Bot):
             print(f"🧩 Loaded extension: {extension}")
 
         _verify_databases()
-        await self.tree.sync()
-        print("🔄 Command tree synced")
+        guild = discord.Object(id=DISCORD_GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        print(f"🔄 Command tree synced to guild {DISCORD_GUILD_ID}")
 
     async def on_ready(self):
         print(f"✅ {self.user} 봇이 실행되었습니다!")

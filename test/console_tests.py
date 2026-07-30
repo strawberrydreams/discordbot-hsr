@@ -83,6 +83,41 @@ def test_config_validation():
     finally:
         config.DISCORD_TOKEN = original
 
+    original_values = {
+        name: getattr(config, name)
+        for name in (
+            "DISCORD_TOKEN",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "RECRUIT_CHANNEL_ID",
+            "EVENT_CHANNEL_ID",
+            "DISCORD_GUILD_ID",
+        )
+        if hasattr(config, name)
+    }
+    try:
+        config.DISCORD_TOKEN = "test-token"
+        config.OPENAI_API_KEY = "test-openai"
+        config.GOOGLE_API_KEY = "test-google"
+        config.RECRUIT_CHANNEL_ID = 1
+        config.EVENT_CHANNEL_ID = 1
+        config.DISCORD_GUILD_ID = 0
+        try:
+            config.validate_config()
+            check("운영 길드 ID 누락 거부", False)
+        except RuntimeError as exc:
+            check("운영 길드 ID 누락 거부", "DISCORD_GUILD_ID" in str(exc))
+
+        config.DISCORD_GUILD_ID = -1
+        try:
+            config.validate_config()
+            check("운영 길드 ID 음수 거부", False)
+        except RuntimeError as exc:
+            check("운영 길드 ID 음수 거부", "DISCORD_GUILD_ID" in str(exc))
+    finally:
+        for name, value in original_values.items():
+            setattr(config, name, value)
+
 
 def test_split_env_loading():
     import module.config as config
@@ -133,6 +168,7 @@ def test_public_env_contract():
         "GOOGLE_API_KEY",
         "RECRUIT_CHANNEL_ID",
         "EVENT_CHANNEL_ID",
+        "DISCORD_GUILD_ID",
         "DATA_DIR",
         "BACKUP_DIR",
         "FORBIDDEN_WORDS_FILE",
@@ -197,8 +233,11 @@ def test_new_install_verifies_after_loading_cogs():
     events = []
 
     class FakeTree:
-        async def sync(self):
-            events.append("sync")
+        def copy_global_to(self, *, guild):
+            events.append(f"copy:{guild.id}")
+
+        async def sync(self, *, guild):
+            events.append(f"sync:{guild.id}")
 
     class FakeBot:
         tree = FakeTree()
@@ -211,14 +250,16 @@ def test_new_install_verifies_after_loading_cogs():
         return {}
 
     with patch.object(pathlib.Path, "exists", return_value=False), \
-         patch.object(main, "verify_database", side_effect=verify):
+         patch.object(main, "verify_database", side_effect=verify), \
+         patch.object(main, "DISCORD_GUILD_ID", 123):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
 
     expected = [
         *(f"load:{extension}" for extension in main.EXTENSIONS),
         "verify:attendance_data.db",
         "verify:party_data.db",
-        "sync",
+        "copy:123",
+        "sync:123",
     ]
     check("신규 설치는 Cog 로드 전 DB 검증 생략", events == expected, f"({events})")
 

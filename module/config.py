@@ -47,6 +47,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 RECRUIT_CHANNEL_ID = _int_from_env("RECRUIT_CHANNEL_ID", 0)
 EVENT_CHANNEL_ID = _int_from_env("EVENT_CHANNEL_ID", 0)
+DISCORD_GUILD_ID = _int_from_env("DISCORD_GUILD_ID", 0)
 BACKUP_INTERVAL_SECONDS = _int_from_env("BACKUP_INTERVAL_SECONDS", 21600)
 BACKUP_RETENTION_DAYS = _int_from_env("BACKUP_RETENTION_DAYS", 30)
 DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
@@ -68,6 +69,8 @@ def validate_config() -> None:
         raise RuntimeError("RECRUIT_CHANNEL_ID는 양의 정수여야 합니다.")
     if EVENT_CHANNEL_ID <= 0:
         raise RuntimeError("EVENT_CHANNEL_ID는 양의 정수여야 합니다.")
+    if DISCORD_GUILD_ID <= 0:
+        raise RuntimeError("DISCORD_GUILD_ID는 양의 정수여야 합니다.")
     if BACKUP_INTERVAL_SECONDS <= 0:
         raise RuntimeError("BACKUP_INTERVAL_SECONDS는 양의 정수여야 합니다.")
     if BACKUP_RETENTION_DAYS <= 0:
