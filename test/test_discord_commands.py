@@ -15,6 +15,7 @@ from module.eventnotice_cog import EventNoticeCog
 from module.hyacine_chat_cog import HyacineChatCog
 from module.playwith_cog import PlayWithCog
 import module.playwith_cog as playwith_cog
+import module.backup as backup
 
 
 class RecordingResponse:
@@ -383,3 +384,21 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
         for game, view in cog.shared_views.items():
             self.assertTrue(view.is_persistent())
             self.assertEqual(view.children[0].custom_id, f"party:join:{game}")
+
+
+class BackupConnectionTests(unittest.TestCase):
+    def test_backup_database_connections_are_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "party.db"
+            temporary = pathlib.Path(directory) / "backup.db"
+            SQLitePartyRepository(source)
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                backup._backup_one(source, temporary)
+                backup.verify_database(temporary, {"parties", "participants"})
+                gc.collect()
+
+        self.assertFalse(
+            [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
+        )

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def verify_database(path: Path, required_tables: set[str]) -> dict[str, int]:
     if not path.is_file():
         raise RuntimeError(f"DB 파일이 없습니다: {path}")
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             if result != ("ok",):
                 raise RuntimeError(f"SQLite 무결성 검사 실패: {path}")
@@ -73,9 +74,10 @@ def _sha256(path: Path) -> str:
 
 
 def _backup_one(source: Path, temporary: Path) -> None:
-    with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as source_conn:
-        with sqlite3.connect(temporary) as target_conn:
+    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as source_conn:
+        with closing(sqlite3.connect(temporary)) as target_conn:
             source_conn.backup(target_conn)
+            target_conn.commit()
 
 
 def _utc(now: datetime | None) -> datetime:

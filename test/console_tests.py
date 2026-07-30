@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import closing
 from unittest.mock import patch
 
 from dotenv import dotenv_values
@@ -316,7 +317,7 @@ def test_migration() -> SQLiteAttendanceRepository:
     db_path = _TMP_DIR / "attendance_migration.db"
 
     # 구버전 스키마 (luckybox 컬럼 없음)를 미리 생성
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute("""
             CREATE TABLE users (
                 user_id INTEGER PRIMARY KEY,
@@ -330,7 +331,7 @@ def test_migration() -> SQLiteAttendanceRepository:
 
     repo = SQLiteAttendanceRepository(db_path)  # __init__에서 마이그레이션 수행
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     check("luckybox_count 컬럼 추가됨", "luckybox_count" in cols)
     check("last_luckybox_date 컬럼 추가됨", "last_luckybox_date" in cols)
