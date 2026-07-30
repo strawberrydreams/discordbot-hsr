@@ -377,12 +377,17 @@ def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
     print("\n[3] claim_attendance 원자성")
     user_id = 150
     results = []
+    errors = []
     lock = threading.Lock()
 
     def worker():
-        result = repo.claim_attendance(user_id, 10_000, "2026-07-29")
-        with lock:
-            results.append(result)
+        try:
+            result = repo.claim_attendance(user_id, 10_000, "2026-07-29")
+            with lock:
+                results.append(result)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(20)]
     for thread in threads:
@@ -390,8 +395,25 @@ def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
     for thread in threads:
         thread.join()
 
+    check(
+        "동시 출석 20개 호출 모두 정상 완료",
+        len(results) == len(threads) and not errors,
+        f"(완료 {len(results)}개, 예외 {errors})",
+    )
     check("동시 출석은 정확히 한 번 성공", sum(result is not None for result in results) == 1)
     check("동시 출석 포인트는 한 번만 지급", repo.get_points(user_id) == 10_000)
+
+    existing_user_id = 151
+    repo.add_points(existing_user_id, 5_000)
+    new_points = repo.claim_attendance(existing_user_id, 10_000, "2026-07-29")
+    check(
+        "기존 유저 출석은 reward만큼 증가",
+        new_points == 15_000 and repo.get_points(existing_user_id) == 15_000,
+    )
+
+    duplicate = repo.claim_attendance(existing_user_id, 99_999, "2026-07-29")
+    check("같은 날짜 순차 중복은 None", duplicate is None)
+    check("같은 날짜 순차 중복은 잔액 불변", repo.get_points(existing_user_id) == 15_000)
 
 
 def test_play_luckybox(repo: SQLiteAttendanceRepository):

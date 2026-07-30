@@ -404,6 +404,30 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
             await command.callback(self.attendance, interaction)
             self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
 
+    async def test_attendance_balance_matches_db_and_duplicate_only_responds_duplicate(self):
+        self.attendance.db.add_points(FakeUser.id, 2_000)
+
+        success = FakeInteraction(channel_id=1)
+        with patch("module.attendance_cog.random.randint", return_value=7_000):
+            await AttendanceCog._attend.callback(self.attendance, success)
+
+        success_args, success_kwargs = success.response.messages[0]
+        self.assertEqual(success_args, ())
+        self.assertEqual(self.attendance.db.get_points(FakeUser.id), 9_000)
+        self.assertEqual(success_kwargs["embed"].fields[0].value, "9,000 P")
+
+        duplicate = FakeInteraction(channel_id=1)
+        with patch("module.attendance_cog.random.randint", return_value=30_000):
+            await AttendanceCog._attend.callback(self.attendance, duplicate)
+
+        duplicate_args, duplicate_kwargs = duplicate.response.messages[0]
+        self.assertEqual(len(duplicate.response.messages), 1)
+        self.assertEqual(len(duplicate_args), 1)
+        self.assertIn("이미 출석", duplicate_args[0])
+        self.assertNotIn("embed", duplicate_kwargs)
+        self.assertIs(duplicate_kwargs.get("ephemeral"), True)
+        self.assertEqual(self.attendance.db.get_points(FakeUser.id), 9_000)
+
     async def test_recruit_selector_and_no_available_games_are_ephemeral(self):
         with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
             selector_interaction = FakeInteraction(channel_id=1)
