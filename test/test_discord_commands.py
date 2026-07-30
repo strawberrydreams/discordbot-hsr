@@ -319,9 +319,9 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             interaction, "", attachment, "gpt-5.6-terra", "none", 0
         )
 
-        self.assertIn("image_url", repr(captured["input"]))
+        self.assertIn(attachment.url, repr(captured["input"]))
         self.assertNotIn(
-            "image_url", repr(list(self.cog.get_session(1).history))
+            attachment.url, repr(list(self.cog.get_session(1).history))
         )
 
     async def test_pre_api_exception_refunds_with_the_original_attendance_cog(self):

@@ -569,10 +569,14 @@ def test_channel_sessions():
     # trim이 system 프롬프트를 보존하는지
     check("trim 후 system 프롬프트 보존", any(m["role"] == "system" for m in s1.history))
 
-    for channel_id in range(cog.MAX_CHANNEL_SESSIONS + 1):
-        cog.get_session(channel_id)
-    check("채널 세션 수 제한", len(cog.sessions) == cog.MAX_CHANNEL_SESSIONS)
-    check("가장 오래된 세션 제거", 0 not in cog.sessions)
+    lru_cog = HyacineChatCog(bot=None)
+    for channel_id in range(lru_cog.MAX_CHANNEL_SESSIONS):
+        lru_cog.get_session(channel_id)
+    lru_cog.get_session(0)
+    lru_cog.get_session(lru_cog.MAX_CHANNEL_SESSIONS)
+    check("채널 세션 수 제한", len(lru_cog.sessions) == lru_cog.MAX_CHANNEL_SESSIONS)
+    check("최근 사용 세션 유지", 0 in lru_cog.sessions)
+    check("가장 오래된 세션 제거", 1 not in lru_cog.sessions)
 
 
 def test_imports():
