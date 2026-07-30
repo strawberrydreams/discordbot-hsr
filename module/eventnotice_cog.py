@@ -2,15 +2,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
+from typing import Optional
 from module.config import EVENT_CHANNEL_ID
 
 class EventNoticeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="이벤트", description="특정 번호의 서버 이벤트 정보를 보여줍니다.")
+    @staticmethod
+    def _valid_events(events, now):
+        return sorted(
+            (event for event in events if not event.end_time or event.end_time > now),
+            key=lambda event: (event.start_time, event.id),
+        )
+
+    @app_commands.command(name="이벤트", description="서버 이벤트 목록 또는 특정 번호의 상세 정보를 보여줍니다.")
     @app_commands.describe(index="이벤트 번호 (1부터 시작)")
-    async def show_specific_event(self, interaction: discord.Interaction, index: int):
+    async def show_specific_event(
+        self, interaction: discord.Interaction, index: Optional[int] = None
+    ):
         # 채널 확인은 defer 전에 수행해야 ephemeral 응답이 가능함
         # (공개 defer 이후의 followup은 ephemeral=True가 무시됨)
         if interaction.channel_id != EVENT_CHANNEL_ID:
@@ -24,13 +34,25 @@ class EventNoticeCog(commands.Cog):
 
         # 현재 유효한 이벤트만 필터링
         now = datetime.now(timezone.utc)
-        valid_events = [
-            event for event in events
-            if not event.end_time or event.end_time > now
-        ]
+        valid_events = self._valid_events(events, now)
 
         if not valid_events:
             await interaction.followup.send("현재 진행 중이거나 예정된 이벤트가 없습니다!")
+            return
+
+        if index is None:
+            lines = [
+                f"`{number}.` **{event.name}** — <t:{int(event.start_time.timestamp())}:F>"
+                for number, event in enumerate(valid_events[:25], start=1)
+            ]
+            if len(valid_events) > 25:
+                lines.append(f"외 {len(valid_events) - 25}개")
+            embed = discord.Embed(
+                title="📅 서버 이벤트 목록",
+                description="\n".join(lines),
+                color=discord.Color.blue(),
+            )
+            await interaction.followup.send(embed=embed)
             return
 
         if index <= 0 or index > len(valid_events):

@@ -58,13 +58,27 @@ class FakeUser:
     avatar = None
 
 
+def fake_event(event_id, name, start_time, end_time=None):
+    return SimpleNamespace(
+        id=event_id,
+        name=name,
+        start_time=start_time,
+        end_time=end_time,
+        description=None,
+        creator=None,
+        location=None,
+        cover_image=None,
+    )
+
+
 class FakeGuild:
-    def __init__(self):
+    def __init__(self, events=None):
         self.fetch_scheduled_events_calls = 0
+        self.events = events or []
 
     async def fetch_scheduled_events(self):
         self.fetch_scheduled_events_calls += 1
-        return []
+        return self.events
 
     def get_member(self, user_id):
         return FakeUser()
@@ -379,6 +393,29 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
         self.assertEqual(guild.fetch_scheduled_events_calls, 0)
+
+    async def test_event_list_and_detail_use_start_time_then_id_order(self):
+        later = datetime(2026, 8, 2, tzinfo=timezone.utc)
+        earlier = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        guild = FakeGuild(
+            [
+                fake_event(2, "두 번째", later),
+                fake_event(3, "같은 시각 뒤", earlier),
+                fake_event(1, "같은 시각 앞", earlier),
+            ]
+        )
+        cog = EventNoticeCog(bot=None)
+
+        listing = FakeInteraction(channel_id=1, guild=guild)
+        detail = FakeInteraction(channel_id=1, guild=guild)
+        with patch("module.eventnotice_cog.EVENT_CHANNEL_ID", 1):
+            await EventNoticeCog.show_specific_event.callback(cog, listing, None)
+            await EventNoticeCog.show_specific_event.callback(cog, detail, 1)
+
+        list_text = listing.followup.messages[0][1]["embed"].description
+        self.assertLess(list_text.index("같은 시각 앞"), list_text.index("같은 시각 뒤"))
+        self.assertLess(list_text.index("같은 시각 뒤"), list_text.index("두 번째"))
+        self.assertIn("같은 시각 앞", detail.followup.messages[0][1]["embed"].title)
 
 
 class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
