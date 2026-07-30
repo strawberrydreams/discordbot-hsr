@@ -2,7 +2,6 @@ from __future__ import annotations
 import discord
 import json
 import re
-import logging
 import unicodedata
 from pathlib import Path
 from typing import List, Optional
@@ -104,7 +103,7 @@ class ForbiddenFilterCog(commands.Cog):
         """JSON을 읽어 내부 캐시에 저장하고 패턴을 갱신합니다."""
         self._banned = load_forbidden_words(DATA_FILE)
         self._banned_pattern = _build_pattern(self._banned)
-        logging.info("📥 금지어 %d개 로드", len(self._banned))
+        print(f"📥 금지어 {len(self._banned)}개 로드")
         return self._banned
 
     @commands.Cog.listener()

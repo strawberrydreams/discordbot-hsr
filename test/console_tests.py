@@ -25,7 +25,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-from contextlib import closing
+from contextlib import closing, redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from dotenv import dotenv_values
@@ -225,6 +226,21 @@ def test_forbidden_words_fail_fast():
         check("금지어 JSON 구조 오류 거부", False)
     except RuntimeError:
         check("금지어 JSON 구조 오류 거부", True)
+
+
+def test_forbidden_words_load_logs_to_stdout():
+    import module.forbiddenfilter_cog as forbiddenfilter_cog
+
+    words = _TMP_DIR / "forbidden-log.json"
+    words.write_text('["금지어"]', encoding="utf-8")
+    output = StringIO()
+    with patch.object(forbiddenfilter_cog, "DATA_FILE", words), redirect_stdout(output):
+        forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+
+    check(
+        "금지어 로드 로그가 stdout에 기록",
+        output.getvalue().strip() == "📥 금지어 1개 로드",
+    )
 
 
 def test_new_install_verifies_after_loading_cogs():
@@ -1113,6 +1129,7 @@ if __name__ == "__main__":
         test_public_env_contract()
         test_compose_env_file_order()
         test_forbidden_words_fail_fast()
+        test_forbidden_words_load_logs_to_stdout()
         test_new_install_verifies_after_loading_cogs()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
