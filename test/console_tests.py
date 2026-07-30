@@ -107,6 +107,28 @@ def test_config_paths():
     )
 
 
+def test_forbidden_words_default_uses_data_dir():
+    import module.config as config
+
+    original_env = os.environ.copy()
+    data_dir = (_TMP_DIR / "isolated-config-data").resolve()
+    try:
+        os.environ["DATA_DIR"] = str(data_dir)
+        os.environ.pop("FORBIDDEN_WORDS_FILE", None)
+        with patch("dotenv.load_dotenv"):
+            importlib.reload(config)
+        default_path = config.FORBIDDEN_WORDS_FILE
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+        importlib.reload(config)
+
+    check(
+        "금지어 기본 경로는 DATA_DIR 사용",
+        default_path == data_dir / "forbidden_words.json",
+    )
+
+
 def test_config_validation():
     import module.config as config
 
@@ -251,6 +273,14 @@ def test_public_env_contract():
     )
     compose_config = json.loads(compose_result.stdout)
     bot_mounts = compose_config["services"]["bot"]["volumes"]
+    check(
+        "Compose는 runtime data를 bot에 bind",
+        any(
+            str(mount.get("source", "")).endswith("runtime/data")
+            and mount.get("target") == "/app/runtime/data"
+            for mount in bot_mounts
+        ),
+    )
     check(
         "Compose는 settings 금지어 파일을 bind하지 않음",
         all(
@@ -1183,6 +1213,7 @@ def test_prune_skips_invalid_utf8_manifest():
 if __name__ == "__main__":
     try:
         test_config_paths()
+        test_forbidden_words_default_uses_data_dir()
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
