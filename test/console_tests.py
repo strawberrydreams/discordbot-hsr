@@ -15,6 +15,7 @@
 
 import datetime
 import asyncio
+import gc
 import importlib
 import json
 import os
@@ -1443,6 +1444,191 @@ def test_pid_file_replaces_stale_after_lock_release():
     )
 
 
+def test_pid_file_replace_occurs_while_companion_lock_is_held():
+    import module.backup as backup
+
+    root = _TMP_DIR / "replace-order-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    lock_path = root / ".service.pid.lock"
+    events = []
+    real_flock = backup.fcntl.flock
+    real_replace = backup.os.replace
+
+    def recording_flock(lock, operation):
+        result = real_flock(lock, operation)
+        if operation & backup.fcntl.LOCK_EX:
+            events.append(("flock", operation))
+        return result
+
+    def recording_replace(source, destination):
+        with lock_path.open("a+b") as contender:
+            try:
+                real_flock(
+                    contender,
+                    backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
+                )
+                held = False
+                real_flock(contender, backup.fcntl.LOCK_UN)
+            except BlockingIOError:
+                held = True
+        events.append(("replace", held))
+        return real_replace(source, destination)
+
+    with patch.object(sys, "platform", "darwin"), \
+         patch.object(backup.fcntl, "flock", side_effect=recording_flock), \
+         patch.object(backup.os, "replace", side_effect=recording_replace):
+        with backup.pid_file(pid_path):
+            pass
+
+    replace_events = [event for event in events if event[0] == "replace"]
+    check(
+        "PID publication은 flock 획득 뒤 os.replace로 수행",
+        len(replace_events) == 1
+        and replace_events[0] == ("replace", True)
+        and events.index(replace_events[0]) > 0
+        and events[0][0] == "flock",
+        f"({events})",
+    )
+
+
+def test_pid_file_unlinks_before_companion_lock_release():
+    import module.backup as backup
+
+    root = _TMP_DIR / "unlink-order-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    lock_path = root / ".service.pid.lock"
+    cleanup_lock_states = []
+    real_unlink = pathlib.Path.unlink
+
+    def recording_unlink(path, *args, **kwargs):
+        if path == pid_path:
+            with lock_path.open("a+b") as contender:
+                try:
+                    backup.fcntl.flock(
+                        contender,
+                        backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
+                    )
+                    held = False
+                    backup.fcntl.flock(contender, backup.fcntl.LOCK_UN)
+                except BlockingIOError:
+                    held = True
+            cleanup_lock_states.append(held)
+        return real_unlink(path, *args, **kwargs)
+
+    with patch.object(sys, "platform", "darwin"), \
+         patch.object(pathlib.Path, "unlink", new=recording_unlink):
+        with backup.pid_file(pid_path):
+            pass
+
+    check(
+        "PID 정상 cleanup은 companion lock 해제 전에 unlink",
+        cleanup_lock_states == [True] and not pid_path.exists(),
+        f"({cleanup_lock_states})",
+    )
+
+
+def test_pid_file_recovers_after_actual_abnormal_child_exit():
+    import module.backup as backup
+
+    root = _TMP_DIR / "abnormal-exit-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    lock_path = root / ".service.pid.lock"
+    child_code = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "import module.backup as backup\n"
+        "backup.sys.platform = 'darwin'\n"
+        "with backup.pid_file(Path(sys.argv[1])):\n"
+        "    os._exit(0)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(pid_path)],
+        cwd=PROJECT_ROOT,
+    )
+    child_pid = child.pid
+    exit_code = child.wait(timeout=10)
+    stale_contents = (
+        pid_path.read_text(encoding="ascii") if pid_path.exists() else None
+    )
+
+    with lock_path.open("a+b") as probe:
+        try:
+            backup.fcntl.flock(
+                probe,
+                backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
+            )
+            released = True
+            backup.fcntl.flock(probe, backup.fcntl.LOCK_UN)
+        except BlockingIOError:
+            released = False
+
+    with patch.object(sys, "platform", "darwin"):
+        with backup.pid_file(pid_path):
+            replacement = pid_path.read_text(encoding="ascii")
+
+    check(
+        "os._exit child는 stale PID를 남기고 kernel lock은 해제",
+        exit_code == 0
+        and stale_contents == f"{child_pid}\n"
+        and released,
+    )
+    check(
+        "abnormal exit 뒤 다음 holder가 stale PID 교체 후 정상 정리",
+        replacement == f"{os.getpid()}\n" and not pid_path.exists(),
+    )
+
+
+def test_pid_file_publication_failure_cleans_temp_lock_and_fds():
+    import module.backup as backup
+
+    root = _TMP_DIR / "failed-publication-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    temporary_path = root / ".service.pid.tmp"
+    fd_root = "/dev/fd" if pathlib.Path("/dev/fd").exists() else "/proc/self/fd"
+    open_fds_before = len(os.listdir(fd_root))
+
+    with patch.object(sys, "platform", "darwin"), \
+         patch.object(backup.os, "replace", side_effect=OSError("publish failed")):
+        try:
+            with backup.pid_file(pid_path):
+                pass
+            failed = False
+        except OSError:
+            failed = True
+
+    gc.collect()
+    open_fds_after_failure = len(os.listdir(fd_root))
+    cleaned_after_failure = not temporary_path.exists() and not pid_path.exists()
+    with patch.object(sys, "platform", "darwin"):
+        try:
+            with backup.pid_file(pid_path):
+                reacquired = True
+        except RuntimeError:
+            reacquired = False
+    gc.collect()
+    open_fds_after_reacquire = len(os.listdir(fd_root))
+
+    check(
+        "PID publication 실패는 temp/PID 파일 정리",
+        failed and cleaned_after_failure,
+    )
+    check(
+        "PID publication 실패 뒤 lock 재획득 및 FD 정리",
+        reacquired
+        and open_fds_after_failure == open_fds_before
+        and open_fds_after_reacquire == open_fds_before,
+        (
+            f"(fd before={open_fds_before}, "
+            f"failure={open_fds_after_failure}, "
+            f"reacquire={open_fds_after_reacquire})"
+        ),
+    )
+
+
 def test_backup_same_timestamp_rejected():
     import module.backup as backup
 
@@ -1661,6 +1847,10 @@ if __name__ == "__main__":
         test_pid_file_linux_is_noop_without_artifacts()
         test_pid_file_rejects_contention_before_handoff()
         test_pid_file_replaces_stale_after_lock_release()
+        test_pid_file_replace_occurs_while_companion_lock_is_held()
+        test_pid_file_unlinks_before_companion_lock_release()
+        test_pid_file_recovers_after_actual_abnormal_child_exit()
+        test_pid_file_publication_failure_cleans_temp_lock_and_fds()
         test_backup_same_timestamp_rejected()
         test_prune_requires_timestamp_bound_filenames()
         test_backup_publication_is_synced()
