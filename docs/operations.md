@@ -8,6 +8,10 @@
 
 Discord 클라이언트의 사용자 설정에서 개발자 모드를 켠 뒤 운영 서버를 우클릭해 서버 ID를 복사하고, `.env.runtime`의 `DISCORD_GUILD_ID`에 넣으세요. 명령 변경은 다음 봇 시작 때 이 운영 길드에 즉시 동기화됩니다.
 
+업그레이드 후 첫 시작은 운영 길드용 명령을 복사한 뒤 기존 전역 명령을 한 번 삭제합니다. 전역 동기화가 성공해야만 `DATA_DIR/.global-commands-cleared` marker가 생성되며, 이후 시작은 전역 API 호출 없이 운영 길드만 동기화합니다. marker를 운영자가 미리 만들지 마세요.
+
+이전 버전의 파티 `created_at` 중 timezone이 없는 값은 Docker가 UTC, launchd가 KST로 기록했을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석합니다. 기존 launchd 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
+
 ### 기존 설치 금지어 파일 마이그레이션
 
 봇을 중지한 뒤 대상 파일이 없는지 확인하고 기존 목록을 복사합니다. 대상 파일이 이미 있으면 덮어쓰지 말고 두 파일을 비교해 사용할 목록을 먼저 결정하세요.
@@ -29,19 +33,39 @@ cmp settings/forbidden_words.json runtime/data/forbidden_words.json
 
 ### macOS LaunchAgent
 
-제공된 plist와 newsyslog 예제는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 plist 템플릿의 Python, 작업 디렉터리, 로그 경로와 newsyslog 예제의 저장소 경로를 실제 절대 경로로 바꾼 뒤 설치합니다.
+제공된 plist와 newsyslog 예제는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 plist 템플릿의 Python, 작업 디렉터리, 로그 경로와 newsyslog 예제의 로그·PID 경로를 실제 절대 경로로 바꾼 뒤 설치합니다.
 
 최초 설치:
 
 ```bash
-mkdir -p "$HOME/Library/LaunchAgents" runtime/logs
+mkdir -p "$HOME/Library/LaunchAgents" runtime/data runtime/backups runtime/logs
 cp deploy/macos/com.discordbot.hsr.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
 cp deploy/macos/com.discordbot.hsr-backup.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
+```
+
+기존의 주기 실행 방식 백업 job을 설치한 호스트는 아래 1회 업그레이드를 먼저 수행합니다. job이 없으면 `launchctl print` 조건이 bootout을 건너뛰며, 다른 실패는 `set -e`로 즉시 중단됩니다.
+
+```bash
+(
+set -euo pipefail
+launchd_domain="gui/$(id -u)"
+backup_target="$launchd_domain/com.discordbot.hsr-backup"
+backup_plist="$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+
+if launchctl print "$backup_target" >/dev/null 2>&1; then
+  launchctl bootout --wait "$backup_target"
+fi
+cp deploy/macos/com.discordbot.hsr-backup.plist.example "$backup_plist"
+plutil -lint "$backup_plist"
+launchctl bootstrap "$launchd_domain" "$backup_plist"
+launchctl kickstart -k "$backup_target"
+)
 ```
 
 로그 로테이션 설치와 구문 확인:
@@ -50,6 +74,8 @@ launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 sudo cp deploy/macos/com.discordbot.hsr.newsyslog.conf.example /etc/newsyslog.d/com.discordbot.hsr.conf
 sudo newsyslog -nvv
 ```
+
+newsyslog 예제의 `strawberrydreams:staff`도 실제 LaunchAgent 사용자와 그룹(`id -un`, `id -gn`)으로 바꾸세요. 네 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
 
 상태와 로그:
 
@@ -68,10 +94,13 @@ Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secr
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 
 ```bash
+docker compose config --quiet
 docker compose build bot
 docker compose up -d
 docker compose logs --tail=100 bot
 ```
+
+Docker Compose CLI가 없는 개발 환경에서 콘솔 suite는 rendered Compose 검사만 `SKIP`하고 plist/newsyslog 검사를 계속합니다. CI 또는 실제 Docker 배포 호스트에서는 `docker compose config --quiet`가 반드시 성공해야 하며 이 `SKIP`을 배포 검증으로 대신할 수 없습니다.
 
 Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 
@@ -205,7 +234,7 @@ esac
 
 ## 배포
 
-변경을 모아 한 번에 배포합니다. macOS는 **테스트 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**, Docker는 **테스트 → 이미지 빌드 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작** 순서로 진행합니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
+변경을 모아 한 번에 배포합니다. macOS는 **테스트 → 온라인 백업 생성 → 백업 검증 → 봇·백업 재시작**, Docker는 **테스트 → 이미지 빌드 → 온라인 백업 생성 → 백업 검증 → 봇·백업 재시작** 순서로 진행합니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
 macOS:
 
@@ -217,6 +246,7 @@ git pull --ff-only
 .venv/bin/python -m test.console_tests
 .venv/bin/python -m module.backup create
 .venv/bin/python -m module.backup verify
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 tail -n 100 runtime/logs/bot.log
 )
@@ -230,6 +260,7 @@ set -euo pipefail
 git rev-parse HEAD
 git pull --ff-only
 .venv/bin/python -m test.console_tests
+docker compose config --quiet
 docker compose build bot
 BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
 test -n "$BACKUP_MANIFEST"
@@ -258,6 +289,7 @@ case "$ROLLBACK_MODE" in
 esac
 
 .venv/bin/python -m test.console_tests
+launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 )
 ```
@@ -277,6 +309,7 @@ case "$ROLLBACK_MODE" in
 esac
 
 .venv/bin/python -m test.console_tests
+docker compose config --quiet
 docker compose build bot
 docker compose run --rm --no-deps backup python -m module.backup verify
 docker compose up -d --no-deps bot backup

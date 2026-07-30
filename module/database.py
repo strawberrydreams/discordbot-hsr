@@ -15,14 +15,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import pathlib
 import sqlite3
 from abc import ABC, abstractmethod
 from contextlib import closing
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
-
 from module.config import DATA_DIR, DB_BACKEND
 
 
@@ -295,12 +293,22 @@ class SQLitePartyRepository(PartyRepository):
                         value = value.decode()
                     parsed = datetime.fromisoformat(str(value))
                     if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                        parsed = parsed.replace(tzinfo=timezone.utc)
                     timestamp = int(parsed.timestamp())
                 cursor.execute(
                     "UPDATE parties SET created_at = ? WHERE game = ?",
                     (timestamp, game),
                 )
+            cursor.execute(
+                """
+                DELETE FROM participants
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM parties
+                    WHERE parties.game = participants.game
+                )
+                """
+            )
             conn.commit()
 
     def get_party(self, game: str) -> Optional[Tuple[int]]:

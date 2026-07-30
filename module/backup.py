@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +24,21 @@ DATABASES = {
     "attendance_data.db": {"users"},
     "party_data.db": {"parties", "participants"},
 }
+
+
+@contextmanager
+def pid_file(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    contents = f"{os.getpid()}\n"
+    path.write_text(contents, encoding="ascii")
+    try:
+        yield
+    finally:
+        try:
+            if path.read_text(encoding="ascii") == contents:
+                path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _require_positive(name: str, value: int) -> None:
@@ -341,14 +356,15 @@ def main() -> int:
         return 0
 
     _validate_backup_settings()
-    while True:
-        try:
-            print(create_backup_set())
-        except Exception as exc:
-            print(f"백업 실패: {exc}", flush=True)
-            time.sleep(min(60, BACKUP_INTERVAL_SECONDS))
-            continue
-        time.sleep(BACKUP_INTERVAL_SECONDS)
+    with pid_file(BACKUP_DIR / ".backup.pid"):
+        while True:
+            try:
+                print(create_backup_set())
+            except Exception as exc:
+                print(f"백업 실패: {exc}", flush=True)
+                time.sleep(min(60, BACKUP_INTERVAL_SECONDS))
+                continue
+            time.sleep(BACKUP_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

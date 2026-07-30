@@ -51,16 +51,28 @@ class HyacineImageCog(commands.Cog):
 
         charged = True
         refunded = False
+        refund_attempted = False
+        refund_failed = False
         generation_completed = False
         filepath = None
         uploaded = False
         file = None
 
         def refund_points() -> bool:
-            nonlocal refunded
-            if not charged or refunded or generation_completed:
+            nonlocal refund_attempted, refund_failed, refunded
+            if not charged or refund_attempted or generation_completed:
                 return False
-            attendance_cog.add_points(inter.user.id, cost)
+            refund_attempted = True
+            try:
+                attendance_cog.add_points(inter.user.id, cost)
+            except Exception:
+                refund_failed = True
+                print(
+                    "❌ [hyacine_image] 포인트 자동 환불 실패 "
+                    f"(user={inter.user.id}, amount={cost})"
+                )
+                traceback.print_exc()
+                return False
             refunded = True
             return True
 
@@ -90,7 +102,16 @@ class HyacineImageCog(commands.Cog):
             if image_data is None:
                 refund_points()
                 print(f"⚠️ Image generation blocked/failed. Response: {response}")
-                await inter.followup.send("❌ 이미지를 생성하지 못했어요. 포인트는 환불해 드렸습니다.\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)")
+                message = "❌ 이미지를 생성하지 못했어요."
+                if refunded:
+                    message += " 포인트는 환불해 드렸습니다."
+                elif refund_failed:
+                    message += (
+                        " 자동 환불에 실패했습니다. "
+                        "관리자에게 수동 정산을 요청해 주세요."
+                    )
+                message += "\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)"
+                await inter.followup.send(message)
                 return
 
             generation_completed = True
@@ -129,8 +150,16 @@ class HyacineImageCog(commands.Cog):
                 message = "❌ 이미지 생성 중 오류가 발생했어요."
                 if refunded:
                     message += " 포인트는 환불해 드렸습니다."
+                elif refund_failed:
+                    message += (
+                        " 자동 환불에 실패했습니다. "
+                        "관리자에게 수동 정산을 요청해 주세요."
+                    )
             try:
-                await inter.followup.send(message)
+                if inter.response.is_done():
+                    await inter.followup.send(message)
+                else:
+                    await inter.response.send_message(message, ephemeral=True)
             except Exception:
                 print(f"⚠️ [hyacine_image] 오류 메시지 전송 실패 (user={inter.user.id})")
         finally:

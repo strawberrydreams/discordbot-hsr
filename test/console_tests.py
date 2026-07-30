@@ -269,23 +269,33 @@ def test_public_env_contract():
 def test_deployment_contracts():
     import plistlib
 
-    compose_result = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "config",
-            "--no-env-resolution",
-            "--format",
-            "json",
-        ],
-        cwd=PROJECT_ROOT,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    services = json.loads(compose_result.stdout)["services"]
-    bot = services["bot"]
-    backup = services["backup"]
+    services = None
+    docker = shutil.which("docker")
+    if docker is not None:
+        compose_version = subprocess.run(
+            [docker, "compose", "version"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if compose_version.returncode == 0:
+            compose_result = subprocess.run(
+                [
+                    docker,
+                    "compose",
+                    "config",
+                    "--no-env-resolution",
+                    "--format",
+                    "json",
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            services = json.loads(compose_result.stdout)["services"]
+
     bot_plist = plistlib.loads(
         (
             PROJECT_ROOT / "deploy/macos/com.discordbot.hsr.plist.example"
@@ -305,60 +315,72 @@ def test_deployment_contracts():
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
-    check("Compose 이미지는 한 번만 빌드", "build" in bot and "build" not in backup)
-    check(
-        "두 서비스가 같은 이미지 사용",
-        bot.get("image") == backup.get("image") == "discordbot-hsr:local",
-    )
-    check(
-        "Compose 두 서비스 secrets 파일 우선",
-        all(
-            [pathlib.Path(item["path"]).name for item in service["env_file"]]
-            == [".env.runtime", ".env.secrets"]
-            for service in (bot, backup)
-        ),
-    )
-    check(
-        "Compose runtime data 권한 분리",
-        any(
-            str(mount.get("source", "")).endswith("runtime/data")
-            and mount.get("target") == "/app/runtime/data"
-            and not mount.get("read_only", False)
-            for mount in bot["volumes"]
+    if services is None:
+        print(
+            "  ⏭️ SKIP: rendered Compose deployment checks "
+            "(Docker Compose CLI unavailable)"
         )
-        and any(
-            str(mount.get("source", "")).endswith("runtime/data")
-            and mount.get("target") == "/app/runtime/data"
-            and mount.get("read_only") is True
-            for mount in backup["volumes"]
-        ),
-    )
-    check(
-        "settings 금지어 bind 제거",
-        all(
-            not str(mount.get("source", "")).endswith(
-                "settings/forbidden_words.json"
+    else:
+        bot = services["bot"]
+        backup = services["backup"]
+        check(
+            "Compose 이미지는 한 번만 빌드",
+            "build" in bot and "build" not in backup,
+        )
+        check(
+            "두 서비스가 같은 이미지 사용",
+            bot.get("image") == backup.get("image") == "discordbot-hsr:local",
+        )
+        check(
+            "Compose 두 서비스 secrets 파일 우선",
+            all(
+                [pathlib.Path(item["path"]).name for item in service["env_file"]]
+                == [".env.runtime", ".env.secrets"]
+                for service in (bot, backup)
+            ),
+        )
+        check(
+            "Compose runtime data 권한 분리",
+            any(
+                str(mount.get("source", "")).endswith("runtime/data")
+                and mount.get("target") == "/app/runtime/data"
+                and not mount.get("read_only", False)
+                for mount in bot["volumes"]
             )
-            for service in (bot, backup)
-            for mount in service["volumes"]
-        ),
-    )
-    check(
-        "Compose 로그 크기 제한",
-        all(
-            service.get("logging", {}).get("driver") == "json-file"
-            and service.get("logging", {}).get("options", {}).get("max-size")
-            == "10m"
-            for service in (bot, backup)
-        ),
-    )
-    check(
-        "Compose 로그 파일 수 제한",
-        all(
-            service.get("logging", {}).get("options", {}).get("max-file") == "5"
-            for service in (bot, backup)
-        ),
-    )
+            and any(
+                str(mount.get("source", "")).endswith("runtime/data")
+                and mount.get("target") == "/app/runtime/data"
+                and mount.get("read_only") is True
+                for mount in backup["volumes"]
+            ),
+        )
+        check(
+            "settings 금지어 bind 제거",
+            all(
+                not str(mount.get("source", "")).endswith(
+                    "settings/forbidden_words.json"
+                )
+                for service in (bot, backup)
+                for mount in service["volumes"]
+            ),
+        )
+        check(
+            "Compose 로그 크기 제한",
+            all(
+                service.get("logging", {}).get("driver") == "json-file"
+                and service.get("logging", {}).get("options", {}).get("max-size")
+                == "10m"
+                for service in (bot, backup)
+            ),
+        )
+        check(
+            "Compose 로그 파일 수 제한",
+            all(
+                service.get("logging", {}).get("options", {}).get("max-file")
+                == "5"
+                for service in (bot, backup)
+            ),
+        )
     check(
         "launchd 백업은 env 주기 loop 사용",
         backup_plist["ProgramArguments"]
@@ -374,7 +396,7 @@ def test_deployment_contracts():
     check(
         "newsyslog는 두 LaunchAgent 로그만 관리",
         len(newsyslog_entries) == 4
-        and all(len(entry) == 6 for entry in newsyslog_entries)
+        and all(len(entry) == 9 for entry in newsyslog_entries)
         and {entry[0] for entry in newsyslog_entries}
         == {
             bot_plist["StandardOutPath"],
@@ -382,6 +404,56 @@ def test_deployment_contracts():
             backup_plist["StandardOutPath"],
             backup_plist["StandardErrorPath"],
         },
+    )
+    check(
+        "newsyslog replacement 로그 owner/group 명시",
+        all(entry[1] == "strawberrydreams:staff" for entry in newsyslog_entries),
+    )
+    working_directory = pathlib.Path(bot_plist["WorkingDirectory"])
+    expected_pid_by_log = {
+        bot_plist["StandardOutPath"]: str(
+            working_directory / "runtime/data/.bot.pid"
+        ),
+        bot_plist["StandardErrorPath"]: str(
+            working_directory / "runtime/data/.bot.pid"
+        ),
+        backup_plist["StandardOutPath"]: str(
+            working_directory / "runtime/backups/.backup.pid"
+        ),
+        backup_plist["StandardErrorPath"]: str(
+            working_directory / "runtime/backups/.backup.pid"
+        ),
+    }
+    check(
+        "newsyslog 네 항목은 올바른 PID에 SIGHUP 전달",
+        all(
+            len(entry) == 9
+            and entry[7] == expected_pid_by_log.get(entry[0])
+            and entry[8] == "1"
+            for entry in newsyslog_entries
+        ),
+    )
+
+
+def test_deployment_contracts_skip_only_compose_when_cli_missing():
+    output = StringIO()
+    error = None
+    with patch.object(shutil, "which", return_value=None), redirect_stdout(output):
+        try:
+            test_deployment_contracts()
+        except (OSError, subprocess.SubprocessError) as exc:
+            error = exc
+
+    rendered = output.getvalue()
+    check("Compose CLI 부재 시 deployment suite 계속 실행", error is None)
+    check(
+        "Compose CLI 부재를 명시적 SKIP으로 출력",
+        "SKIP: rendered Compose deployment checks" in rendered,
+    )
+    check(
+        "Compose CLI 부재에도 plist/newsyslog 검증 유지",
+        "launchd 백업은 env 주기 loop 사용" in rendered
+        and "newsyslog 네 항목은 올바른 PID에 SIGHUP 전달" in rendered,
     )
 
 
@@ -423,13 +495,23 @@ def test_new_install_verifies_after_loading_cogs():
     import module.main as main
 
     events = []
+    data_dir = _TMP_DIR / "new-install-data"
+    data_dir.mkdir(exist_ok=True)
+    marker = data_dir / ".global-commands-cleared"
+    marker.unlink(missing_ok=True)
 
     class FakeTree:
         def copy_global_to(self, *, guild):
             events.append(f"copy:{guild.id}")
 
-        async def sync(self, *, guild):
-            events.append(f"sync:{guild.id}")
+        def clear_commands(self, *, guild):
+            events.append(f"clear:{guild}")
+
+        async def sync(self, *, guild=None):
+            if guild is None:
+                events.append(f"sync:global:marker={marker.exists()}")
+            else:
+                events.append(f"sync:{guild.id}:marker={marker.exists()}")
 
     class FakeBot:
         tree = FakeTree()
@@ -441,7 +523,7 @@ def test_new_install_verifies_after_loading_cogs():
         events.append(f"verify:{path.name}")
         return {}
 
-    with patch.object(pathlib.Path, "exists", return_value=False), \
+    with patch.object(main, "DATA_DIR", data_dir), \
          patch.object(main, "verify_database", side_effect=verify), \
          patch.object(main, "DISCORD_GUILD_ID", 123):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
@@ -451,9 +533,54 @@ def test_new_install_verifies_after_loading_cogs():
         "verify:attendance_data.db",
         "verify:party_data.db",
         "copy:123",
-        "sync:123",
+        "clear:None",
+        "sync:global:marker=False",
+        "sync:123:marker=True",
     ]
     check("신규 설치는 Cog 로드 전 DB 검증 생략", events == expected, f"({events})")
+    check("global command 정리 marker는 global sync 성공 후 생성", marker.is_file())
+
+
+def test_existing_global_cleanup_marker_skips_only_global_sync():
+    import module.main as main
+
+    events = []
+    data_dir = _TMP_DIR / "existing-global-cleanup-data"
+    data_dir.mkdir(exist_ok=True)
+    marker = data_dir / ".global-commands-cleared"
+    marker.touch()
+
+    class FakeTree:
+        def copy_global_to(self, *, guild):
+            events.append(f"copy:{guild.id}")
+
+        def clear_commands(self, *, guild):
+            events.append(f"clear:{guild}")
+
+        async def sync(self, *, guild=None):
+            events.append("sync:global" if guild is None else f"sync:{guild.id}")
+
+    class FakeBot:
+        tree = FakeTree()
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+
+    with patch.object(main, "DATA_DIR", data_dir), \
+         patch.object(main, "_verify_databases"), \
+         patch.object(main, "DISCORD_GUILD_ID", 456):
+        asyncio.run(main.MyBot.setup_hook(FakeBot()))
+
+    expected = [
+        *(f"load:{extension}" for extension in main.EXTENSIONS),
+        "copy:456",
+        "sync:456",
+    ]
+    check(
+        "기존 marker는 global sync만 생략하고 guild sync 유지",
+        events == expected,
+        f"({events})",
+    )
 
 
 def test_startup_preverification_failure_stops_cogs_and_sync():
@@ -575,6 +702,12 @@ def test_main_holds_instance_lock_while_bot_runs():
         return
 
     events = []
+    data_dir = _TMP_DIR / "main-pid-data"
+    backup_dir = _TMP_DIR / "main-pid-backups"
+    data_dir.mkdir(exist_ok=True)
+    backup_dir.mkdir(exist_ok=True)
+    pid_path = data_dir / ".bot.pid"
+    pid_path.unlink(missing_ok=True)
 
     class FakeLock:
         def __enter__(self):
@@ -585,6 +718,8 @@ def test_main_holds_instance_lock_while_bot_runs():
 
     class FakeBot:
         def run(self, token):
+            value = pid_path.read_text(encoding="ascii").strip() if pid_path.exists() else "missing"
+            events.append(f"pid:{value}")
             events.append("run")
 
     def acquire(path):
@@ -592,16 +727,25 @@ def test_main_holds_instance_lock_while_bot_runs():
         return FakeLock()
 
     with patch.object(main, "validate_config"), \
-         patch.object(pathlib.Path, "mkdir"), \
+         patch.object(main, "DATA_DIR", data_dir), \
+         patch.object(main, "BACKUP_DIR", backup_dir), \
          patch.object(main, "acquire_instance_lock", side_effect=acquire), \
          patch.object(main, "MyBot", FakeBot):
         main.main()
 
     check(
-        "봇 실행 수명 동안 인스턴스 잠금 유지",
-        events == ["acquire:.bot.lock", "lock", "run", "unlock"],
+        "봇 실행 수명 동안 lock과 현재 PID 유지",
+        events
+        == [
+            "acquire:.bot.lock",
+            "lock",
+            f"pid:{os.getpid()}",
+            "run",
+            "unlock",
+        ],
         f"({events})",
     )
+    check("봇 정상 종료 시 PID 파일 정리", not pid_path.exists())
 
 
 def test_importing_main_does_not_construct_bot():
@@ -834,28 +978,46 @@ def test_party_repository():
         conn.executemany(
             "INSERT INTO parties VALUES (?, ?)",
             (
-                ("Legacy", "2026-07-29 12:00:00"),
+                ("DockerNaive", "2026-07-29 12:00:00"),
+                ("KstOriginNaive", "2026-07-29 12:00:00"),
+                ("AwareKST", "2026-07-29T12:00:00+09:00"),
                 ("BlobLegacy", sqlite3.Binary(b"2026-07-29 12:00:00")),
                 ("RealLegacy", 1_785_294_000.75),
+                ("IntegerLegacy", 1_785_294_000),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO participants VALUES (?, ?, ?)",
+            (
+                ("DockerNaive", 50, "valid"),
+                ("MissingParty", 51, "orphan"),
             ),
         )
         conn.commit()
 
     repo_with_legacy = SQLitePartyRepository(legacy_db)
-    legacy_value = repo_with_legacy.get_party("Legacy")[0]
+    docker_value = repo_with_legacy.get_party("DockerNaive")[0]
     check(
-        "legacy KST 파티 시각을 UTC epoch로 변환",
-        legacy_value == 1_785_294_000 and isinstance(legacy_value, int),
-        f"(변환값 {legacy_value!r})",
+        "Docker legacy naive UTC 시각을 동일 UTC epoch로 변환",
+        docker_value == 1_785_326_400 and isinstance(docker_value, int),
+        f"(변환값 {docker_value!r})",
+    )
+    check(
+        "launchd legacy naive KST 시각은 보수적으로 UTC 해석",
+        repo_with_legacy.get_party("KstOriginNaive") == (1_785_326_400,),
+    )
+    check(
+        "timezone-aware legacy 시각은 명시된 offset 반영",
+        repo_with_legacy.get_party("AwareKST") == (1_785_294_000,),
     )
     SQLitePartyRepository(legacy_db)
     check(
         "legacy 파티 시각 마이그레이션은 재실행해도 동일",
-        repo_with_legacy.get_party("Legacy") == (1_785_294_000,),
+        repo_with_legacy.get_party("DockerNaive") == (1_785_326_400,),
     )
     check(
         "BLOB legacy 파티 시각도 UTC epoch로 변환",
-        repo_with_legacy.get_party("BlobLegacy") == (1_785_294_000,),
+        repo_with_legacy.get_party("BlobLegacy") == (1_785_326_400,),
     )
     real_value = repo_with_legacy.get_party("RealLegacy")
     check(
@@ -863,6 +1025,36 @@ def test_party_repository():
         real_value == (1_785_294_000,)
         and isinstance(real_value[0], int),
         f"(변환값 {real_value!r})",
+    )
+    check(
+        "INTEGER legacy epoch는 값과 타입 유지",
+        repo_with_legacy.get_party("IntegerLegacy") == (1_785_294_000,)
+        and isinstance(repo_with_legacy.get_party("IntegerLegacy")[0], int),
+    )
+    check(
+        "legacy migration은 유효 참가자 보존",
+        repo_with_legacy.get_user_party(50) == "DockerNaive",
+    )
+    check(
+        "legacy migration은 고아 참가자 제거",
+        repo_with_legacy.get_user_party(51) is None,
+    )
+    with closing(sqlite3.connect(legacy_db)) as conn:
+        orphan_count = conn.execute(
+            "SELECT COUNT(*) FROM participants WHERE game = 'MissingParty'"
+        ).fetchone()[0]
+    check("고아 참가자 삭제가 DB에 영구 반영", orphan_count == 0)
+    first_expiry = repo_with_legacy.delete_expired_parties(1_785_294_001)
+    check(
+        "naive KST-origin 파티는 실제 만료 시각에 조기 삭제되지 않음",
+        "KstOriginNaive" not in first_expiry
+        and repo_with_legacy.get_party("KstOriginNaive") is not None,
+    )
+    second_expiry = repo_with_legacy.delete_expired_parties(1_785_326_401)
+    check(
+        "naive KST-origin 파티는 최대 9시간 뒤 정상 정리",
+        "KstOriginNaive" in second_expiry
+        and repo_with_legacy.get_party("KstOriginNaive") is None,
     )
 
     null_db = _TMP_DIR / "party_legacy_null_time.db"
@@ -1118,6 +1310,52 @@ def test_invalid_interval_prevents_loop_entry():
     backup.BACKUP_INTERVAL_SECONDS = 21600
 
 
+def test_backup_loop_pid_lifecycle():
+    import module.backup as backup
+
+    backup_dir = _TMP_DIR / "loop-pid-backups"
+    backup_dir.mkdir(exist_ok=True)
+    pid_path = backup_dir / ".backup.pid"
+    pid_path.unlink(missing_ok=True)
+    observed = []
+
+    def stop_loop():
+        observed.append(
+            pid_path.read_text(encoding="ascii").strip()
+            if pid_path.exists()
+            else "missing"
+        )
+        raise KeyboardInterrupt
+
+    with patch.object(backup, "BACKUP_DIR", backup_dir), \
+         patch.object(backup, "_validate_backup_settings"), \
+         patch.object(backup, "create_backup_set", side_effect=stop_loop), \
+         patch.object(sys, "argv", ["backup", "loop"]):
+        try:
+            backup.main()
+        except KeyboardInterrupt:
+            pass
+
+    check("backup loop 실행 중 현재 PID 게시", observed == [str(os.getpid())])
+    check("backup loop 정상 unwind 시 PID 파일 정리", not pid_path.exists())
+
+
+def test_pid_file_preserves_replacement_owner():
+    import module.backup as backup
+
+    pid_path = _TMP_DIR / "replacement-owner.pid"
+    pid_path.unlink(missing_ok=True)
+    with backup.pid_file(pid_path):
+        pid_path.write_text("999999\n", encoding="ascii")
+
+    check(
+        "PID cleanup은 다른 프로세스가 교체한 파일 보존",
+        pid_path.exists()
+        and pid_path.read_text(encoding="ascii") == "999999\n",
+    )
+    pid_path.unlink(missing_ok=True)
+
+
 def test_backup_same_timestamp_rejected():
     import module.backup as backup
 
@@ -1305,9 +1543,11 @@ if __name__ == "__main__":
         test_split_env_loading()
         test_public_env_contract()
         test_deployment_contracts()
+        test_deployment_contracts_skip_only_compose_when_cli_missing()
         test_forbidden_words_fail_fast()
         test_forbidden_words_load_logs_to_stdout()
         test_new_install_verifies_after_loading_cogs()
+        test_existing_global_cleanup_marker_skips_only_global_sync()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
@@ -1329,6 +1569,8 @@ if __name__ == "__main__":
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()
         test_invalid_interval_prevents_loop_entry()
+        test_backup_loop_pid_lifecycle()
+        test_pid_file_preserves_replacement_owner()
         test_backup_same_timestamp_rejected()
         test_prune_requires_timestamp_bound_filenames()
         test_backup_publication_is_synced()

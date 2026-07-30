@@ -132,6 +132,7 @@ class RecordingAttendance:
     def __init__(self, refund_error=None):
         self.deductions = []
         self.refunds = []
+        self.refund_attempts = []
         self.refund_error = refund_error
 
     def deduct_points(self, user_id, amount):
@@ -139,12 +140,42 @@ class RecordingAttendance:
         return True
 
     def add_points(self, user_id, amount):
+        self.refund_attempts.append((user_id, amount))
         if self.refund_error:
             raise self.refund_error
         self.refunds.append((user_id, amount))
 
 
 class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_defer_and_refund_failures_request_manual_reconciliation_once(self):
+        attendance = RecordingAttendance(
+            refund_error=RuntimeError("database unavailable")
+        )
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+
+        async def fail_defer():
+            raise RuntimeError("defer transport failed")
+
+        interaction.response.defer = fail_defer
+        escaped = None
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            try:
+                await HyacineImageCog._image.callback(cog, interaction, "test")
+            except Exception as exc:
+                escaped = exc
+
+        self.assertIsNone(escaped)
+        self.assertEqual(attendance.refund_attempts, [(123, 50_000)])
+        messages = interaction.response.messages + interaction.followup.messages
+        self.assertTrue(messages)
+        message = messages[-1][0][0]
+        self.assertIn("자동 환불에 실패", message)
+        self.assertIn("관리자", message)
+        self.assertIn("수동 정산", message)
+
     async def test_generation_exception_refunds_once_when_error_message_fails(self):
         attendance = RecordingAttendance()
         interaction = FakeInteraction(channel_id=1)
