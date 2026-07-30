@@ -284,9 +284,11 @@ class SQLitePartyRepository(PartyRepository):
             """)
             cursor.execute("SELECT game, created_at FROM parties")
             for game, value in cursor.fetchall():
-                if isinstance(value, int):
+                if value is None:
+                    timestamp = 0  # Legacy NULL is immediately eligible for normal expiry.
+                elif isinstance(value, int):
                     continue
-                if isinstance(value, float):
+                elif isinstance(value, float):
                     timestamp = int(value)
                 else:
                     if isinstance(value, bytes):

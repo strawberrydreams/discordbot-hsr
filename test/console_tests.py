@@ -550,6 +550,21 @@ def test_party_repository():
         f"(변환값 {real_value!r})",
     )
 
+    null_db = _TMP_DIR / "party_legacy_null_time.db"
+    with closing(sqlite3.connect(null_db)) as conn:
+        conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
+        conn.execute("INSERT INTO parties VALUES (?, ?)", ("NullLegacy", None))
+        conn.commit()
+    try:
+        null_value = SQLitePartyRepository(null_db).get_party("NullLegacy")
+    except ValueError:
+        null_value = None
+    check(
+        "NULL legacy 파티 시각을 epoch 0으로 정규화",
+        null_value == (0,) and isinstance(null_value[0], int),
+        f"(변환값 {null_value!r})",
+    )
+
 
 def test_party_cog_uses_epoch_seconds():
     from module.playwith_cog import PlayWithCog
