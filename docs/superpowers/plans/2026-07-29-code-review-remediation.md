@@ -1079,15 +1079,19 @@ git commit -m "fix: sync commands to the configured guild"
 
 ```python
 import module.forbiddenfilter_cog as forbiddenfilter_cog
+from contextlib import redirect_stdout
+from io import StringIO
 
 words = _TMP_DIR / "forbidden-log.json"
 words.write_text('["금지어"]', encoding="utf-8")
-with patch.object(forbiddenfilter_cog, "DATA_FILE", words), \
-     patch("module.forbiddenfilter_cog.print") as output:
-    cog = forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+output = StringIO()
+with patch.object(forbiddenfilter_cog, "DATA_FILE", words), redirect_stdout(output):
+    forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
 
-output.assert_called_once_with("📥 금지어 1개 로드")
-check("금지어 로드 로그가 stdout에 기록", output.call_count == 1)
+check(
+    "금지어 로드 로그가 stdout에 기록",
+    output.getvalue().strip() == "📥 금지어 1개 로드",
+)
 ```
 
 - [ ] **Step 2: 테스트 실패 확인**
@@ -1191,14 +1195,27 @@ check(
 `.env.example` 계약에는 정확한 공개 값을 검사한다.
 
 ```python
+import json
+
 check(
     "공개 env 금지어 경로",
     example["FORBIDDEN_WORDS_FILE"] == "runtime/data/forbidden_words.json",
 )
-compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+compose_result = subprocess.run(
+    ["docker", "compose", "config", "--format", "json"],
+    cwd=PROJECT_ROOT,
+    check=True,
+    text=True,
+    capture_output=True,
+)
+compose_config = json.loads(compose_result.stdout)
+bot_mounts = compose_config["services"]["bot"]["volumes"]
 check(
     "Compose는 settings 금지어 파일을 bind하지 않음",
-    "settings/forbidden_words.json" not in compose,
+    all(
+        not str(mount.get("source", "")).endswith("settings/forbidden_words.json")
+        for mount in bot_mounts
+    ),
 )
 ```
 
@@ -1320,20 +1337,48 @@ git commit -m "fix: keep moderation data outside git worktrees"
 
 ```python
 def test_deployment_contracts():
-    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
-    backup_plist = (
-        PROJECT_ROOT / "deploy/macos/com.discordbot.hsr-backup.plist.example"
-    ).read_text(encoding="utf-8")
+    import json
+    import plistlib
 
-    check("Compose 두 서비스 secrets 파일 우선",
-          compose.count("    env_file:\n      - .env.runtime\n      - .env.secrets\n") == 2)
-    check("Compose 이미지는 한 번만 빌드", compose.count("build: .") == 1)
-    check("두 서비스가 같은 이미지 사용", compose.count("image: discordbot-hsr:local") == 2)
-    check("settings 금지어 bind 제거", "settings/forbidden_words.json" not in compose)
-    check("Compose 로그 크기 제한", compose.count('max-size: "10m"') == 2)
-    check("Compose 로그 파일 수 제한", compose.count('max-file: "5"') == 2)
-    check("launchd 백업은 env 주기 loop 사용",
-          "<string>loop</string>" in backup_plist and "<key>StartInterval</key>" not in backup_plist)
+    compose_result = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    services = json.loads(compose_result.stdout)["services"]
+    bot = services["bot"]
+    backup = services["backup"]
+    backup_plist = plistlib.loads(
+        (
+            PROJECT_ROOT / "deploy/macos/com.discordbot.hsr-backup.plist.example"
+        ).read_bytes()
+    )
+
+    check("Compose 이미지는 한 번만 빌드", "build" in bot and "build" not in backup)
+    check("두 서비스가 같은 이미지 사용", bot["image"] == backup["image"] == "discordbot-hsr:local")
+    check(
+        "settings 금지어 bind 제거",
+        all(
+            not str(mount.get("source", "")).endswith("settings/forbidden_words.json")
+            for mount in bot["volumes"]
+        ),
+    )
+    check(
+        "Compose 로그 크기 제한",
+        all(service["logging"]["options"]["max-size"] == "10m" for service in (bot, backup)),
+    )
+    check(
+        "Compose 로그 파일 수 제한",
+        all(service["logging"]["options"]["max-file"] == "5" for service in (bot, backup)),
+    )
+    check(
+        "launchd 백업은 env 주기 loop 사용",
+        backup_plist["ProgramArguments"][-1] == "loop"
+        and "StartInterval" not in backup_plist
+        and backup_plist["KeepAlive"] is True,
+    )
 ```
 
 - [ ] **Step 2: 테스트 실패 확인**
