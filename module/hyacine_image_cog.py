@@ -49,9 +49,24 @@ class HyacineImageCog(commands.Cog):
             await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
             return
 
-        await inter.response.defer()
+        charged = True
+        refunded = False
+        generation_completed = False
+        filepath = None
+        uploaded = False
+        file = None
+
+        def refund_points() -> bool:
+            nonlocal refunded
+            if not charged or refunded or generation_completed:
+                return False
+            attendance_cog.add_points(inter.user.id, cost)
+            refunded = True
+            return True
 
         try:
+            await inter.response.defer()
+
             # 1. Request Image Generation
             loop = asyncio.get_running_loop()
 
@@ -73,11 +88,12 @@ class HyacineImageCog(commands.Cog):
                     break
 
             if image_data is None:
-                # Refund on failure
-                attendance_cog.add_points(inter.user.id, cost)
+                refund_points()
                 print(f"⚠️ Image generation blocked/failed. Response: {response}")
                 await inter.followup.send("❌ 이미지를 생성하지 못했어요. 포인트는 환불해 드렸습니다.\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)")
                 return
+
+            generation_completed = True
             
             # 2. Save to a local file
             filename = f"{uuid.uuid4()}.png"
@@ -97,17 +113,34 @@ class HyacineImageCog(commands.Cog):
             embed.set_footer(text=f"Model: {IMAGE_MODEL} | 비용: {cost:,} P | 5분 후 서버에서 삭제됨")
             
             await inter.followup.send(embed=embed, file=file)
+            uploaded = True
             
             # 4. Schedule deletion
             self.bot.loop.create_task(self._delete_file_after_delay(filepath, 300))
 
         except Exception:
-            # Refund on error
-            attendance_cog.add_points(inter.user.id, cost)
+            refund_points()
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_image] 이미지 생성 실패 (user={inter.user.id})")
             traceback.print_exc()
-            await inter.followup.send("❌ 이미지 생성 중 오류가 발생했어요. 포인트는 환불해 드렸습니다.")
+            if generation_completed:
+                message = "❌ 이미지는 생성되었지만 Discord 전송에 실패했습니다."
+            else:
+                message = "❌ 이미지 생성 중 오류가 발생했어요."
+                if refunded:
+                    message += " 포인트는 환불해 드렸습니다."
+            try:
+                await inter.followup.send(message)
+            except Exception:
+                print(f"⚠️ [hyacine_image] 오류 메시지 전송 실패 (user={inter.user.id})")
+        finally:
+            if file is not None:
+                file.close()
+            if filepath and not uploaded:
+                try:
+                    os.remove(filepath)
+                except FileNotFoundError:
+                    pass
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HyacineImageCog(bot))

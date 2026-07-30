@@ -13,6 +13,7 @@ from module.attendance_cog import AttendanceCog
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
 from module.hyacine_chat_cog import HyacineChatCog
+from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
 import module.playwith_cog as playwith_cog
 import module.backup as backup
@@ -36,10 +37,15 @@ class RecordingResponse:
 
 
 class RecordingFollowup:
-    def __init__(self):
+    def __init__(self, fail_on_call=None):
         self.messages = []
+        self.fail_on_call = fail_on_call
+        self.calls = 0
 
     async def send(self, *args, **kwargs):
+        self.calls += 1
+        if self.fail_on_call == self.calls:
+            raise RuntimeError("followup transport failed")
         self.messages.append((args, kwargs))
 
 
@@ -87,6 +93,98 @@ class RecordingAttendance:
         if self.refund_error:
             raise self.refund_error
         self.refunds.append((user_id, amount))
+
+
+class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generation_exception_refunds_once_when_error_message_fails(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        interaction.followup = RecordingFollowup(fail_on_call=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+
+        def fail_generation(**_):
+            raise RuntimeError("provider failed")
+
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(generate_content=fail_generation)
+        )
+
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(attendance.refunds, [(123, 50_000)])
+
+    async def test_empty_image_response_refunds_only_once_when_error_message_fails(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        interaction.followup = RecordingFollowup(fail_on_call=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cog.temp_dir = temp_dir.name
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **_: SimpleNamespace(parts=[])
+            )
+        )
+
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(attendance.refunds, [(123, 50_000)])
+
+    async def test_generated_image_is_not_refunded_when_discord_upload_fails(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        interaction.followup = RecordingFollowup(fail_on_call=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cog.temp_dir = temp_dir.name
+        part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **_: SimpleNamespace(parts=[part])
+            )
+        )
+
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(attendance.refunds, [])
+        self.assertIn(
+            "이미지는 생성되었지만 Discord 전송에 실패했습니다.",
+            interaction.followup.messages[-1][0][0],
+        )
+        self.assertNotIn("환불", interaction.followup.messages[-1][0][0])
+
+    async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        interaction.followup = RecordingFollowup(fail_on_call=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cog.temp_dir = temp_dir.name
+        part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **_: SimpleNamespace(parts=[part])
+            )
+        )
+
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(list(pathlib.Path(temp_dir.name).iterdir()), [])
 
 
 class DisappearingAttendanceBot:
