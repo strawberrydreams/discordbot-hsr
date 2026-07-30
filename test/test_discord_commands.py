@@ -281,6 +281,37 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_party_status_keeps_empty_active_party(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
+
+            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+                await PlayWithCog.파티.callback(cog, interaction)
+
+            self.assertIsNotNone(repository.get_party(game))
+            self.assertEqual(
+                interaction.response.messages[0][1]["embeds"][0].description,
+                f"현재 인원: 0 / {playwith_cog.GAMES[game]['max_players']}",
+            )
+
+    async def test_stale_join_button_rejects_deleted_party(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(channel_id=1)
+
+            await cog.shared_views[game].children[0].callback(interaction)
+
+            self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
+            self.assertIsNone(repository.get_user_party(interaction.user.id))
+
     async def test_party_status_sends_multiple_embeds_in_one_initial_response(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")

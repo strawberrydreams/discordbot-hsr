@@ -93,8 +93,8 @@ class PartyRepository(ABC):
         """{user_id: role} 형태로 참가자 목록을 반환한다."""
 
     @abstractmethod
-    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> None:
-        """참가자를 추가하거나 역할을 갱신한다."""
+    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> bool:
+        """존재하는 파티에만 참가자를 추가하거나 역할을 갱신한다."""
 
     @abstractmethod
     def remove_participant(self, game: str, user_id: int) -> None:
@@ -308,12 +308,16 @@ class SQLitePartyRepository(PartyRepository):
             cursor.execute("SELECT user_id, role FROM participants WHERE game = ?", (game,))
             return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> None:
+    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> bool:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO participants (game, user_id, role) VALUES (?, ?, ?)",
-                           (game, user_id, role))
+            cursor.execute("""
+                INSERT OR REPLACE INTO participants (game, user_id, role)
+                SELECT ?, ?, ?
+                WHERE EXISTS (SELECT 1 FROM parties WHERE game = ?)
+            """, (game, user_id, role, game))
             conn.commit()
+            return cursor.rowcount > 0
 
     def remove_participant(self, game: str, user_id: int) -> None:
         with sqlite3.connect(self.db_path) as conn:

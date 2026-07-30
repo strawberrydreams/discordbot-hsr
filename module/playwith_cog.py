@@ -47,7 +47,7 @@ class PlayWithCog(commands.Cog):
         return self.db.get_participants(game)
 
     def add_participant(self, game, user_id, role=None):
-        self.db.add_participant(game, user_id, role)
+        return self.db.add_participant(game, user_id, role)
 
     def remove_participant(self, game, user_id):
         self.db.remove_participant(game, user_id)
@@ -121,10 +121,6 @@ class PlayWithCog(commands.Cog):
                 continue
             
             participants = self.get_participants(game)
-            if not participants:
-                # Should not happen if logic is correct, but cleanup just in case
-                self.delete_party(game)
-                continue
 
             role_members = {}
             player_lines = []
@@ -233,7 +229,11 @@ class JoinButton(Button):
     async def callback(self, interaction: discord.Interaction):
         game = self.game
         user_id = interaction.user.id
-        
+
+        if not self.cog.get_party(game):
+            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            return
+
         current_party = self.cog.get_user_party(user_id)
 
         if current_party:
@@ -250,7 +250,9 @@ class JoinButton(Button):
             view.add_item(RoleSelect(self.cog, game, GAMES[game]["roles"]))
             await interaction.response.send_message("🎯 역할을 선택하세요:", view=view, ephemeral=True)
         else:
-            self.cog.add_participant(game, user_id)
+            if not self.cog.add_participant(game, user_id):
+                await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+                return
             await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 참가했습니다!", ephemeral=False)
 
 class RoleSelect(Select):
@@ -264,6 +266,10 @@ class RoleSelect(Select):
         game = self.game
         role = self.values[0].strip().lower()
         user_id = interaction.user.id
+
+        if not self.cog.get_party(game):
+            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            return
 
         participants = self.cog.get_participants(game)
         if len(participants) >= GAMES[game]["max_players"]:
@@ -281,7 +287,9 @@ class RoleSelect(Select):
                 await interaction.response.send_message(f"⚠️ `{role}` 역할은 이미 다른 참가자가 선택했습니다.", ephemeral=True)
                 return
 
-        self.cog.add_participant(game, user_id, role)
+        if not self.cog.add_participant(game, user_id, role):
+            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            return
         await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 역할 `{role}`로 참가했어요!", ephemeral=False)
 
 class RoleUpdateSelect(Select):

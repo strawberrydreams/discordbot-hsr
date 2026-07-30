@@ -428,6 +428,8 @@ def test_party_repository():
     now = datetime.datetime.now()
 
     check("없는 파티 조회 시 None", repo.get_party("LOL") is None)
+    check("없는 파티 참가 거부", repo.add_participant("missing", 99) is False)
+    check("거부된 참가자는 고아 행을 남기지 않음", repo.get_user_party(99) is None)
 
     repo.create_party("LOL", now)
     check("파티 생성 후 조회됨", repo.get_party("LOL") is not None)
