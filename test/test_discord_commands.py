@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import pathlib
 import tempfile
@@ -12,6 +13,7 @@ import discord
 from module.attendance_cog import AttendanceCog
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
+from module.finance_cog import FinanceCog
 from module.hyacine_chat_cog import HyacineChatCog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
@@ -91,6 +93,39 @@ class FakeInteraction:
         self.response = RecordingResponse()
         self.followup = RecordingFollowup()
         self.guild = guild
+
+
+class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_tickers_start_before_any_result_is_released(self):
+        cog = FinanceCog(bot=None)
+        interaction = FakeInteraction(channel_id=1)
+        started = 0
+        all_started = asyncio.Event()
+
+        async def controlled_to_thread(function, symbol):
+            nonlocal started
+            started += 1
+            if started == len(cog.tickers):
+                all_started.set()
+            await all_started.wait()
+            return function(symbol)
+
+        with patch.object(
+            FinanceCog,
+            "get_stock_data",
+            return_value={"price": 1.0, "change": 0.0, "change_percent": 0.0},
+        ) as get_stock_data, patch(
+            "module.finance_cog.asyncio.to_thread", side_effect=controlled_to_thread
+        ):
+            await asyncio.wait_for(
+                FinanceCog.stock_price.callback(cog, interaction), timeout=1
+            )
+
+        self.assertEqual(started, len(cog.tickers))
+        self.assertEqual(get_stock_data.call_count, len(cog.tickers))
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(len(interaction.followup.messages), 1)
+        self.assertEqual(len(interaction.followup.messages[0][1]["embed"].fields), len(cog.tickers))
 
 
 class RecordingAttendance:

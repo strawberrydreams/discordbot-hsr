@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -60,9 +61,13 @@ class FinanceCog(commands.Cog):
             color=0x00ff00 # Default color
         )
 
+        items = list(self.tickers.items())
+        results = await asyncio.gather(
+            *(asyncio.to_thread(self.get_stock_data, symbol) for _, symbol in items)
+        )
+
         # Iterate through tickers and add fields
-        for name, symbol in self.tickers.items():
-            data = self.get_stock_data(symbol)
+        for (name, _), data in zip(items, results):
             
             if data:
                 price = data['price']
