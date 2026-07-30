@@ -1549,36 +1549,50 @@ def test_pid_file_recovers_after_actual_abnormal_child_exit():
         cwd=PROJECT_ROOT,
     )
     child_pid = child.pid
-    exit_code = child.wait(timeout=10)
-    stale_contents = (
-        pid_path.read_text(encoding="ascii") if pid_path.exists() else None
-    )
-
-    with lock_path.open("a+b") as probe:
+    timed_out = False
+    try:
         try:
-            backup.fcntl.flock(
-                probe,
-                backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
-            )
-            released = True
-            backup.fcntl.flock(probe, backup.fcntl.LOCK_UN)
-        except BlockingIOError:
-            released = False
+            exit_code = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.kill()
+            exit_code = child.wait()
+        stale_contents = (
+            pid_path.read_text(encoding="ascii") if pid_path.exists() else None
+        )
 
-    with patch.object(sys, "platform", "darwin"):
-        with backup.pid_file(pid_path):
-            replacement = pid_path.read_text(encoding="ascii")
+        with lock_path.open("a+b") as probe:
+            try:
+                backup.fcntl.flock(
+                    probe,
+                    backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
+                )
+                released = True
+                backup.fcntl.flock(probe, backup.fcntl.LOCK_UN)
+            except BlockingIOError:
+                released = False
 
-    check(
-        "os._exit child는 stale PID를 남기고 kernel lock은 해제",
-        exit_code == 0
-        and stale_contents == f"{child_pid}\n"
-        and released,
-    )
-    check(
-        "abnormal exit 뒤 다음 holder가 stale PID 교체 후 정상 정리",
-        replacement == f"{os.getpid()}\n" and not pid_path.exists(),
-    )
+        with patch.object(sys, "platform", "darwin"):
+            with backup.pid_file(pid_path):
+                replacement = pid_path.read_text(encoding="ascii")
+
+        check(
+            "os._exit child는 stale PID를 남기고 kernel lock은 해제",
+            not timed_out
+            and exit_code == 0
+            and stale_contents == f"{child_pid}\n"
+            and released,
+        )
+        check(
+            "abnormal exit 뒤 다음 holder가 stale PID 교체 후 정상 정리",
+            replacement == f"{os.getpid()}\n" and not pid_path.exists(),
+        )
+    finally:
+        try:
+            if child.poll() is None:
+                child.kill()
+        finally:
+            child.wait()
 
 
 def test_pid_file_publication_failure_cleans_temp_lock_and_fds():
