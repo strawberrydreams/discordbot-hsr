@@ -361,8 +361,13 @@ def test_deployment_contracts():
     )
     check(
         "launchd 백업은 env 주기 loop 사용",
-        pathlib.Path(backup_plist["ProgramArguments"][0]).name == "python"
-        and backup_plist["ProgramArguments"][1:] == ["-m", "module.backup", "loop"]
+        backup_plist["ProgramArguments"]
+        == [
+            bot_plist["ProgramArguments"][0],
+            "-m",
+            "module.backup",
+            "loop",
+        ]
         and "StartInterval" not in backup_plist
         and backup_plist.get("KeepAlive") is True,
     )
