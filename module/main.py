@@ -1,3 +1,7 @@
+import fcntl
+from pathlib import Path
+from typing import BinaryIO
+
 import discord
 from discord.ext import commands
 from module.backup import DATABASES, verify_database
@@ -21,6 +25,25 @@ EXTENSIONS = (
     "module.finance_cog",
 )
 
+
+def _verify_databases(existing_only: bool = False) -> None:
+    for filename, required_tables in DATABASES.items():
+        path = DATA_DIR / filename
+        if existing_only and not path.exists():
+            continue
+        verify_database(path, required_tables)
+
+
+def acquire_instance_lock(path: Path) -> BinaryIO:
+    lock = path.open("a+b")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock.close()
+        raise RuntimeError(f"봇이 이미 실행 중입니다: {path}") from exc
+    return lock
+
+
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(
@@ -31,15 +54,13 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        for filename, required_tables in DATABASES.items():
-            verify_database(DATA_DIR / filename, required_tables)
+        _verify_databases(existing_only=True)
 
         for extension in EXTENSIONS:
             await self.load_extension(extension)
             print(f"🧩 Loaded extension: {extension}")
 
-        for filename, required_tables in DATABASES.items():
-            verify_database(DATA_DIR / filename, required_tables)
+        _verify_databases()
         await self.tree.sync()
         print("🔄 Command tree synced")
 
@@ -60,7 +81,8 @@ def main() -> None:
     validate_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    MyBot().run(DISCORD_TOKEN)
+    with acquire_instance_lock(DATA_DIR / ".bot.lock"):
+        MyBot().run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     main()

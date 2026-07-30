@@ -191,7 +191,7 @@ def test_forbidden_words_fail_fast():
         check("금지어 JSON 구조 오류 거부", True)
 
 
-def test_startup_verifies_before_loading_cogs():
+def test_new_install_verifies_after_loading_cogs():
     import module.main as main
 
     events = []
@@ -207,21 +207,20 @@ def test_startup_verifies_before_loading_cogs():
             events.append(f"load:{extension}")
 
     def verify(path, tables):
-        events.append(f"verify:{path.name}:{','.join(sorted(tables))}")
+        events.append(f"verify:{path.name}")
         return {}
 
-    with patch.object(main, "verify_database", side_effect=verify):
+    with patch.object(pathlib.Path, "exists", return_value=False), \
+         patch.object(main, "verify_database", side_effect=verify):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
 
     expected = [
-        "verify:attendance_data.db:users",
-        "verify:party_data.db:participants,parties",
         *(f"load:{extension}" for extension in main.EXTENSIONS),
-        "verify:attendance_data.db:users",
-        "verify:party_data.db:participants,parties",
+        "verify:attendance_data.db",
+        "verify:party_data.db",
         "sync",
     ]
-    check("시작 시 DB 검증-모든 Cog-재검증-sync 순서", events == expected, f"({events})")
+    check("신규 설치는 Cog 로드 전 DB 검증 생략", events == expected, f"({events})")
 
 
 def test_startup_preverification_failure_stops_cogs_and_sync():
@@ -242,7 +241,8 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
         events.append(f"verify:{path.name}")
         raise RuntimeError("missing production database")
 
-    with patch.object(main, "verify_database", side_effect=fail_verify):
+    with patch.object(pathlib.Path, "exists", return_value=True), \
+         patch.object(main, "verify_database", side_effect=fail_verify):
         try:
             asyncio.run(main.MyBot.setup_hook(FakeBot()))
             check("사전 DB 검증 실패 전파", False)
@@ -271,7 +271,8 @@ def test_startup_cog_failure_stops_postverification_and_sync():
         events.append(f"verify:{path.name}")
         return {}
 
-    with patch.object(main, "verify_database", side_effect=verify):
+    with patch.object(pathlib.Path, "exists", return_value=True), \
+         patch.object(main, "verify_database", side_effect=verify):
         try:
             asyncio.run(main.MyBot.setup_hook(FakeBot()))
             check("Cog 로드 실패 전파", False)
@@ -285,6 +286,87 @@ def test_startup_cog_failure_stops_postverification_and_sync():
             f"load:{main.EXTENSIONS[0]}",
             f"load:{main.EXTENSIONS[1]}",
         ],
+        f"({events})",
+    )
+
+
+def test_instance_lock_rejects_second_holder():
+    import module.main as main
+
+    if not hasattr(main, "acquire_instance_lock"):
+        check("인스턴스 잠금 API 제공", False)
+        return
+
+    lock_path = _TMP_DIR / ".bot.lock"
+    first = main.acquire_instance_lock(lock_path)
+    try:
+        try:
+            main.acquire_instance_lock(lock_path)
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check("두 번째 봇 인스턴스 거부", rejected)
+    finally:
+        first.close()
+
+    reacquired = main.acquire_instance_lock(lock_path)
+    reacquired.close()
+    check("첫 번째 잠금 해제 후 재획득", True)
+
+
+def test_instance_lock_closes_failed_handle():
+    import module.main as main
+
+    if not hasattr(main, "acquire_instance_lock"):
+        check("잠금 실패 파일 핸들 정리 API 제공", False)
+        return
+
+    lock = (_TMP_DIR / ".failed-bot.lock").open("a+b")
+    with patch.object(pathlib.Path, "open", return_value=lock), \
+         patch.object(main.fcntl, "flock", side_effect=BlockingIOError):
+        try:
+            main.acquire_instance_lock(_TMP_DIR / ".failed-bot.lock")
+            rejected = False
+        except RuntimeError:
+            rejected = True
+
+    check("잠금 경합 오류 전환", rejected)
+    check("잠금 실패 파일 핸들 닫힘", lock.closed)
+
+
+def test_main_holds_instance_lock_while_bot_runs():
+    import module.main as main
+
+    if not hasattr(main, "acquire_instance_lock"):
+        check("main 인스턴스 잠금 API 제공", False)
+        return
+
+    events = []
+
+    class FakeLock:
+        def __enter__(self):
+            events.append("lock")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("unlock")
+
+    class FakeBot:
+        def run(self, token):
+            events.append("run")
+
+    def acquire(path):
+        events.append(f"acquire:{path.name}")
+        return FakeLock()
+
+    with patch.object(main, "validate_config"), \
+         patch.object(pathlib.Path, "mkdir"), \
+         patch.object(main, "acquire_instance_lock", side_effect=acquire), \
+         patch.object(main, "MyBot", FakeBot):
+        main.main()
+
+    check(
+        "봇 실행 수명 동안 인스턴스 잠금 유지",
+        events == ["acquire:.bot.lock", "lock", "run", "unlock"],
         f"({events})",
     )
 
@@ -990,9 +1072,12 @@ if __name__ == "__main__":
         test_public_env_contract()
         test_compose_env_file_order()
         test_forbidden_words_fail_fast()
-        test_startup_verifies_before_loading_cogs()
+        test_new_install_verifies_after_loading_cogs()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
+        test_instance_lock_rejects_second_holder()
+        test_instance_lock_closes_failed_handle()
+        test_main_holds_instance_lock_while_bot_runs()
         test_importing_main_does_not_construct_bot()
         test_bot_disables_all_mentions()
         repo = test_migration()
