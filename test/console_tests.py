@@ -469,14 +469,14 @@ def test_play_luckybox(repo: SQLiteAttendanceRepository):
 def test_party_repository():
     print("\n[4] PartyRepository CRUD")
     repo = SQLitePartyRepository(_TMP_DIR / "party_test.db")
-    now = datetime.datetime.now()
+    now = 2_000_000_000
 
     check("없는 파티 조회 시 None", repo.get_party("LOL") is None)
     check("없는 파티 참가 거부", repo.add_participant("missing", 99) is False)
     check("거부된 참가자는 고아 행을 남기지 않음", repo.get_user_party(99) is None)
 
     repo.create_party("LOL", now)
-    check("파티 생성 후 조회됨", repo.get_party("LOL") is not None)
+    check("파티 시각을 epoch 정수로 저장", repo.get_party("LOL") == (now,))
 
     repo.create_party("LOL", now)  # INSERT OR IGNORE
     check("중복 생성은 무시됨", True)
@@ -498,16 +498,85 @@ def test_party_repository():
     check("파티 삭제 시 참가자도 정리됨", repo.get_user_party(1) is None)
 
     # 만료 정리: 25시간 전 파티는 삭제, 방금 만든 파티는 유지
-    old_time = now - datetime.timedelta(hours=25)
+    old_time = now - 25 * 60 * 60
     repo.create_party("PUBG", old_time)
     repo.add_participant("PUBG", 3)
     repo.create_party("Overwatch", now)
-    cutoff = now - datetime.timedelta(hours=24)
+    cutoff = now - 24 * 60 * 60
 
     expired = repo.delete_expired_parties(cutoff)
     check("만료 파티만 삭제됨", expired == ["PUBG"], f"(삭제 목록 {expired})")
     check("만료 파티 참가자도 정리됨", repo.get_user_party(3) is None)
     check("유효 파티는 유지됨", repo.get_party("Overwatch") is not None)
+
+    legacy_db = _TMP_DIR / "party_legacy_time.db"
+    with closing(sqlite3.connect(legacy_db)) as conn:
+        conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
+        conn.execute(
+            "CREATE TABLE participants (game TEXT, user_id INTEGER, role TEXT, "
+            "PRIMARY KEY (game, user_id))"
+        )
+        conn.executemany(
+            "INSERT INTO parties VALUES (?, ?)",
+            (
+                ("Legacy", "2026-07-29 12:00:00"),
+                ("BlobLegacy", sqlite3.Binary(b"2026-07-29 12:00:00")),
+                ("RealLegacy", 1_785_294_000.75),
+            ),
+        )
+        conn.commit()
+
+    repo_with_legacy = SQLitePartyRepository(legacy_db)
+    legacy_value = repo_with_legacy.get_party("Legacy")[0]
+    check(
+        "legacy KST 파티 시각을 UTC epoch로 변환",
+        legacy_value == 1_785_294_000 and isinstance(legacy_value, int),
+        f"(변환값 {legacy_value!r})",
+    )
+    SQLitePartyRepository(legacy_db)
+    check(
+        "legacy 파티 시각 마이그레이션은 재실행해도 동일",
+        repo_with_legacy.get_party("Legacy") == (1_785_294_000,),
+    )
+    check(
+        "BLOB legacy 파티 시각도 UTC epoch로 변환",
+        repo_with_legacy.get_party("BlobLegacy") == (1_785_294_000,),
+    )
+    real_value = repo_with_legacy.get_party("RealLegacy")
+    check(
+        "REAL legacy epoch도 정수로 정규화",
+        real_value == (1_785_294_000,)
+        and isinstance(real_value[0], int),
+        f"(변환값 {real_value!r})",
+    )
+
+
+def test_party_cog_uses_epoch_seconds():
+    from module.playwith_cog import PlayWithCog
+
+    class RecordingRepository:
+        created_at = None
+        cutoff = None
+
+        def create_party(self, game, created_at):
+            self.created_at = created_at
+
+        def delete_expired_parties(self, cutoff):
+            self.cutoff = cutoff
+            return []
+
+    repository = RecordingRepository()
+    cog = object.__new__(PlayWithCog)
+    cog.db = repository
+    with patch("time.time", return_value=2_000_000_000.75):
+        cog.create_party("LOL")
+        asyncio.run(PlayWithCog.cleanup_parties.coro(cog))
+
+    check("Cog 파티 생성 시 epoch 정수 전달", repository.created_at == 2_000_000_000)
+    check(
+        "Cog 만료 정리 시 24시간 전 epoch 정수 전달",
+        repository.cutoff == 1_999_913_600,
+    )
 
 
 def test_factory():
@@ -610,7 +679,7 @@ def test_backup_round_trip():
     SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(77, 1234)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
         "LOL",
-        datetime.datetime.now(),
+        2_000_000_000,
     )
 
     manifest = backup.create_backup_set()
@@ -664,7 +733,7 @@ def test_invalid_retention_prevents_pruning():
         ).add_points(1, 100)
         SQLitePartyRepository(
             backup.DATA_DIR / "party_data.db"
-        ).create_party("LOL", datetime.datetime.now())
+        ).create_party("LOL", 2_000_000_000)
         created_at = datetime.datetime(
             2026,
             1,
@@ -730,7 +799,7 @@ def test_backup_same_timestamp_rejected():
     attendance.add_points(1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         "LOL",
-        datetime.datetime.now(),
+        2_000_000_000,
     )
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
@@ -756,7 +825,7 @@ def test_prune_requires_timestamp_bound_filenames():
     ).add_points(1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         "LOL",
-        datetime.datetime.now(),
+        2_000_000_000,
     )
     current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(current)
@@ -784,7 +853,7 @@ def test_backup_publication_is_synced():
     ).add_points(1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         "LOL",
-        datetime.datetime.now(),
+        2_000_000_000,
     )
     events = []
     synced_directories = []
@@ -916,6 +985,7 @@ if __name__ == "__main__":
         test_attendance_atomicity(repo)
         test_play_luckybox(repo)
         test_party_repository()
+        test_party_cog_uses_epoch_seconds()
         test_factory()
         test_cog_facade()
         test_channel_sessions()

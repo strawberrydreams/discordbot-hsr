@@ -1,5 +1,5 @@
 import discord
-import datetime
+import time
 from typing import Optional
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -27,7 +27,7 @@ class PlayWithCog(commands.Cog):
     @tasks.loop(minutes=10)
     async def cleanup_parties(self):
         # Delete parties older than 24 hours
-        expiration_time = datetime.datetime.now() - datetime.timedelta(hours=24)
+        expiration_time = int(time.time()) - 24 * 60 * 60
         expired_games = self.db.delete_expired_parties(expiration_time)
         if expired_games:
             print(f"Deleted expired parties: {expired_games}")
@@ -38,7 +38,7 @@ class PlayWithCog(commands.Cog):
         return self.db.get_party(game)
 
     def create_party(self, game):
-        self.db.create_party(game, datetime.datetime.now())
+        self.db.create_party(game, int(time.time()))
 
     def delete_party(self, game):
         self.db.delete_party(game)

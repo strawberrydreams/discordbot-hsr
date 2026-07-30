@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import pathlib
 import sqlite3
 from abc import ABC, abstractmethod
 from contextlib import closing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from module.config import DATA_DIR, DB_BACKEND
 
@@ -79,11 +81,11 @@ class PartyRepository(ABC):
     """게임 파티 모집 데이터 접근 인터페이스."""
 
     @abstractmethod
-    def get_party(self, game: str) -> Optional[Tuple[Any, ...]]:
+    def get_party(self, game: str) -> Optional[Tuple[int]]:
         """파티가 존재하면 (created_at,)을, 없으면 None을 반환한다."""
 
     @abstractmethod
-    def create_party(self, game: str, created_at: Any) -> None:
+    def create_party(self, game: str, created_at: int) -> None:
         """파티를 생성한다. 이미 존재하면 무시한다."""
 
     @abstractmethod
@@ -107,7 +109,7 @@ class PartyRepository(ABC):
         """유저가 참가 중인 파티의 게임 이름을 반환한다. 없으면 None."""
 
     @abstractmethod
-    def delete_expired_parties(self, cutoff: Any) -> List[str]:
+    def delete_expired_parties(self, cutoff: int) -> List[str]:
         """cutoff보다 오래된 파티를 삭제하고, 삭제된 게임 이름 목록을 반환한다."""
 
 
@@ -280,15 +282,32 @@ class SQLitePartyRepository(PartyRepository):
                     FOREIGN KEY (game) REFERENCES parties (game) ON DELETE CASCADE
                 )
             """)
+            cursor.execute("SELECT game, created_at FROM parties")
+            for game, value in cursor.fetchall():
+                if isinstance(value, int):
+                    continue
+                if isinstance(value, float):
+                    timestamp = int(value)
+                else:
+                    if isinstance(value, bytes):
+                        value = value.decode()
+                    parsed = datetime.fromisoformat(str(value))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                    timestamp = int(parsed.timestamp())
+                cursor.execute(
+                    "UPDATE parties SET created_at = ? WHERE game = ?",
+                    (timestamp, game),
+                )
             conn.commit()
 
-    def get_party(self, game: str) -> Optional[Tuple[Any, ...]]:
+    def get_party(self, game: str) -> Optional[Tuple[int]]:
         with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT created_at FROM parties WHERE game = ?", (game,))
             return cursor.fetchone()
 
-    def create_party(self, game: str, created_at: Any) -> None:
+    def create_party(self, game: str, created_at: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT OR IGNORE INTO parties (game, created_at) VALUES (?, ?)",
@@ -333,7 +352,7 @@ class SQLitePartyRepository(PartyRepository):
             row = cursor.fetchone()
             return row[0] if row else None
 
-    def delete_expired_parties(self, cutoff: Any) -> List[str]:
+    def delete_expired_parties(self, cutoff: int) -> List[str]:
         with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT game FROM parties WHERE created_at < ?", (cutoff,))
