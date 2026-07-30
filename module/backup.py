@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 from contextlib import closing, contextmanager
@@ -28,17 +29,31 @@ DATABASES = {
 
 @contextmanager
 def pid_file(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    contents = f"{os.getpid()}\n"
-    path.write_text(contents, encoding="ascii")
-    try:
+    if sys.platform != "darwin":
         yield
-    finally:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    with lock_path.open("a+b") as lock:
         try:
-            if path.read_text(encoding="ascii") == contents:
-                path.unlink()
-        except FileNotFoundError:
-            pass
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"PID 파일이 이미 사용 중입니다: {path}") from exc
+
+        try:
+            with temporary_path.open("w", encoding="ascii") as temporary:
+                temporary.write(f"{os.getpid()}\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, path)
+            try:
+                yield
+            finally:
+                path.unlink(missing_ok=True)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _require_positive(name: str, value: int) -> None:

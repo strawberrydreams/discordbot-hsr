@@ -730,7 +730,8 @@ def test_main_holds_instance_lock_while_bot_runs():
          patch.object(main, "DATA_DIR", data_dir), \
          patch.object(main, "BACKUP_DIR", backup_dir), \
          patch.object(main, "acquire_instance_lock", side_effect=acquire), \
-         patch.object(main, "MyBot", FakeBot):
+         patch.object(main, "MyBot", FakeBot), \
+         patch.object(sys, "platform", "darwin"):
         main.main()
 
     check(
@@ -1330,7 +1331,8 @@ def test_backup_loop_pid_lifecycle():
     with patch.object(backup, "BACKUP_DIR", backup_dir), \
          patch.object(backup, "_validate_backup_settings"), \
          patch.object(backup, "create_backup_set", side_effect=stop_loop), \
-         patch.object(sys, "argv", ["backup", "loop"]):
+         patch.object(sys, "argv", ["backup", "loop"]), \
+         patch.object(sys, "platform", "darwin"):
         try:
             backup.main()
         except KeyboardInterrupt:
@@ -1340,20 +1342,105 @@ def test_backup_loop_pid_lifecycle():
     check("backup loop 정상 unwind 시 PID 파일 정리", not pid_path.exists())
 
 
-def test_pid_file_preserves_replacement_owner():
+def test_pid_file_darwin_publishes_and_cleans():
     import module.backup as backup
 
-    pid_path = _TMP_DIR / "replacement-owner.pid"
+    root = _TMP_DIR / "darwin-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    lock_path = root / ".service.pid.lock"
+    temporary_path = root / ".service.pid.tmp"
     pid_path.unlink(missing_ok=True)
-    with backup.pid_file(pid_path):
-        pid_path.write_text("999999\n", encoding="ascii")
+    lock_path.unlink(missing_ok=True)
+    temporary_path.unlink(missing_ok=True)
+
+    with patch.object(sys, "platform", "darwin"):
+        with backup.pid_file(pid_path):
+            published = pid_path.read_text(encoding="ascii")
+            lock_held = lock_path.exists()
+            temporary_absent = not temporary_path.exists()
+
+    check("Darwin PID context는 현재 PID를 게시", published == f"{os.getpid()}\n")
+    check("Darwin PID context는 companion lock을 사용", lock_held)
+    check(
+        "Darwin PID 정상 종료는 PID/임시 파일만 정리",
+        not pid_path.exists()
+        and temporary_absent
+        and not temporary_path.exists()
+        and lock_path.exists(),
+    )
+
+
+def test_pid_file_linux_is_noop_without_artifacts():
+    import module.backup as backup
+
+    root = _TMP_DIR / "linux-pid"
+    pid_path = root / ".service.pid"
+    with patch.object(sys, "platform", "linux"):
+        with backup.pid_file(pid_path):
+            clean_inside = not root.exists()
 
     check(
-        "PID cleanup은 다른 프로세스가 교체한 파일 보존",
-        pid_path.exists()
-        and pid_path.read_text(encoding="ascii") == "999999\n",
+        "Linux PID context는 PID/lock/디렉터리를 만들지 않음",
+        clean_inside and not root.exists(),
     )
+
+
+def test_pid_file_rejects_contention_before_handoff():
+    import module.backup as backup
+
+    root = _TMP_DIR / "contended-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
     pid_path.unlink(missing_ok=True)
+
+    with patch.object(sys, "platform", "darwin"):
+        with backup.pid_file(pid_path):
+            try:
+                with backup.pid_file(pid_path):
+                    pass
+                rejected = False
+            except RuntimeError:
+                rejected = True
+            first_publication_intact = (
+                pid_path.exists()
+                and pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
+            )
+        with backup.pid_file(pid_path):
+            next_holder_published = (
+                pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
+            )
+
+    check(
+        "같은 PID 경로의 두 번째 holder 거부",
+        rejected and first_publication_intact,
+    )
+    check(
+        "첫 holder cleanup 뒤 다음 holder만 게시",
+        next_holder_published and not pid_path.exists(),
+    )
+
+
+def test_pid_file_replaces_stale_after_lock_release():
+    import module.backup as backup
+
+    root = _TMP_DIR / "stale-pid"
+    root.mkdir(exist_ok=True)
+    pid_path = root / ".service.pid"
+    lock_path = root / ".service.pid.lock"
+    pid_path.write_text("12345\n", encoding="ascii")
+    with lock_path.open("a+b") as stale_lock:
+        backup.fcntl.flock(stale_lock, backup.fcntl.LOCK_EX)
+        backup.fcntl.flock(stale_lock, backup.fcntl.LOCK_UN)
+
+    with patch.object(sys, "platform", "darwin"):
+        with backup.pid_file(pid_path):
+            replaced = pid_path.read_text(encoding="ascii")
+
+    check(
+        "release된 lock의 stale PID를 현재 PID로 교체",
+        replaced == f"{os.getpid()}\n" and not pid_path.exists(),
+    )
 
 
 def test_backup_same_timestamp_rejected():
@@ -1570,7 +1657,10 @@ if __name__ == "__main__":
         test_invalid_retention_prevents_pruning()
         test_invalid_interval_prevents_loop_entry()
         test_backup_loop_pid_lifecycle()
-        test_pid_file_preserves_replacement_owner()
+        test_pid_file_darwin_publishes_and_cleans()
+        test_pid_file_linux_is_noop_without_artifacts()
+        test_pid_file_rejects_contention_before_handoff()
+        test_pid_file_replaces_stale_after_lock_release()
         test_backup_same_timestamp_rejected()
         test_prune_requires_timestamp_bound_filenames()
         test_backup_publication_is_synced()

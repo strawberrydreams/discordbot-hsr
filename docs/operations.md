@@ -75,7 +75,7 @@ sudo cp deploy/macos/com.discordbot.hsr.newsyslog.conf.example /etc/newsyslog.d/
 sudo newsyslog -nvv
 ```
 
-newsyslog 예제의 `strawberrydreams:staff`도 실제 LaunchAgent 사용자와 그룹(`id -un`, `id -gn`)으로 바꾸세요. 네 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
+newsyslog 예제의 `strawberrydreams:staff`도 실제 LaunchAgent 사용자와 그룹(`id -un`, `id -gn`)으로 바꾸세요. 네 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. PID와 companion lock은 launchd로 실행하는 macOS에서만 생성되며 Docker에서는 만들지 않습니다. SIGHUP 뒤 남은 PID는 launchd 재시작이 lock을 다시 획득한 뒤 원자적으로 교체합니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
 
 상태와 로그:
 
