@@ -286,11 +286,24 @@ def test_deployment_contracts():
     services = json.loads(compose_result.stdout)["services"]
     bot = services["bot"]
     backup = services["backup"]
+    bot_plist = plistlib.loads(
+        (
+            PROJECT_ROOT / "deploy/macos/com.discordbot.hsr.plist.example"
+        ).read_bytes()
+    )
     backup_plist = plistlib.loads(
         (
             PROJECT_ROOT / "deploy/macos/com.discordbot.hsr-backup.plist.example"
         ).read_bytes()
     )
+    newsyslog_entries = [
+        line.split()
+        for line in (
+            PROJECT_ROOT
+            / "deploy/macos/com.discordbot.hsr.newsyslog.conf.example"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
     check("Compose 이미지는 한 번만 빌드", "build" in bot and "build" not in backup)
     check(
@@ -348,9 +361,22 @@ def test_deployment_contracts():
     )
     check(
         "launchd 백업은 env 주기 loop 사용",
-        backup_plist["ProgramArguments"][-1] == "loop"
+        pathlib.Path(backup_plist["ProgramArguments"][0]).name == "python"
+        and backup_plist["ProgramArguments"][1:] == ["-m", "module.backup", "loop"]
         and "StartInterval" not in backup_plist
         and backup_plist.get("KeepAlive") is True,
+    )
+    check(
+        "newsyslog는 두 LaunchAgent 로그만 관리",
+        len(newsyslog_entries) == 4
+        and all(len(entry) == 6 for entry in newsyslog_entries)
+        and {entry[0] for entry in newsyslog_entries}
+        == {
+            bot_plist["StandardOutPath"],
+            bot_plist["StandardErrorPath"],
+            backup_plist["StandardOutPath"],
+            backup_plist["StandardErrorPath"],
+        },
     )
 
 

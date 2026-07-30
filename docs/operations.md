@@ -29,7 +29,7 @@ cmp settings/forbidden_words.json runtime/data/forbidden_words.json
 
 ### macOS LaunchAgent
 
-제공된 plist는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 템플릿의 Python, 작업 디렉터리, 로그 경로를 먼저 수정합니다.
+제공된 plist와 newsyslog 예제는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 plist 템플릿의 Python, 작업 디렉터리, 로그 경로와 newsyslog 예제의 저장소 경로를 실제 절대 경로로 바꾼 뒤 설치합니다.
 
 최초 설치:
 
@@ -205,7 +205,7 @@ esac
 
 ## 배포
 
-변경을 모아 한 번에 배포합니다. 아래 순서를 바꾸지 않습니다: **테스트 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
+변경을 모아 한 번에 배포합니다. 아래 순서를 바꾸지 않습니다: **테스트 → 이미지 빌드 → 온라인 백업 생성 → 백업 검증 → 봇 1회 재시작**. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
 macOS:
 
@@ -230,10 +230,9 @@ set -euo pipefail
 git rev-parse HEAD
 git pull --ff-only
 .venv/bin/python -m test.console_tests
+docker compose build bot
 BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
 test -n "$BACKUP_MANIFEST"
-docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
-docker compose build bot
 docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
 docker compose up -d --no-deps bot backup
 docker compose logs --tail=100 bot
