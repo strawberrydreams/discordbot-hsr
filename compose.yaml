@@ -10,7 +10,6 @@ services:
     volumes:
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
-      - ./settings/forbidden_words.json:/app/settings/forbidden_words.json:ro
 
   backup:
     build: .

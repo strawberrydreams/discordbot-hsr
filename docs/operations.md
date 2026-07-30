@@ -8,6 +8,21 @@
 
 Discord 클라이언트의 사용자 설정에서 개발자 모드를 켠 뒤 운영 서버를 우클릭해 서버 ID를 복사하고, `.env.runtime`의 `DISCORD_GUILD_ID`에 넣으세요. 명령 변경은 다음 봇 시작 때 이 운영 길드에 즉시 동기화됩니다.
 
+### 기존 설치 금지어 파일 마이그레이션
+
+봇을 중지한 뒤 대상 파일이 없는지 확인하고 기존 목록을 복사합니다. 대상 파일이 이미 있으면 덮어쓰지 말고 두 파일을 비교해 사용할 목록을 먼저 결정하세요.
+
+```bash
+mkdir -p runtime/data
+test -f settings/forbidden_words.json
+test ! -e runtime/data/forbidden_words.json
+cp settings/forbidden_words.json runtime/data/forbidden_words.json
+chmod 600 runtime/data/forbidden_words.json
+cmp settings/forbidden_words.json runtime/data/forbidden_words.json
+```
+
+`.env.runtime`의 `FORBIDDEN_WORDS_FILE`을 `runtime/data/forbidden_words.json`으로 변경합니다. 봇 재시작 직전에 `cmp settings/forbidden_words.json runtime/data/forbidden_words.json`이 성공하는지 다시 확인하세요.
+
 ## 실행 방식 선택
 
 운영 호스트에서는 아래 방식 중 하나만 선택하세요.
@@ -41,7 +56,7 @@ LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 �
 
 ### Docker Desktop
 
-Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`, `runtime/backups/`, `settings/forbidden_words.json`을 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
+Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`와 `runtime/backups/`를 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
 
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 

@@ -16,6 +16,7 @@
 import datetime
 import asyncio
 import importlib
+import json
 import os
 import pathlib
 import shutil
@@ -35,6 +36,7 @@ from dotenv import dotenv_values
 _TMP_DIR = pathlib.Path(tempfile.mkdtemp(prefix="hsr_test_"))
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 os.environ["DATA_DIR"] = str(_TMP_DIR)
+os.environ["FORBIDDEN_WORDS_FILE"] = str(_TMP_DIR / "forbidden_words.json")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
 
@@ -68,6 +70,41 @@ def test_config_paths():
     check("DATA_DIR는 절대 경로", config.DATA_DIR.is_absolute())
     check("BACKUP_DIR는 절대 경로", config.BACKUP_DIR.is_absolute())
     check("금지어 경로는 절대 경로", config.FORBIDDEN_WORDS_FILE.is_absolute())
+    check(
+        "금지어 파일은 DATA_DIR에 저장",
+        config.FORBIDDEN_WORDS_FILE == config.DATA_DIR / "forbidden_words.json",
+    )
+    check(
+        "runtime 금지어 파일은 Git ignore",
+        subprocess.run(
+            ["git", "check-ignore", "-q", "runtime/data/forbidden_words.json"],
+            cwd=PROJECT_ROOT,
+            check=False,
+        ).returncode
+        == 0,
+    )
+    check(
+        "실제 금지어 파일은 Git 비추적",
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "runtime/data/forbidden_words.json"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        != 0,
+    )
+    check(
+        "금지어 예시 파일은 Git 추적",
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "settings/forbidden_words.example.json"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0,
+    )
 
 
 def test_config_validation():
@@ -200,6 +237,28 @@ def test_public_env_contract():
             stderr=subprocess.DEVNULL,
         ).returncode
         == 0,
+    )
+    check(
+        "공개 env 금지어 경로",
+        example["FORBIDDEN_WORDS_FILE"] == "runtime/data/forbidden_words.json",
+    )
+    compose_result = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    compose_config = json.loads(compose_result.stdout)
+    bot_mounts = compose_config["services"]["bot"]["volumes"]
+    check(
+        "Compose는 settings 금지어 파일을 bind하지 않음",
+        all(
+            not str(mount.get("source", "")).endswith(
+                "settings/forbidden_words.json"
+            )
+            for mount in bot_mounts
+        ),
     )
 
 

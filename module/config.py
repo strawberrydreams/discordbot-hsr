@@ -39,7 +39,7 @@ DATA_DIR = _path_from_env("DATA_DIR", "runtime/data")
 BACKUP_DIR = _path_from_env("BACKUP_DIR", "runtime/backups")
 FORBIDDEN_WORDS_FILE = _path_from_env(
     "FORBIDDEN_WORDS_FILE",
-    "settings/forbidden_words.json",
+    str(DATA_DIR / "forbidden_words.json"),
 )
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")

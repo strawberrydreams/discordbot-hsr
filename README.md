@@ -16,12 +16,12 @@
 
 ```bash
 touch .env.secrets .env.runtime
-chmod 600 .env.secrets .env.runtime
-cp settings/forbidden_words.example.json settings/forbidden_words.json
+mkdir -p runtime/data runtime/backups runtime/logs
+cp settings/forbidden_words.example.json runtime/data/forbidden_words.json
+chmod 600 .env.secrets .env.runtime runtime/data/forbidden_words.json
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
-mkdir -p runtime/data runtime/backups runtime/logs
 ```
 
 ### 2. 환경 설정
@@ -31,7 +31,7 @@ mkdir -p runtime/data runtime/backups runtime/logs
 - `.env.secrets`: Discord, OpenAI, Google 자격 증명
 - `.env.runtime`: 채널 ID, 데이터·백업 경로, 백업 설정
 
-실제 금지어는 `settings/forbidden_words.json`에 작성합니다.
+실제 금지어는 `runtime/data/forbidden_words.json`에 작성합니다.
 
 ### 3. DB 초기화와 초기 백업
 
@@ -54,7 +54,7 @@ mkdir -p runtime/data runtime/backups runtime/logs
 
 ## 운영 시 주의
 
-- `.env.secrets`, `.env.runtime`, `settings/forbidden_words.json`, `runtime/`은 Git에 추가하지 마세요. `git add -f`도 사용하지 않습니다.
+- `.env.secrets`, `.env.runtime`, `runtime/`은 Git에 추가하지 마세요. `git add -f`도 사용하지 않습니다.
 - 운영 백엔드는 SQLite만 지원합니다.
 - launchd와 Docker를 동시에 실행하지 마세요.
 
