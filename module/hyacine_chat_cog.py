@@ -1,6 +1,6 @@
 import textwrap
 import traceback
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional
 import discord
 import openai
@@ -26,6 +26,8 @@ class ChannelSession:
 
 
 class HyacineChatCog(commands.Cog):
+    MAX_CHANNEL_SESSIONS = 100
+
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
         self.bot = bot
         self.nickname = nickname
@@ -66,13 +68,17 @@ class HyacineChatCog(commands.Cog):
         """).strip()
 
         # 채널 ID -> ChannelSession (채널별 대화 기억 슬롯)
-        self.sessions: Dict[int, ChannelSession] = {}
+        self.sessions: OrderedDict[int, ChannelSession] = OrderedDict()
 
     def get_session(self, channel_id: int) -> ChannelSession:
         """채널의 세션을 가져오거나 새로 만든다."""
-        if channel_id not in self.sessions:
-            self.sessions[channel_id] = ChannelSession(self.system_prompt)
-        return self.sessions[channel_id]
+        session = self.sessions.pop(channel_id, None)
+        if session is None:
+            session = ChannelSession(self.system_prompt)
+        self.sessions[channel_id] = session
+        if len(self.sessions) > self.MAX_CHANNEL_SESSIONS:
+            self.sessions.popitem(last=False)
+        return session
 
     def tokenizer_for(self, model_name: str):
         try:
@@ -232,7 +238,12 @@ class HyacineChatCog(commands.Cog):
             }
 
             # Update History
-            session.history.append({"role": "user", "content": parts})
+            history_parts = [
+                part for part in parts if part.get("type") == "input_text"
+            ]
+            if not history_parts:
+                history_parts = [{"type": "input_text", "text": "(이전 턴에 이미지 첨부됨)"}]
+            session.history.append({"role": "user", "content": history_parts})
             session.history.append({"role": "assistant", "content": reply})
 
             await inter.followup.send(f"**{inter.user.mention}**: {내용}")

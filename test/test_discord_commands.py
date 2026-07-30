@@ -295,6 +295,35 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
             self.assertIn(text, message)
 
+    async def test_image_url_is_sent_once_but_not_saved_in_history(self):
+        interaction = FakeInteraction(channel_id=1)
+        attachment = SimpleNamespace(
+            content_type="image/png", url="https://cdn.example/signed.png"
+        )
+        captured = {}
+
+        async def response(**kwargs):
+            captured["input"] = kwargs["input"]
+            return SimpleNamespace(
+                output_text="확인했습니다.",
+                model="gpt-5.6-terra",
+                usage=SimpleNamespace(
+                    input_tokens=1, output_tokens=1, total_tokens=2
+                ),
+            )
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=response)
+        )
+        await self.cog._run_talk(
+            interaction, "", attachment, "gpt-5.6-terra", "none", 0
+        )
+
+        self.assertIn("image_url", repr(captured["input"]))
+        self.assertNotIn(
+            "image_url", repr(list(self.cog.get_session(1).history))
+        )
+
     async def test_pre_api_exception_refunds_with_the_original_attendance_cog(self):
         attendance = RecordingAttendance()
         bot = DisappearingAttendanceBot(attendance)
