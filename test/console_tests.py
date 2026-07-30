@@ -300,6 +300,17 @@ def test_importing_main_does_not_construct_bot():
             check("main import는 Bot을 생성하지 않음", False)
 
 
+def test_bot_disables_all_mentions():
+    import module.main as main
+    from discord.ext import commands
+
+    with patch.object(commands.Bot, "__init__", return_value=None) as init:
+        main.MyBot()
+
+    allowed = init.call_args.kwargs["allowed_mentions"]
+    check("봇 전역 멘션 차단", allowed.everyone is False and allowed.roles is False and allowed.users is False)
+
+
 def test_migration() -> SQLiteAttendanceRepository:
     print("\n[1] SQLite 마이그레이션")
     db_path = _TMP_DIR / "attendance_migration.db"
@@ -844,6 +855,7 @@ if __name__ == "__main__":
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_importing_main_does_not_construct_bot()
+        test_bot_disables_all_mentions()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_play_luckybox(repo)

@@ -26,7 +26,8 @@ class MyBot(commands.Bot):
         super().__init__(
             command_prefix="!", # Slash command 위주지만 prefix 설정은 필요함
             intents=intents,
-            help_command=None
+            help_command=None,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def setup_hook(self):
