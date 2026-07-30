@@ -43,22 +43,11 @@ class AttendanceCog(commands.Cog):
         kst = timezone(timedelta(hours=9))
         today_str = datetime.now(kst).date().isoformat()
 
-        data = self.db.get_attendance(user_id)
-        current_points = 0
-        last_date = None
-
-        if data:
-            current_points, last_date = data
-
-        if last_date == today_str:
+        reward = random.randint(5000, 30000)
+        new_points = self.db.claim_attendance(user_id, reward, today_str)
+        if new_points is None:
             await inter.response.send_message(f"🛑 {inter.user.mention}, 오늘은 이미 출석하셨어요! 내일 또 오세요~", ephemeral=True)
             return
-
-        # Reward calculation
-        reward = random.randint(5000, 30000)
-        new_points = current_points + reward
-
-        self.db.update_attendance(user_id, new_points, today_str)
 
         embed = discord.Embed(
             title="📅 출석체크 완료!",

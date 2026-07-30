@@ -373,6 +373,27 @@ def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
     check("동시 차감: 최종 잔액 0, 음수 아님", final == 0, f"(잔액 {final})")
 
 
+def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
+    print("\n[3] claim_attendance 원자성")
+    user_id = 150
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        result = repo.claim_attendance(user_id, 10_000, "2026-07-29")
+        with lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    check("동시 출석은 정확히 한 번 성공", sum(result is not None for result in results) == 1)
+    check("동시 출석 포인트는 한 번만 지급", repo.get_points(user_id) == 10_000)
+
+
 def test_play_luckybox(repo: SQLiteAttendanceRepository):
     print("\n[3] play_luckybox 단일 트랜잭션")
     user = 200
@@ -861,6 +882,7 @@ if __name__ == "__main__":
         test_bot_disables_all_mentions()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
+        test_attendance_atomicity(repo)
         test_play_luckybox(repo)
         test_party_repository()
         test_factory()

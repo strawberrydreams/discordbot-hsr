@@ -43,12 +43,13 @@ class AttendanceRepository(ABC):
         성공 시 True, 잔액 부족 시 False."""
 
     @abstractmethod
-    def get_attendance(self, user_id: int) -> Optional[Tuple[int, Optional[str]]]:
-        """(points, last_attendance_date)를 반환한다. 미등록 유저는 None."""
-
-    @abstractmethod
-    def update_attendance(self, user_id: int, points: int, attendance_date: str) -> None:
-        """출석 처리: 포인트와 마지막 출석일을 갱신한다. 유저가 없으면 생성한다."""
+    def claim_attendance(
+        self,
+        user_id: int,
+        reward: int,
+        attendance_date: str,
+    ) -> Optional[int]:
+        """당일 첫 출석이면 포인트를 지급하고 새 잔액을, 중복이면 None을 반환한다."""
 
     @abstractmethod
     def increment_forbidden_count(self, user_id: int) -> None:
@@ -171,30 +172,29 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             conn.commit()
             return c.rowcount > 0
 
-    def get_attendance(self, user_id: int) -> Optional[Tuple[int, Optional[str]]]:
+    def claim_attendance(
+        self,
+        user_id: int,
+        reward: int,
+        attendance_date: str,
+    ) -> Optional[int]:
         with closing(sqlite3.connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute("SELECT points, last_attendance_date FROM users WHERE user_id = ?", (user_id,))
-            return c.fetchone()
-
-    def update_attendance(self, user_id: int, points: int, attendance_date: str) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-            exists = c.fetchone()
-
-            if exists:
-                c.execute("""
-                    UPDATE users
-                    SET points = ?, last_attendance_date = ?
-                    WHERE user_id = ?
-                """, (points, attendance_date, user_id))
-            else:
-                c.execute("""
-                    INSERT INTO users (user_id, points, last_attendance_date, forbidden_count)
-                    VALUES (?, ?, ?, 0)
-                """, (user_id, points, attendance_date))
+            cursor = conn.execute(
+                """
+                INSERT INTO users (user_id, points, last_attendance_date)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    points = users.points + excluded.points,
+                    last_attendance_date = excluded.last_attendance_date
+                WHERE users.last_attendance_date IS NULL
+                   OR users.last_attendance_date != excluded.last_attendance_date
+                RETURNING points
+                """,
+                (user_id, reward, attendance_date),
+            )
+            row = cursor.fetchone()
             conn.commit()
+            return row[0] if row else None
 
     def increment_forbidden_count(self, user_id: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as conn:
