@@ -308,13 +308,19 @@ class RoleUpdateSelect(Select):
         role = self.values[0].strip().lower()
         game = self.game
 
+        if not self.cog.get_party(game):
+            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            return
+
         participants = self.cog.get_participants(game)
         for uid, assigned_role in participants.items():
             if uid != self.user_id and assigned_role == role:
                 await interaction.response.send_message(f"⚠️ `{role}` 역할은 이미 다른 참가자가 선택했습니다.", ephemeral=True)
                 return
 
-        self.cog.add_participant(game, self.user_id, role) # Update role
+        if not self.cog.add_participant(game, self.user_id, role):
+            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            return
         await interaction.response.send_message(f"🔄 역할이 `{role}`(으)로 변경되었습니다!", ephemeral=True)
 
 async def setup(bot: commands.Bot):

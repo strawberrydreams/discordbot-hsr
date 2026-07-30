@@ -1,6 +1,8 @@
+import gc
 import pathlib
 import tempfile
 import unittest
+import warnings
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -281,6 +283,21 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def test_party_repository_closes_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+                repository.create_party("PUBG", 1_000)
+                repository.add_participant("PUBG", 123)
+                repository.delete_party("PUBG")
+                del repository
+                gc.collect()
+
+        self.assertFalse(
+            [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
+        )
+
     async def test_party_status_keeps_empty_active_party(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
@@ -308,6 +325,24 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
             interaction = FakeInteraction(channel_id=1)
 
             await cog.shared_views[game].children[0].callback(interaction)
+
+            self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
+            self.assertIsNone(repository.get_user_party(interaction.user.id))
+
+    async def test_stale_role_update_rejects_deleted_party(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            repository.add_participant(game, FakeUser.id, "탑")
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            select = playwith_cog.RoleUpdateSelect(cog, game, FakeUser.id)
+            select._values = ["정글"]
+            repository.delete_party(game)
+            interaction = FakeInteraction(channel_id=1)
+
+            await select.callback(interaction)
 
             self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
             self.assertIsNone(repository.get_user_party(interaction.user.id))
