@@ -1,5 +1,6 @@
 services:
   bot:
+    image: discordbot-hsr:local
     build: .
     env_file:
       - .env.runtime
@@ -10,9 +11,14 @@ services:
     volumes:
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   backup:
-    build: .
+    image: discordbot-hsr:local
     env_file:
       - .env.runtime
       - .env.secrets
@@ -21,3 +27,8 @@ services:
     volumes:
       - ./runtime/data:/app/runtime/data:ro
       - ./runtime/backups:/app/runtime/backups
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

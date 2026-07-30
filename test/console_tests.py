@@ -264,38 +264,94 @@ def test_public_env_contract():
         "공개 env 금지어 경로",
         example["FORBIDDEN_WORDS_FILE"] == "runtime/data/forbidden_words.json",
     )
+
+
+def test_deployment_contracts():
+    import plistlib
+
     compose_result = subprocess.run(
-        ["docker", "compose", "config", "--format", "json"],
+        [
+            "docker",
+            "compose",
+            "config",
+            "--no-env-resolution",
+            "--format",
+            "json",
+        ],
         cwd=PROJECT_ROOT,
         check=True,
         text=True,
         capture_output=True,
     )
-    compose_config = json.loads(compose_result.stdout)
-    bot_mounts = compose_config["services"]["bot"]["volumes"]
+    services = json.loads(compose_result.stdout)["services"]
+    bot = services["bot"]
+    backup = services["backup"]
+    backup_plist = plistlib.loads(
+        (
+            PROJECT_ROOT / "deploy/macos/com.discordbot.hsr-backup.plist.example"
+        ).read_bytes()
+    )
+
+    check("Compose 이미지는 한 번만 빌드", "build" in bot and "build" not in backup)
     check(
-        "Compose는 runtime data를 bot에 bind",
-        any(
-            str(mount.get("source", "")).endswith("runtime/data")
-            and mount.get("target") == "/app/runtime/data"
-            for mount in bot_mounts
+        "두 서비스가 같은 이미지 사용",
+        bot.get("image") == backup.get("image") == "discordbot-hsr:local",
+    )
+    check(
+        "Compose 두 서비스 secrets 파일 우선",
+        all(
+            [pathlib.Path(item["path"]).name for item in service["env_file"]]
+            == [".env.runtime", ".env.secrets"]
+            for service in (bot, backup)
         ),
     )
     check(
-        "Compose는 settings 금지어 파일을 bind하지 않음",
+        "Compose runtime data 권한 분리",
+        any(
+            str(mount.get("source", "")).endswith("runtime/data")
+            and mount.get("target") == "/app/runtime/data"
+            and not mount.get("read_only", False)
+            for mount in bot["volumes"]
+        )
+        and any(
+            str(mount.get("source", "")).endswith("runtime/data")
+            and mount.get("target") == "/app/runtime/data"
+            and mount.get("read_only") is True
+            for mount in backup["volumes"]
+        ),
+    )
+    check(
+        "settings 금지어 bind 제거",
         all(
             not str(mount.get("source", "")).endswith(
                 "settings/forbidden_words.json"
             )
-            for mount in bot_mounts
+            for service in (bot, backup)
+            for mount in service["volumes"]
         ),
     )
-
-
-def test_compose_env_file_order():
-    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
-    expected = "    env_file:\n      - .env.runtime\n      - .env.secrets\n"
-    check("Compose 두 서비스 secrets 파일 우선", compose.count(expected) == 2)
+    check(
+        "Compose 로그 크기 제한",
+        all(
+            service.get("logging", {}).get("driver") == "json-file"
+            and service.get("logging", {}).get("options", {}).get("max-size")
+            == "10m"
+            for service in (bot, backup)
+        ),
+    )
+    check(
+        "Compose 로그 파일 수 제한",
+        all(
+            service.get("logging", {}).get("options", {}).get("max-file") == "5"
+            for service in (bot, backup)
+        ),
+    )
+    check(
+        "launchd 백업은 env 주기 loop 사용",
+        backup_plist["ProgramArguments"][-1] == "loop"
+        and "StartInterval" not in backup_plist
+        and backup_plist.get("KeepAlive") is True,
+    )
 
 
 def test_forbidden_words_fail_fast():
@@ -1217,7 +1273,7 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
-        test_compose_env_file_order()
+        test_deployment_contracts()
         test_forbidden_words_fail_fast()
         test_forbidden_words_load_logs_to_stdout()
         test_new_install_verifies_after_loading_cogs()

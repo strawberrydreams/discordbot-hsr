@@ -44,6 +44,13 @@ launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 ```
 
+로그 로테이션 설치와 구문 확인:
+
+```bash
+sudo cp deploy/macos/com.discordbot.hsr.newsyslog.conf.example /etc/newsyslog.d/com.discordbot.hsr.conf
+sudo newsyslog -nvv
+```
+
 상태와 로그:
 
 ```bash
@@ -61,7 +68,7 @@ Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secr
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 
 ```bash
-docker compose build
+docker compose build bot
 docker compose up -d
 docker compose logs --tail=100 bot
 ```
@@ -78,7 +85,7 @@ Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 .venv/bin/python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker 주기와 보존 기간은 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. launchd 주기는 plist의 `StartInterval`을 사용합니다. 변경 시 설치된 백업 plist도 수정하고, 이미 로드된 job을 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내린 뒤 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록해야 합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
 
 `runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
 
@@ -226,7 +233,7 @@ git pull --ff-only
 BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
 test -n "$BACKUP_MANIFEST"
 docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
-docker compose build bot backup
+docker compose build bot
 docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
 docker compose up -d --no-deps bot backup
 docker compose logs --tail=100 bot
@@ -271,7 +278,7 @@ case "$ROLLBACK_MODE" in
 esac
 
 .venv/bin/python -m test.console_tests
-docker compose build bot backup
+docker compose build bot
 docker compose run --rm --no-deps backup python -m module.backup verify
 docker compose up -d --no-deps bot backup
 )
