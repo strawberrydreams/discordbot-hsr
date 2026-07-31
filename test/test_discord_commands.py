@@ -310,6 +310,35 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("환불", interaction.followup.messages[-1][0][0])
 
+    async def test_long_prompt_is_truncated_in_embed(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cog.temp_dir = temp_dir.name
+        cog.bot = SimpleNamespace(
+            get_cog=lambda _: attendance,
+            loop=SimpleNamespace(create_task=lambda coro: coro.close()),
+        )
+        part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
+        captured = {}
+
+        def generate(**kwargs):
+            captured["contents"] = kwargs["contents"]
+            return SimpleNamespace(parts=[part])
+
+        cog.client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        prompt = "가" * 5_000
+
+        await HyacineImageCog._image.callback(cog, interaction, prompt)
+
+        description = interaction.followup.messages[0][1]["embed"].description
+        self.assertLessEqual(len(description), 1_100)
+        self.assertTrue(description.endswith("…"))
+        # 모델에는 원본이 그대로 간다.
+        self.assertEqual(captured["contents"], [prompt])
+
     async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
         attendance = RecordingAttendance()
         interaction = FakeInteraction(channel_id=1)

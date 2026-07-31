@@ -1,13 +1,15 @@
 from __future__ import annotations
 import asyncio
 import os
+import pathlib
+import time
 import traceback
 import uuid
 import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from module.config import AI_COOLDOWN_SECONDS, GOOGLE_API_KEY
+from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY
 
 # Model Alias
 # Imagen 계열은 2026-06-24 서비스 종료 예정이라 Gemini 이미지 모델로 교체
@@ -16,16 +18,30 @@ IMAGE_MODEL = "gemini-3.1-flash-image" # Nano Banana 2 (Gemini 3.1 Flash Image)
 # 평균 출석 수입(17,500 P/일) 기준 이틀에 1회. 「포인트 경제 근거」 절 참조.
 IMAGE_COST = 30_000
 
+# 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패하고 환불도 못 한다.
+MAX_PROMPT_DISPLAY = 1_000
+TEMP_IMAGE_TTL_SECONDS = 300
+
 class HyacineImageCog(commands.Cog):
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
         self.bot = bot
         self.nickname = nickname
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
         
-        # Ensure temp directory exists
-        self.temp_dir = "temp_images"
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
+        # CWD 상대 경로는 Docker 볼륨 밖이라 재시작 시 고아 파일이 남는다.
+        self.temp_dir = DATA_DIR / "temp_images"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self._sweep_stale_images()
+
+    def _sweep_stale_images(self):
+        """삭제 태스크는 재시작에서 살아남지 못하므로 시작 시 한 번 청소한다."""
+        cutoff = time.time() - TEMP_IMAGE_TTL_SECONDS
+        for path in pathlib.Path(self.temp_dir).glob("*.png"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError as exc:
+                print(f"⚠️ Failed to sweep {path}: {exc}")
 
     async def _delete_file_after_delay(self, file_path: str, delay: int):
         """Waits for a delay (seconds) and then deletes the file."""
@@ -143,9 +159,14 @@ class HyacineImageCog(commands.Cog):
                 
             # 3. Upload to Discord
             file = discord.File(filepath, filename=filename)
+            display_prompt = (
+                프롬프트
+                if len(프롬프트) <= MAX_PROMPT_DISPLAY
+                else 프롬프트[:MAX_PROMPT_DISPLAY] + "…"
+            )
             embed = discord.Embed(
                 title="🎨 히아킨의 그림 선물",
-                description=f"**요청**: {프롬프트}",
+                description=f"**요청**: {display_prompt}",
                 color=0x9b59b6 # Purple-ish
             )
             embed.set_image(url=f"attachment://{filename}")
@@ -155,7 +176,9 @@ class HyacineImageCog(commands.Cog):
             uploaded = True
             
             # 4. Schedule deletion
-            self.bot.loop.create_task(self._delete_file_after_delay(filepath, 300))
+            self.bot.loop.create_task(
+                self._delete_file_after_delay(filepath, TEMP_IMAGE_TTL_SECONDS)
+            )
 
         except Exception:
             refund_points()

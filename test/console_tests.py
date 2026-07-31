@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import closing, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -891,6 +892,30 @@ def test_guild_guard():
         "명령 트리에 길드 검사 등록",
         "interaction_check" in inspect.getsource(main.MyBot.setup_hook),
     )
+
+
+def test_temp_image_lifecycle():
+    print("\n[0] 임시 이미지 경로와 수명")
+    import module.config as config
+    import module.hyacine_image_cog as hyacine_image_cog
+
+    cog = object.__new__(hyacine_image_cog.HyacineImageCog)
+    cog.temp_dir = config.DATA_DIR / "temp_images"
+    cog.temp_dir.mkdir(parents=True, exist_ok=True)
+    check("임시 경로는 DATA_DIR 아래", cog.temp_dir.is_relative_to(config.DATA_DIR))
+
+    stale = cog.temp_dir / "stale.png"
+    fresh = cog.temp_dir / "fresh.png"
+    stale.write_bytes(b"png")
+    fresh.write_bytes(b"png")
+    old = time.time() - hyacine_image_cog.TEMP_IMAGE_TTL_SECONDS - 60
+    os.utime(stale, (old, old))
+
+    cog._sweep_stale_images()
+
+    check("시작 시 오래된 임시 파일 정리", not stale.exists())
+    check("최근 파일은 보존", fresh.exists())
+    fresh.unlink()
 
 
 def test_migration() -> SQLiteAttendanceRepository:
@@ -1955,6 +1980,7 @@ if __name__ == "__main__":
         test_point_ledger()
         test_luckybox_removed()
         test_guild_guard()
+        test_temp_image_lifecycle()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
