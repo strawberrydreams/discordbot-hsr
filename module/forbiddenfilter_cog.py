@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 from discord.ext import commands
 
-from module.config import FORBIDDEN_WORDS_FILE
+from module.config import DISCORD_GUILD_ID, FORBIDDEN_WORDS_FILE
 
 # ─────────── 설정 ─────────── #
 DATA_FILE = FORBIDDEN_WORDS_FILE
@@ -108,6 +108,9 @@ class ForbiddenFilterCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # forbidden_count는 길드 구분 없는 공용 테이블이므로 DM/타 길드는 세지 않는다.
+        if message.guild is None or message.guild.id != DISCORD_GUILD_ID:
+            return
         if message.author.bot or not self._banned or self._banned_pattern is None:
             return
 

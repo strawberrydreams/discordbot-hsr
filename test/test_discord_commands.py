@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import pathlib
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from module.hyacine_chat_cog import HyacineChatCog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
 import module.playwith_cog as playwith_cog
+import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.backup as backup
 
 
@@ -90,12 +92,14 @@ class FakeGuild:
 
 
 class FakeInteraction:
-    def __init__(self, channel_id, guild=None):
+    def __init__(self, channel_id, guild=None, guild_id=None):
         self.channel_id = channel_id
         self.user = FakeUser()
         self.response = RecordingResponse()
         self.followup = RecordingFollowup()
         self.guild = guild
+        # 기본값은 설정된 길드 — 경계 테스트만 다른 값을 넘긴다.
+        self.guild_id = config.DISCORD_GUILD_ID if guild_id is None else guild_id
 
 
 class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -751,6 +755,119 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
         for game, view in cog.shared_views.items():
             self.assertTrue(view.is_persistent())
             self.assertEqual(view.children[0].custom_id, f"party:join:{game}")
+
+
+class FakeMessage:
+    def __init__(self, content, guild_id=None):
+        self.content = content
+        self.author = SimpleNamespace(bot=False, id=FakeUser.id, mention=FakeUser.mention)
+        self.guild = (
+            None
+            if guild_id is None
+            else SimpleNamespace(id=guild_id)
+        )
+        self.channel = SimpleNamespace(send=self._send)
+        self.sent = []
+
+    async def _send(self, text):
+        self.sent.append(text)
+
+
+class RecordingForbiddenCounts:
+    def __init__(self):
+        self.counts = []
+
+    def increment_forbidden_count(self, user_id):
+        self.counts.append(user_id)
+
+
+def make_forbidden_cog(counter, words=("나쁜말",)):
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(list(words), handle)
+        path = pathlib.Path(handle.name)
+    with patch.object(forbiddenfilter_cog, "DATA_FILE", path), patch(
+        "module.forbiddenfilter_cog.print"
+    ):
+        cog = forbiddenfilter_cog.ForbiddenFilterCog(
+            SimpleNamespace(get_cog=lambda _: counter)
+        )
+    path.unlink()
+    return cog
+
+
+class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_other_guild_and_dm_messages_are_ignored(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+
+        other_guild = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID + 1)
+        direct_message = FakeMessage("나쁜말", guild_id=None)
+        for message in (other_guild, direct_message):
+            await cog.on_message(message)
+
+        self.assertEqual(counter.counts, [])
+        self.assertEqual(other_guild.sent + direct_message.sent, [])
+
+    async def test_configured_guild_message_is_still_screened(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        message = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
+
+        await cog.on_message(message)
+
+        self.assertEqual(counter.counts, [FakeUser.id])
+        self.assertIn("나쁜말", message.sent[0])
+
+    async def test_join_button_from_another_guild_does_not_join(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(
+                channel_id=1, guild_id=config.DISCORD_GUILD_ID + 1
+            )
+
+            await cog.shared_views[game].children[0].callback(interaction)
+
+            self.assertIsNone(repository.get_user_party(FakeUser.id))
+            self.assertIs(interaction.response.messages[0][1].get("ephemeral"), True)
+            self.assertIn("이 서버에서 사용할 수 없습니다", interaction.response.messages[0][0][0])
+
+    async def test_command_tree_rejects_other_guilds(self):
+        import module.main as main
+
+        class FakeTree:
+            interaction_check = None
+
+            def copy_global_to(self, *, guild):
+                pass
+
+            async def sync(self, *, guild=None):
+                pass
+
+        class FakeBot:
+            tree = FakeTree()
+
+            async def load_extension(self, extension):
+                pass
+
+        with patch.object(main, "_verify_databases"), patch.object(
+            main, "DISCORD_GUILD_ID", 4_242
+        ), patch.object(main, "DATA_DIR", pathlib.Path(tempfile.mkdtemp())), patch.object(
+            main, "GLOBAL_CLEANUP_MARKER", pathlib.Path(tempfile.mkdtemp()) / "marker"
+        ):
+            bot = FakeBot()
+            await main.MyBot.setup_hook(bot)
+            check = bot.tree.interaction_check
+
+            self.assertTrue(await check(FakeInteraction(channel_id=1, guild_id=4_242)))
+            self.assertFalse(await check(FakeInteraction(channel_id=1, guild_id=1)))
+            # DM 상호작용은 guild_id가 없다.
+            self.assertFalse(await check(SimpleNamespace(guild_id=None)))
 
 
 class PartyCreationTests(unittest.IsolatedAsyncioTestCase):

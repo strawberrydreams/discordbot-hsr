@@ -60,6 +60,12 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
+        # 슬래시 명령은 길드 sync로 격리되지만, 남아 있는 등록분이 다른 길드에서 뜰 수 있다.
+        async def _guild_only_check(interaction: discord.Interaction) -> bool:
+            return interaction.guild_id == DISCORD_GUILD_ID
+
+        self.tree.interaction_check = _guild_only_check
+
         _verify_databases(existing_only=True)
 
         for extension in EXTENSIONS:

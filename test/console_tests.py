@@ -868,6 +868,27 @@ def test_point_ledger():
         )
 
 
+def test_guild_guard():
+    print("\n[0] 길드 경계")
+    import module.forbiddenfilter_cog as forbiddenfilter_cog
+    import module.main as main
+    import module.playwith_cog as playwith_cog
+
+    check(
+        "on_message가 길드를 확인",
+        "DISCORD_GUILD_ID"
+        in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog.on_message),
+    )
+    check(
+        "JoinButton이 길드를 확인",
+        "DISCORD_GUILD_ID" in inspect.getsource(playwith_cog.JoinButton.callback),
+    )
+    check(
+        "명령 트리에 길드 검사 등록",
+        "interaction_check" in inspect.getsource(main.MyBot.setup_hook),
+    )
+
+
 def test_migration() -> SQLiteAttendanceRepository:
     print("\n[1] SQLite 마이그레이션")
     db_path = _TMP_DIR / "attendance_migration.db"
@@ -1929,6 +1950,7 @@ if __name__ == "__main__":
         test_backup_reads_wal_without_writer()
         test_point_ledger()
         test_luckybox_removed()
+        test_guild_guard()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)

@@ -4,7 +4,7 @@ from typing import Optional
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import View, Select, Button
-from module.config import RECRUIT_CHANNEL_ID, GAMES
+from module.config import DISCORD_GUILD_ID, RECRUIT_CHANNEL_ID, GAMES
 from module.database import PartyRepository, create_party_repository
 
 class PlayWithCog(commands.Cog):
@@ -236,6 +236,13 @@ class JoinButton(Button):
     async def callback(self, interaction: discord.Interaction):
         game = self.game
         user_id = interaction.user.id
+
+        # 영속 버튼은 custom_id만으로 동작하므로 위치 무관하게 응답할 수 있다.
+        if interaction.guild_id != DISCORD_GUILD_ID:
+            await interaction.response.send_message(
+                "❌ 이 버튼은 이 서버에서 사용할 수 없습니다.", ephemeral=True
+            )
+            return
 
         if not self.cog.get_party(game):
             await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
