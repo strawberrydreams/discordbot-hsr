@@ -32,11 +32,16 @@ SQLITE_TIMEOUT_SECONDS = 30.0
 
 def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection:
     """이 모듈의 유일한 SQLite 연결 지점. timeout/journal 정책을 한 곳에 모은다."""
-    return sqlite3.connect(
+    conn = sqlite3.connect(
         db_path,
         timeout=SQLITE_TIMEOUT_SECONDS,
         isolation_level=isolation_level,
     )
+    # journal_mode는 DB 파일에 영속되므로 매 연결 설정은 멱등하다.
+    # WAL이면 쓰기 프로세스가 없어도 백업이 읽을 수 있다(단, 디렉터리가 쓰기 가능해야 함).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
 
 # ─────────── 인터페이스 ─────────── #

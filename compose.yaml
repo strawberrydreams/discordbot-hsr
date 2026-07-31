@@ -25,7 +25,9 @@ services:
     command: ["python", "-m", "module.backup", "loop"]
     restart: unless-stopped
     volumes:
-      - ./runtime/data:/app/runtime/data:ro
+      # WAL DB는 읽기 전용 연결이라도 -shm/-wal을 만들 수 있어야 하므로 rw로 마운트한다.
+      # 백업 코드는 온라인 backup API로 읽기만 한다.
+      - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
     logging:
       driver: json-file

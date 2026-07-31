@@ -342,18 +342,16 @@ def test_deployment_contracts():
             ),
         )
         check(
-            "Compose runtime data 권한 분리",
-            any(
-                str(mount.get("source", "")).endswith("runtime/data")
-                and mount.get("target") == "/app/runtime/data"
-                and not mount.get("read_only", False)
-                for mount in bot["volumes"]
-            )
-            and any(
-                str(mount.get("source", "")).endswith("runtime/data")
-                and mount.get("target") == "/app/runtime/data"
-                and mount.get("read_only") is True
-                for mount in backup["volumes"]
+            # WAL DB는 읽기 전용 연결이라도 -shm/-wal 생성이 필요하므로 :ro면 백업이 실패한다.
+            "backup 데이터 마운트는 WAL을 위해 쓰기 가능",
+            all(
+                any(
+                    str(mount.get("source", "")).endswith("runtime/data")
+                    and mount.get("target") == "/app/runtime/data"
+                    and not mount.get("read_only", False)
+                    for mount in service["volumes"]
+                )
+                for service in (bot, backup)
             ),
         )
         check(
@@ -785,6 +783,29 @@ def test_sqlite_busy_timeout():
     source = pathlib.Path(inspect.getsourcefile(database)).read_text(encoding="utf-8")
     direct = source.count("sqlite3.connect(")
     check("모든 연결이 헬퍼를 경유", direct == 1, f"직접 호출 {direct}건")
+
+
+def test_backup_reads_wal_without_writer():
+    import module.backup as backup
+
+    with tempfile.TemporaryDirectory() as directory:
+        data_dir = pathlib.Path(directory) / "data"
+        data_dir.mkdir()
+        source = data_dir / "attendance_data.db"
+        repo = SQLiteAttendanceRepository(source)
+        repo.add_points(1, 10)
+        del repo  # 쓰기 연결 없음 = 봇 정지 상태
+        gc.collect()
+
+        with closing(sqlite3.connect(source)) as conn:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        check("WAL 모드로 저장됨", mode == "wal", f"({mode})")
+
+        target = pathlib.Path(directory) / "copy.db"
+        backup._backup_one(source, target)
+        with closing(sqlite3.connect(target)) as conn:
+            points = conn.execute("SELECT points FROM users WHERE user_id = 1").fetchone()
+        check("쓰기 프로세스 없이도 백업 가능", points == (10,), f"({points})")
 
 
 def test_migration() -> SQLiteAttendanceRepository:
@@ -1857,6 +1878,7 @@ if __name__ == "__main__":
         test_importing_main_does_not_construct_bot()
         test_bot_disables_all_mentions()
         test_sqlite_busy_timeout()
+        test_backup_reads_wal_without_writer()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
