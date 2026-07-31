@@ -24,6 +24,21 @@ from typing import Dict, List, Optional, Tuple
 from module.config import DATA_DIR, DB_BACKEND
 
 
+# ─────────── 연결 정책 ─────────── #
+
+# 봇과 backup 프로세스가 같은 DB 파일을 연다. 기본 5초로는 백업 중 쓰기가 실패할 수 있다.
+SQLITE_TIMEOUT_SECONDS = 30.0
+
+
+def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection:
+    """이 모듈의 유일한 SQLite 연결 지점. timeout/journal 정책을 한 곳에 모은다."""
+    return sqlite3.connect(
+        db_path,
+        timeout=SQLITE_TIMEOUT_SECONDS,
+        isolation_level=isolation_level,
+    )
+
+
 # ─────────── 인터페이스 ─────────── #
 
 class AttendanceRepository(ABC):
@@ -120,7 +135,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
         self._init_db()
 
     def _init_db(self):
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -148,14 +163,14 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             conn.commit()
 
     def get_points(self, user_id: int) -> int:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("SELECT points FROM users WHERE user_id = ?", (user_id,))
             result = c.fetchone()
             return result[0] if result else 0
 
     def add_points(self, user_id: int, amount: int) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("INSERT OR IGNORE INTO users (user_id, points) VALUES (?, 0)", (user_id,))
             c.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, user_id))
@@ -163,7 +178,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
     def deduct_points(self, user_id: int, amount: int) -> bool:
         # 잔액 확인과 차감을 단일 조건부 UPDATE로 처리하여 race condition을 방지한다.
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute(
                 "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
@@ -178,7 +193,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
         reward: int,
         attendance_date: str,
     ) -> Optional[int]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO users (user_id, points, last_attendance_date)
@@ -197,28 +212,28 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             return row[0] if row else None
 
     def increment_forbidden_count(self, user_id: int) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("INSERT OR IGNORE INTO users (user_id, points, forbidden_count) VALUES (?, 0, 0)", (user_id,))
             c.execute("UPDATE users SET forbidden_count = forbidden_count + 1 WHERE user_id = ?", (user_id,))
             conn.commit()
 
     def get_forbidden_count(self, user_id: int) -> int:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("SELECT forbidden_count FROM users WHERE user_id = ?", (user_id,))
             result = c.fetchone()
             return result[0] if result else 0
 
     def get_top_rankings(self, limit: int = 5) -> List[Tuple[int, int]]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("SELECT user_id, points FROM users ORDER BY points DESC LIMIT ?", (limit,))
             return c.fetchall()
 
     def play_luckybox(self, user_id: int, bet: int, today_str: str, multiplier: float):
         result_amount = int(bet * multiplier)
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn = _connect(self.db_path, isolation_level=None)
         try:
             c = conn.cursor()
             c.execute("BEGIN IMMEDIATE")
@@ -261,7 +276,7 @@ class SQLitePartyRepository(PartyRepository):
         self._init_db()
 
     def _init_db(self):
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             # Parties table: game is the primary key (one party per game)
             cursor.execute("""
@@ -312,20 +327,20 @@ class SQLitePartyRepository(PartyRepository):
             conn.commit()
 
     def get_party(self, game: str) -> Optional[Tuple[int]]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT created_at FROM parties WHERE game = ?", (game,))
             return cursor.fetchone()
 
     def create_party(self, game: str, created_at: int) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT OR IGNORE INTO parties (game, created_at) VALUES (?, ?)",
                            (game, created_at))
             conn.commit()
 
     def delete_party(self, game: str) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             # SQLite의 FK CASCADE는 기본적으로 꺼져 있으므로 참가자를 직접 정리한다
             cursor.execute("DELETE FROM participants WHERE game = ?", (game,))
@@ -333,13 +348,13 @@ class SQLitePartyRepository(PartyRepository):
             conn.commit()
 
     def get_participants(self, game: str) -> Dict[int, Optional[str]]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, role FROM participants WHERE game = ?", (game,))
             return {row[0]: row[1] for row in cursor.fetchall()}
 
     def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> bool:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO participants (game, user_id, role)
@@ -350,20 +365,20 @@ class SQLitePartyRepository(PartyRepository):
             return cursor.rowcount > 0
 
     def remove_participant(self, game: str, user_id: int) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM participants WHERE game = ? AND user_id = ?", (game, user_id))
             conn.commit()
 
     def get_user_party(self, user_id: int) -> Optional[str]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT game FROM participants WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             return row[0] if row else None
 
     def delete_expired_parties(self, cutoff: int) -> List[str]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT game FROM parties WHERE created_at < ?", (cutoff,))
             expired_games = [row[0] for row in cursor.fetchall()]

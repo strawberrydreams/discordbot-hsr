@@ -20,6 +20,7 @@ from module.config import (
     BACKUP_RETENTION_DAYS,
     DATA_DIR,
 )
+from module.database import SQLITE_TIMEOUT_SECONDS
 
 DATABASES = {
     "attendance_data.db": {"users"},
@@ -70,7 +71,7 @@ def verify_database(path: Path, required_tables: set[str]) -> dict[str, int]:
     if not path.is_file():
         raise RuntimeError(f"DB 파일이 없습니다: {path}")
     try:
-        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             if result != ("ok",):
                 raise RuntimeError(f"SQLite 무결성 검사 실패: {path}")
@@ -104,8 +105,8 @@ def _sha256(path: Path) -> str:
 
 
 def _backup_one(source: Path, temporary: Path) -> None:
-    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as source_conn:
-        with closing(sqlite3.connect(temporary)) as target_conn:
+    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as source_conn:
+        with closing(sqlite3.connect(temporary, timeout=SQLITE_TIMEOUT_SECONDS)) as target_conn:
             source_conn.backup(target_conn)
             target_conn.commit()
 

@@ -17,6 +17,7 @@ import datetime
 import asyncio
 import gc
 import importlib
+import inspect
 import json
 import os
 import pathlib
@@ -771,6 +772,19 @@ def test_bot_disables_all_mentions():
 
     allowed = init.call_args.kwargs["allowed_mentions"]
     check("봇 전역 멘션 차단", allowed.everyone is False and allowed.roles is False and allowed.users is False)
+
+
+def test_sqlite_busy_timeout():
+    print("\n[0] SQLite 연결 정책")
+    with tempfile.TemporaryDirectory() as directory:
+        path = pathlib.Path(directory) / "t.db"
+        with closing(database._connect(path)) as conn:
+            timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        check("busy timeout 30초 적용", timeout_ms == 30_000, f"({timeout_ms}ms)")
+
+    source = pathlib.Path(inspect.getsourcefile(database)).read_text(encoding="utf-8")
+    direct = source.count("sqlite3.connect(")
+    check("모든 연결이 헬퍼를 경유", direct == 1, f"직접 호출 {direct}건")
 
 
 def test_migration() -> SQLiteAttendanceRepository:
@@ -1842,6 +1856,7 @@ if __name__ == "__main__":
         test_main_holds_instance_lock_while_bot_runs()
         test_importing_main_does_not_construct_bot()
         test_bot_disables_all_mentions()
+        test_sqlite_busy_timeout()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
