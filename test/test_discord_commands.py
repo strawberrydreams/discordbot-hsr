@@ -447,6 +447,46 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
 
 
+class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
+        self.openai_key.start()
+        self.addCleanup(self.openai_key.stop)
+
+    async def test_same_channel_calls_do_not_interleave_history(self):
+        cog = HyacineChatCog(bot=None)
+        # 첫 호출의 응답이 두 번째보다 늦게 끝나도록 지연시킨다.
+        delays = {"first": 0.05, "second": 0.0}
+
+        async def delayed(**kwargs):
+            text = kwargs["input"][-1]["content"][0]["text"]
+            await asyncio.sleep(delays[text])
+            return SimpleNamespace(
+                output_text=f"{text} 응답",
+                model="gpt-5.6-terra",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        cog.client = SimpleNamespace(responses=SimpleNamespace(create=delayed))
+
+        await asyncio.gather(
+            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", 0),
+            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", 0),
+        )
+
+        roles = [m["role"] for m in cog.get_session(1).history if m["role"] != "system"]
+        self.assertEqual(roles, ["user", "assistant", "user", "assistant"])
+
+    async def test_active_session_survives_eviction(self):
+        cog = HyacineChatCog(bot=None)
+        cog.MAX_CHANNEL_SESSIONS = 2
+        active = cog.get_session(1)
+        async with active.lock:
+            for channel_id in range(2, 12):
+                cog.get_session(channel_id)
+            self.assertIs(cog.get_session(1), active)
+
+
 class AICooldownTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")

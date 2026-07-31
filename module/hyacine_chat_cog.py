@@ -1,3 +1,4 @@
+import asyncio
 import textwrap
 import traceback
 from collections import OrderedDict, deque
@@ -28,6 +29,8 @@ class ChannelSession:
             maxlen=120
         )
         self.last_usage: Dict[str, Any] = {}
+        # 같은 채널의 동시 호출이 히스토리를 읽고 완료 순서대로 append하면 턴이 어긋난다.
+        self.lock = asyncio.Lock()
 
 
 class HyacineChatCog(commands.Cog):
@@ -81,8 +84,14 @@ class HyacineChatCog(commands.Cog):
         if session is None:
             session = ChannelSession(self.system_prompt)
         self.sessions[channel_id] = session
-        if len(self.sessions) > self.MAX_CHANNEL_SESSIONS:
-            self.sessions.popitem(last=False)
+        while len(self.sessions) > self.MAX_CHANNEL_SESSIONS:
+            # 응답 대기 중인 세션을 버리면 코루틴이 고아 객체에 append해 턴이 유실된다.
+            for candidate_id, candidate in self.sessions.items():
+                if not candidate.lock.locked():
+                    del self.sessions[candidate_id]
+                    break
+            else:
+                break  # 전부 사용 중이면 이번 사이클은 축출하지 않음
         return session
 
     def tokenizer_for(self, model_name: str):
@@ -208,48 +217,51 @@ class HyacineChatCog(commands.Cog):
             await inter.response.defer()
 
             parts = self.build_user_parts(내용, 이미지)
-            self.trim(session)
 
-            # 최근 10개 메시지 (5턴) 사용
-            recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
+            # 포인트 차감과 defer()는 락 밖에 둬서 대기 중에도 인터랙션이 만료되지 않게 한다.
+            async with session.lock:
+                self.trim(session)
 
-            max_tokens = self.MAX_ASSISTANT_DEEP if model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
+                # 최근 10개 메시지 (5턴) 사용
+                recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
 
-            kwargs = {
-                "model": model,
-                "instructions": self.system_prompt,
-                "input": recent_turns + [{"role": "user", "content": parts}],
-                "max_output_tokens": max_tokens,
-                "reasoning": {"effort": reasoning_effort},
-            }
+                max_tokens = self.MAX_ASSISTANT_DEEP if model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
 
-            resp = await self.client.responses.create(**kwargs)
+                kwargs = {
+                    "model": model,
+                    "instructions": self.system_prompt,
+                    "input": recent_turns + [{"role": "user", "content": parts}],
+                    "max_output_tokens": max_tokens,
+                    "reasoning": {"effort": reasoning_effort},
+                }
 
-            reply = (resp.output_text or "").strip()
+                resp = await self.client.responses.create(**kwargs)
 
-            if not reply.strip():
-                refund_note = " (포인트 환불됨)" if refund_points() else ""
-                await inter.followup.send(
-                    "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
-                    + refund_note
-                )
-                return
+                reply = (resp.output_text or "").strip()
 
-            session.last_usage = {
-                "model": resp.model,
-                "input_tokens": resp.usage.input_tokens,
-                "output_tokens": resp.usage.output_tokens,
-                "total_tokens": resp.usage.total_tokens
-            }
+                if not reply.strip():
+                    refund_note = " (포인트 환불됨)" if refund_points() else ""
+                    await inter.followup.send(
+                        "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
+                        + refund_note
+                    )
+                    return
 
-            # Update History
-            history_parts = [
-                part for part in parts if part.get("type") == "input_text"
-            ]
-            if not history_parts:
-                history_parts = [{"type": "input_text", "text": "(이전 턴에 이미지 첨부됨)"}]
-            session.history.append({"role": "user", "content": history_parts})
-            session.history.append({"role": "assistant", "content": reply})
+                session.last_usage = {
+                    "model": resp.model,
+                    "input_tokens": resp.usage.input_tokens,
+                    "output_tokens": resp.usage.output_tokens,
+                    "total_tokens": resp.usage.total_tokens
+                }
+
+                # Update History
+                history_parts = [
+                    part for part in parts if part.get("type") == "input_text"
+                ]
+                if not history_parts:
+                    history_parts = [{"type": "input_text", "text": "(이전 턴에 이미지 첨부됨)"}]
+                session.history.append({"role": "user", "content": history_parts})
+                session.history.append({"role": "assistant", "content": reply})
 
             await inter.followup.send(f"**{inter.user.mention}**: {내용}")
             await self.send_chunked_followup(inter, reply)
