@@ -870,6 +870,46 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await check(SimpleNamespace(guild_id=None)))
 
 
+class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.counter = RecordingForbiddenCounts()
+        self.cog = make_forbidden_cog(self.counter)
+
+    async def test_edit_that_introduces_a_forbidden_word_is_caught(self):
+        before = FakeMessage("안녕하세요", guild_id=config.DISCORD_GUILD_ID)
+        after = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
+
+        await self.cog.on_message_edit(before, after)
+
+        self.assertEqual(self.counter.counts, [FakeUser.id])
+        self.assertIn("나쁜말", after.sent[0])
+
+    async def test_edit_of_an_already_caught_message_is_not_double_counted(self):
+        before = FakeMessage("나쁜말 하나", guild_id=config.DISCORD_GUILD_ID)
+        after = FakeMessage("나쁜말 둘", guild_id=config.DISCORD_GUILD_ID)
+
+        await self.cog.on_message_edit(before, after)
+
+        self.assertEqual(self.counter.counts, [])
+        self.assertEqual(after.sent, [])
+
+    async def test_unchanged_content_is_not_rescreened(self):
+        message = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
+
+        await self.cog.on_message_edit(message, message)
+
+        self.assertEqual(self.counter.counts, [])
+
+    async def test_clean_edit_stays_clean(self):
+        before = FakeMessage("안녕", guild_id=config.DISCORD_GUILD_ID)
+        after = FakeMessage("반가워요", guild_id=config.DISCORD_GUILD_ID)
+
+        await self.cog.on_message_edit(before, after)
+
+        self.assertEqual(self.counter.counts, [])
+        self.assertEqual(after.sent, [])
+
+
 class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_selection_of_same_game_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:

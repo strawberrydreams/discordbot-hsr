@@ -106,34 +106,55 @@ class ForbiddenFilterCog(commands.Cog):
         print(f"📥 금지어 {len(self._banned)}개 로드")
         return self._banned
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        # forbidden_count는 길드 구분 없는 공용 테이블이므로 DM/타 길드는 세지 않는다.
-        if message.guild is None or message.guild.id != DISCORD_GUILD_ID:
-            return
-        if message.author.bot or not self._banned or self._banned_pattern is None:
-            return
+    def _find_match(self, content: str) -> Optional[str]:
+        """금지어를 찾으면 정규화된 형태로 반환한다."""
+        if not self._banned or self._banned_pattern is None:
+            return None
 
         # 1차 검사: 기본 정규화 (공백/구두점 제거, 숫자/자모 유지) -> "18", "ㅋㅋㅋ" 등을 잡음
-        text_norm = _normalize_message_for_match(message.content)
+        text_norm = _normalize_message_for_match(content)
         match = self._banned_pattern.search(text_norm)
-        
+
         # 2차 검사: 공격적 정규화 (숫자/자모 제거) -> "아1니", "아ㅑ니" 등을 잡음
         # 1차에서 걸리지 않았을 때만 수행 (중복 적발 방지)
         if not match:
             text_aggressive = _strip_to_core_chars(text_norm)
             match = self._banned_pattern.search(text_aggressive)
 
-        if match:
-            bad_word = match.group()  # 정규화된 금지어
-            await message.channel.send(
-                f"🛑🛑 {message.author.mention} 삐삑~~ 나쁜 단어 **{bad_word}** 금지! 금지! 🛑🛑"
-            )
-            
-            # Increment forbidden count
-            attendance_cog = self.bot.get_cog("AttendanceCog")
-            if attendance_cog:
-                attendance_cog.increment_forbidden_count(message.author.id)
+        return match.group() if match else None
+
+    async def _inspect(self, message: discord.Message):
+        # forbidden_count는 길드 구분 없는 공용 테이블이므로 DM/타 길드는 세지 않는다.
+        if message.guild is None or message.guild.id != DISCORD_GUILD_ID:
+            return
+        if message.author.bot:
+            return
+
+        bad_word = self._find_match(message.content)
+        if not bad_word:
+            return
+
+        await message.channel.send(
+            f"🛑🛑 {message.author.mention} 삐삑~~ 나쁜 단어 **{bad_word}** 금지! 금지! 🛑🛑"
+        )
+
+        # Increment forbidden count
+        attendance_cog = self.bot.get_cog("AttendanceCog")
+        if attendance_cog:
+            attendance_cog.increment_forbidden_count(message.author.id)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        await self._inspect(message)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """깨끗한 메시지를 올린 뒤 수정해 금지어를 넣는 우회를 막는다."""
+        if before.content == after.content:
+            return
+        if self._find_match(before.content):
+            return  # 수정 전에 이미 적발됨
+        await self._inspect(after)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ForbiddenFilterCog(bot))

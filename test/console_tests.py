@@ -875,9 +875,13 @@ def test_guild_guard():
     import module.playwith_cog as playwith_cog
 
     check(
-        "on_message가 길드를 확인",
+        "메시지 검사가 길드를 확인",
         "DISCORD_GUILD_ID"
-        in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog.on_message),
+        in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog._inspect),
+    )
+    check(
+        "메시지 수정도 같은 검사를 공유",
+        hasattr(forbiddenfilter_cog.ForbiddenFilterCog, "on_message_edit"),
     )
     check(
         "JoinButton이 길드를 확인",
