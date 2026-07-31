@@ -12,6 +12,11 @@ from module.config import OPENAI_API_KEY
 LIGHT_MODEL = "gpt-5.6-terra"
 DEEP_MODEL = "gpt-5.6-sol"
 
+# 포인트 수입원은 /출석 하나뿐이다. 가격이 곧 하루 사용 빈도 상한이 된다.
+# 값을 바꿀 때 docs/superpowers/plans의 「포인트 경제 근거」 절을 함께 갱신한다.
+LIGHT_COST = 200
+DEEP_COST = 2_000
+
 
 class ChannelSession:
     """채널 하나의 대화 상태 (히스토리, 사용량).
@@ -182,7 +187,7 @@ class HyacineChatCog(commands.Cog):
 
             if not attendance_cog.deduct_points(inter.user.id, cost, f"chat:{model}"):
                 current = attendance_cog.get_points(inter.user.id)
-                await inter.response.send_message(f"❌ 고급 모델(Thinking)은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
+                await inter.response.send_message(f"❌ 이 명령은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
                 return
             charged = True
 
@@ -264,7 +269,7 @@ class HyacineChatCog(commands.Cog):
                 print(f"❌ [hyacine_chat] 오류 메시지 전송 실패 (channel={inter.channel_id})")
                 traceback.print_exc()
 
-    @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다.")
+    @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다. (200 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     async def _light_talk(
         self,
@@ -272,7 +277,7 @@ class HyacineChatCog(commands.Cog):
         내용: str,
         이미지: Optional[discord.Attachment] = None,
     ):
-        await self._run_talk(inter, 내용, 이미지, LIGHT_MODEL, "none", 0)
+        await self._run_talk(inter, 내용, 이미지, LIGHT_MODEL, "none", LIGHT_COST)
 
     @app_commands.command(name="고급대화", description="GPT-5.6 Sol과 깊이 대화합니다. (2,000 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
@@ -282,15 +287,15 @@ class HyacineChatCog(commands.Cog):
         내용: str,
         이미지: Optional[discord.Attachment] = None,
     ):
-        await self._run_talk(inter, 내용, 이미지, DEEP_MODEL, "medium", 2_000)
+        await self._run_talk(inter, 내용, 이미지, DEEP_MODEL, "medium", DEEP_COST)
 
     @app_commands.command(name="상태", description="이 채널의 현재 상태 확인")
     async def _status(self, inter: discord.Interaction):
         session = self.get_session(inter.channel_id)
         msg = (
             "- **대화 명령**\n"
-            f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`, 무료)\n"
-            f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`, 2,000 P)\n"
+            f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`, {LIGHT_COST:,} P)\n"
+            f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`, {DEEP_COST:,} P)\n"
         )
         if session.last_usage:
             msg += (

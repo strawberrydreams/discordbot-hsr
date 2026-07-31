@@ -171,7 +171,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
                 escaped = exc
 
         self.assertIsNone(escaped)
-        self.assertEqual(attendance.refund_attempts, [(123, 50_000)])
+        self.assertEqual(attendance.refund_attempts, [(123, 30_000)])
         messages = interaction.response.messages + interaction.followup.messages
         self.assertTrue(messages)
         message = messages[-1][0][0]
@@ -197,7 +197,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await HyacineImageCog._image.callback(cog, interaction, "test")
 
-        self.assertEqual(attendance.refunds, [(123, 50_000)])
+        self.assertEqual(attendance.refunds, [(123, 30_000)])
 
     async def test_empty_image_response_refunds_only_once_when_error_message_fails(self):
         attendance = RecordingAttendance()
@@ -218,7 +218,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await HyacineImageCog._image.callback(cog, interaction, "test")
 
-        self.assertEqual(attendance.refunds, [(123, 50_000)])
+        self.assertEqual(attendance.refunds, [(123, 30_000)])
 
     async def test_generated_image_is_not_refunded_when_discord_upload_fails(self):
         attendance = RecordingAttendance()
@@ -309,7 +309,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
-                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 0),
+                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 200),
                 (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000),
             ],
         )

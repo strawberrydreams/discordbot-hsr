@@ -13,6 +13,9 @@ from module.config import GOOGLE_API_KEY
 # Imagen 계열은 2026-06-24 서비스 종료 예정이라 Gemini 이미지 모델로 교체
 IMAGE_MODEL = "gemini-3.1-flash-image" # Nano Banana 2 (Gemini 3.1 Flash Image)
 
+# 평균 출석 수입(17,500 P/일) 기준 이틀에 1회. 「포인트 경제 근거」 절 참조.
+IMAGE_COST = 30_000
+
 class HyacineImageCog(commands.Cog):
     def __init__(self, bot: commands.Bot, nickname: str = "회색"):
         self.bot = bot
@@ -34,7 +37,7 @@ class HyacineImageCog(commands.Cog):
         except Exception as e:
             print(f"⚠️ Failed to delete {file_path}: {e}")
 
-    @app_commands.command(name="이미지", description="Nano Banana 2에게 그림을 그려달라고 요청합니다. (50,000 P)")
+    @app_commands.command(name="이미지", description="Nano Banana 2에게 그림을 그려달라고 요청합니다. (30,000 P)")
     @app_commands.describe(프롬프트="그려줘! 라고 할 내용")
     async def _image(self, inter: discord.Interaction, 프롬프트: str):
         # 0. Check Points
@@ -43,7 +46,7 @@ class HyacineImageCog(commands.Cog):
             await inter.response.send_message("❌ 출석체크 모듈이 로드되지 않아 포인트를 확인할 수 없어요.", ephemeral=True)
             return
 
-        cost = 50000
+        cost = IMAGE_COST
         if not attendance_cog.deduct_points(inter.user.id, cost, "image"):
             current = attendance_cog.get_points(inter.user.id)
             await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)

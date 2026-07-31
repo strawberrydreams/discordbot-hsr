@@ -97,17 +97,6 @@ class AttendanceRepository(ABC):
     def get_top_rankings(self, limit: int = 5) -> List[Tuple[int, int]]:
         """포인트 상위 유저 [(user_id, points), ...]를 반환한다."""
 
-    @abstractmethod
-    def play_luckybox(self, user_id: int, bet: int, today_str: str, multiplier: float):
-        """럭키박스 베팅 전체(일일 제한 확인 -> 차감 -> 지급 -> 카운트 갱신)를
-        단일 트랜잭션으로 처리한다. 동시 요청이 겹쳐도 잔액/횟수가 어긋나지 않아야 한다.
-
-        Returns:
-            ("limit", None)                              - 하루 3회 제한 초과
-            ("insufficient", {"points": 보유 포인트})      - 잔액 부족
-            ("ok", {"result_amount": 획득량, "final_points": 최종 잔액})
-        """
-
 
 class PartyRepository(ABC):
     """게임 파티 모집 데이터 접근 인터페이스."""
@@ -280,43 +269,6 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 (user_id, limit),
             )
             return c.fetchall()
-
-    def play_luckybox(self, user_id: int, bet: int, today_str: str, multiplier: float):
-        result_amount = int(bet * multiplier)
-        conn = _connect(self.db_path, isolation_level=None)
-        try:
-            c = conn.cursor()
-            c.execute("BEGIN IMMEDIATE")
-            c.execute("INSERT OR IGNORE INTO users (user_id, points) VALUES (?, 0)", (user_id,))
-            c.execute(
-                "SELECT points, luckybox_count, last_luckybox_date FROM users WHERE user_id = ?",
-                (user_id,)
-            )
-            points, count, last_date = c.fetchone()
-
-            if last_date != today_str:
-                count = 0  # 날짜가 바뀌면 카운트 초기화
-
-            if count >= 3:
-                conn.rollback()
-                return "limit", None
-
-            if points < bet:
-                conn.rollback()
-                return "insufficient", {"points": points}
-
-            new_points = points - bet + result_amount
-            c.execute(
-                "UPDATE users SET points = ?, luckybox_count = ?, last_luckybox_date = ? WHERE user_id = ?",
-                (new_points, count + 1, today_str, user_id)
-            )
-            conn.commit()
-            return "ok", {"result_amount": result_amount, "final_points": new_points}
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
 
 class SQLitePartyRepository(PartyRepository):

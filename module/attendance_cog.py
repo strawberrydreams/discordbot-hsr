@@ -76,47 +76,6 @@ class AttendanceCog(commands.Cog):
 
         await inter.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="럭키박스", description="포인트를 걸고 20% ~ 300% 대박을 노려보세요! (확률 랜덤)")
-    @app_commands.describe(금액="베팅할 포인트 금액")
-    async def _luckybox(self, inter: discord.Interaction, 금액: int):
-        if 금액 <= 0:
-            await inter.response.send_message("❌ 0보다 큰 금액을 걸어야죠!", ephemeral=True)
-            return
-
-        user_id = inter.user.id
-        kst = timezone(timedelta(hours=9))
-        today_str = datetime.now(kst).date().isoformat()
-
-        multiplier = random.uniform(0.2, 3.0)
-        status, result = self.db.play_luckybox(user_id, 금액, today_str, multiplier)
-
-        if status == "limit":
-            await inter.response.send_message(f"🛑 {inter.user.mention}, 오늘은 그만! 하루 3번만 가능해요. 내일 다시 도전하세요! 🎲", ephemeral=True)
-            return
-
-        if status == "insufficient":
-            await inter.response.send_message(f"❌ 포인트가 부족해요! (보유: {result['points']:,} P)", ephemeral=True)
-            return
-
-        result_amount = result["result_amount"]
-        final_points = result["final_points"]
-        profit = result_amount - 금액
-
-        # Visuals
-        color = 0x2ecc71 if profit >= 0 else 0xe74c3c
-        title = "🎉 대박!" if profit >= 0 else "😭 쪽박..."
-        desc = f"**{multiplier:.0%}**를 뽑으셨네요!\n"
-
-        if profit >= 0:
-            desc += f"투자금 **{금액:,}** P ➡️ 획득 **{result_amount:,}** P (+{profit:,})"
-        else:
-            desc += f"투자금 **{금액:,}** P ➡️ 획득 **{result_amount:,}** P ({profit:,})"
-
-        embed = discord.Embed(title=title, description=desc, color=color)
-        embed.set_footer(text=f"현재 잔액: {final_points:,} P")
-
-        await inter.response.send_message(embed=embed)
-
     @app_commands.command(name="랭킹", description="포인트 부자 TOP 5를 보여줍니다.")
     async def _ranking(self, inter: discord.Interaction):
         rows = self.db.get_top_rankings(limit=5)

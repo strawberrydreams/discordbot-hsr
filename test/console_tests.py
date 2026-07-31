@@ -4,7 +4,7 @@
 # 검증 항목:
 #   1. SQLite 마이그레이션 (구버전 users 테이블에 luckybox 컬럼 추가)
 #   2. deduct_points 원자성 (동시 차감 시 잔액이 음수가 되지 않음)
-#   3. play_luckybox 단일 트랜잭션 (일일 제한 / 잔액 부족 / 정산 / 동시성)
+#   3. 포인트 원장 (모든 이동 기록, 실패한 차감은 미기록)
 #   4. PartyRepository CRUD (파티 생성/참가/탈퇴/만료 정리)
 #   5. Repository 팩토리 (sqlite 선택, 미지원 백엔드 거부)
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
@@ -808,6 +808,31 @@ def test_backup_reads_wal_without_writer():
         check("쓰기 프로세스 없이도 백업 가능", points == (10,), f"({points})")
 
 
+def test_luckybox_removed():
+    print("\n[0] 럭키박스 제거")
+    import module.attendance_cog as attendance_cog
+
+    check(
+        "play_luckybox 인터페이스 제거",
+        not hasattr(database.AttendanceRepository, "play_luckybox"),
+    )
+    names = {c.name for c in AttendanceCog(bot=None).get_app_commands()}
+    check("럭키박스 명령 제거", "럭키박스" not in names, f"({sorted(names)})")
+
+    repo = SQLiteAttendanceRepository(_TMP_DIR / "luckybox_columns.db")
+    with closing(sqlite3.connect(repo.db_path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    check(
+        "레거시 컬럼은 보존",
+        {"luckybox_count", "last_luckybox_date"} <= columns,
+        f"({sorted(columns)})",
+    )
+    check(
+        "출석 외 통화 발행 없음",
+        "add_points" not in inspect.getsource(attendance_cog.AttendanceCog._attend.callback),
+    )
+
+
 def test_point_ledger():
     print("\n[0] 포인트 원장")
     with tempfile.TemporaryDirectory() as directory:
@@ -944,56 +969,6 @@ def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
     duplicate = repo.claim_attendance(existing_user_id, 99_999, "2026-07-29")
     check("같은 날짜 순차 중복은 None", duplicate is None)
     check("같은 날짜 순차 중복은 잔액 불변", repo.get_points(existing_user_id) == 15_000)
-
-
-def test_play_luckybox(repo: SQLiteAttendanceRepository):
-    print("\n[3] play_luckybox 단일 트랜잭션")
-    user = 200
-    today = "2026-06-11"
-    repo.add_points(user, 10_000)
-
-    # 잔액 부족
-    status, result = repo.play_luckybox(user, 99_999, today, 1.0)
-    check("잔액 부족 시 'insufficient' 반환", status == "insufficient")
-    check("잔액 부족 시 보유 포인트 보고", result["points"] == 10_000)
-    check("잔액 부족 시 잔액 변동 없음", repo.get_points(user) == 10_000)
-
-    # 정상 베팅 (배율 고정으로 정산 검증): 1,000 베팅 x 2.5 = 2,500 획득
-    status, result = repo.play_luckybox(user, 1_000, today, 2.5)
-    check("정상 베팅 'ok' 반환", status == "ok")
-    check("획득량 계산 일치 (2,500)", result["result_amount"] == 2_500)
-    check("최종 잔액 일치 (10,000 - 1,000 + 2,500)", result["final_points"] == 11_500)
-    check("DB 잔액과 반환값 일치", repo.get_points(user) == 11_500)
-
-    # 일일 제한: 2회 더 플레이하면 3회 도달, 4번째는 거부
-    repo.play_luckybox(user, 100, today, 1.0)
-    repo.play_luckybox(user, 100, today, 1.0)
-    status, _ = repo.play_luckybox(user, 100, today, 1.0)
-    check("하루 3회 초과 시 'limit' 반환", status == "limit")
-
-    # 날짜가 바뀌면 카운트 초기화
-    status, _ = repo.play_luckybox(user, 100, "2026-06-12", 1.0)
-    check("날짜 변경 시 카운트 초기화", status == "ok")
-
-    # 동시성: 새 유저, 30개 스레드가 동시에 베팅 -> 성공은 정확히 3회(일일 제한)
-    user2 = 201
-    repo.add_points(user2, 1_000_000)
-    statuses = []
-    lock = threading.Lock()
-
-    def worker():
-        s, _ = repo.play_luckybox(user2, 1_000, today, 1.0)  # 배율 1.0 = 잔액 불변
-        with lock:
-            statuses.append(s)
-
-    threads = [threading.Thread(target=worker) for _ in range(30)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-
-    ok_count = statuses.count("ok")
-    check("동시 베팅: 일일 제한(3회)만 성공", ok_count == 3, f"(성공 {ok_count}회)")
-    check("동시 베팅: 잔액 정확 (배율 1.0이므로 불변)", repo.get_points(user2) == 1_000_000,
-          f"(잔액 {repo.get_points(user2)})")
 
 
 def test_party_repository():
@@ -1914,10 +1889,10 @@ if __name__ == "__main__":
         test_sqlite_busy_timeout()
         test_backup_reads_wal_without_writer()
         test_point_ledger()
+        test_luckybox_removed()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
-        test_play_luckybox(repo)
         test_party_repository()
         test_party_cog_uses_epoch_seconds()
         test_factory()
