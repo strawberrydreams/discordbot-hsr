@@ -10,8 +10,13 @@ from module.config import (
     DATA_DIR,
     DISCORD_GUILD_ID,
     DISCORD_TOKEN,
+    PROJECT_ROOT,
     validate_config,
 )
+
+# 데이터가 아니라 봇 설치 상태이므로 백업 대상 밖(runtime/)에 둔다.
+# DATA_DIR에 두면 백업에서 새 데이터 디렉터리로 복구할 때 전역 클리어가 한 번 더 돈다.
+GLOBAL_CLEANUP_MARKER = PROJECT_ROOT / "runtime" / ".global-commands-cleared"
 
 # 실행 커맨드: python -m module.main
 
@@ -75,10 +80,15 @@ class MyBot(commands.Bot):
         _verify_databases()
         guild = discord.Object(id=DISCORD_GUILD_ID)
         self.tree.copy_global_to(guild=guild)
-        global_cleanup_marker = DATA_DIR / ".global-commands-cleared"
+        global_cleanup_marker = GLOBAL_CLEANUP_MARKER
+        legacy_marker = DATA_DIR / ".global-commands-cleared"
+        if legacy_marker.exists() and not global_cleanup_marker.exists():
+            global_cleanup_marker.parent.mkdir(parents=True, exist_ok=True)
+            legacy_marker.replace(global_cleanup_marker)  # 재-sync를 피한다
         if not global_cleanup_marker.exists():
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
+            global_cleanup_marker.parent.mkdir(parents=True, exist_ok=True)
             global_cleanup_marker.touch()
         await self.tree.sync(guild=guild)
         print(f"🔄 Command tree synced to guild {DISCORD_GUILD_ID}")

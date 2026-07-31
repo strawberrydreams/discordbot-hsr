@@ -87,8 +87,13 @@ class AttendanceCog(commands.Cog):
         embed = discord.Embed(title="🏆 명예의 전당 (TOP 5)", color=0xf1c40f)
 
         for idx, (user_id, points) in enumerate(rows, 1):
-            user = self.bot.get_user(user_id)
-            name = user.display_name if user else f"Unknown User ({user_id})"
+            # get_user는 캐시 기반이라 미스 시 원시 ID가 노출된다. 길드 멤버(닉네임)를 우선한다.
+            member = inter.guild.get_member(user_id) if inter.guild else None
+            if member is None:
+                user = self.bot.get_user(user_id) if self.bot else None
+                name = user.display_name if user else "알 수 없는 유저"
+            else:
+                name = member.display_name
             medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx-1]
             embed.add_field(name=f"{medal} {name}", value=f"**{points:,}** P", inline=False)
 

@@ -955,6 +955,38 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await check(SimpleNamespace(guild_id=None)))
 
 
+class RankingCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        repository = SQLiteAttendanceRepository(
+            pathlib.Path(self.temp_dir.name) / "attendance.db"
+        )
+        repository.add_points(1, 500)
+        repository.add_points(2, 400)
+        self.cog = AttendanceCog(bot=None, repository=repository)
+
+    async def test_guild_nickname_wins_and_cache_miss_hides_the_raw_id(self):
+        class PartialGuild:
+            def get_member(self, user_id):
+                return (
+                    SimpleNamespace(display_name="서버 닉네임")
+                    if user_id == 1
+                    else None
+                )
+
+        interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
+
+        await AttendanceCog._ranking.callback(self.cog, interaction)
+
+        names = [
+            field.name for field in interaction.response.messages[0][1]["embed"].fields
+        ]
+        self.assertIn("서버 닉네임", names[0])
+        self.assertIn("알 수 없는 유저", names[1])
+        self.assertNotIn("2", names[1].replace("2️⃣", ""))
+
+
 class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.counter = RecordingForbiddenCounts()

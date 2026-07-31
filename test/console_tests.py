@@ -499,7 +499,7 @@ def test_new_install_verifies_after_loading_cogs():
     events = []
     data_dir = _TMP_DIR / "new-install-data"
     data_dir.mkdir(exist_ok=True)
-    marker = data_dir / ".global-commands-cleared"
+    marker = _TMP_DIR / "new-install-state" / ".global-commands-cleared"
     marker.unlink(missing_ok=True)
 
     class FakeTree:
@@ -526,6 +526,7 @@ def test_new_install_verifies_after_loading_cogs():
         return {}
 
     with patch.object(main, "DATA_DIR", data_dir), \
+         patch.object(main, "GLOBAL_CLEANUP_MARKER", marker), \
          patch.object(main, "verify_database", side_effect=verify), \
          patch.object(main, "DISCORD_GUILD_ID", 123):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
@@ -549,7 +550,9 @@ def test_existing_global_cleanup_marker_skips_only_global_sync():
     events = []
     data_dir = _TMP_DIR / "existing-global-cleanup-data"
     data_dir.mkdir(exist_ok=True)
-    marker = data_dir / ".global-commands-cleared"
+    state_dir = _TMP_DIR / "existing-global-cleanup-state"
+    state_dir.mkdir(exist_ok=True)
+    marker = state_dir / ".global-commands-cleared"
     marker.touch()
 
     class FakeTree:
@@ -569,6 +572,7 @@ def test_existing_global_cleanup_marker_skips_only_global_sync():
             events.append(f"load:{extension}")
 
     with patch.object(main, "DATA_DIR", data_dir), \
+         patch.object(main, "GLOBAL_CLEANUP_MARKER", marker), \
          patch.object(main, "_verify_databases"), \
          patch.object(main, "DISCORD_GUILD_ID", 456):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
@@ -583,6 +587,52 @@ def test_existing_global_cleanup_marker_skips_only_global_sync():
         events == expected,
         f"({events})",
     )
+
+
+def test_global_cleanup_marker_location():
+    import module.backup as backup
+    import module.config as config
+    import module.main as main
+
+    check("마커는 DATA_DIR 밖", not main.GLOBAL_CLEANUP_MARKER.is_relative_to(config.DATA_DIR))
+    check(
+        "마커는 백업 대상이 아님",
+        main.GLOBAL_CLEANUP_MARKER.name not in set(backup.DATABASES),
+    )
+
+    # 구버전 위치에 남아 있으면 새 위치로 이관해 재-sync를 피한다.
+    data_dir = _TMP_DIR / "marker-migration-data"
+    data_dir.mkdir(exist_ok=True)
+    legacy = data_dir / ".global-commands-cleared"
+    legacy.touch()
+    new_marker = _TMP_DIR / "marker-migration-state" / ".global-commands-cleared"
+
+    events = []
+
+    class FakeTree:
+        def copy_global_to(self, *, guild):
+            pass
+
+        def clear_commands(self, *, guild):
+            events.append("clear")
+
+        async def sync(self, *, guild=None):
+            events.append("sync:global" if guild is None else "sync:guild")
+
+    class FakeBot:
+        tree = FakeTree()
+
+        async def load_extension(self, extension):
+            pass
+
+    with patch.object(main, "DATA_DIR", data_dir), \
+         patch.object(main, "GLOBAL_CLEANUP_MARKER", new_marker), \
+         patch.object(main, "_verify_databases"), \
+         patch.object(main, "DISCORD_GUILD_ID", 789):
+        asyncio.run(main.MyBot.setup_hook(FakeBot()))
+
+    check("구버전 마커는 새 위치로 이관", new_marker.is_file() and not legacy.exists())
+    check("이관 후 전역 클리어는 재실행되지 않음", events == ["sync:guild"], f"({events})")
 
 
 def test_startup_preverification_failure_stops_cogs_and_sync():
@@ -1968,6 +2018,7 @@ if __name__ == "__main__":
         test_forbidden_words_load_logs_to_stdout()
         test_new_install_verifies_after_loading_cogs()
         test_existing_global_cleanup_marker_skips_only_global_sync()
+        test_global_cleanup_marker_location()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
