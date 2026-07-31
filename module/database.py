@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import pathlib
 import sqlite3
+import time
 from abc import ABC, abstractmethod
 from contextlib import closing
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,14 @@ def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection
     return conn
 
 
+def _record_ledger(cursor: sqlite3.Cursor, user_id: int, delta: int, reason: str) -> None:
+    """포인트를 실제로 변경한 트랜잭션 안에서만 호출한다."""
+    cursor.execute(
+        "INSERT INTO point_ledger (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, delta, reason, int(time.time())),
+    )
+
+
 # ─────────── 인터페이스 ─────────── #
 
 class AttendanceRepository(ABC):
@@ -54,13 +63,13 @@ class AttendanceRepository(ABC):
         """유저의 현재 포인트를 반환한다. 미등록 유저는 0."""
 
     @abstractmethod
-    def add_points(self, user_id: int, amount: int) -> None:
-        """포인트를 지급한다. 유저가 없으면 생성한다."""
+    def add_points(self, user_id: int, amount: int, reason: str = "unspecified") -> None:
+        """포인트를 지급한다. 유저가 없으면 생성한다. 이동은 원장에 기록된다."""
 
     @abstractmethod
-    def deduct_points(self, user_id: int, amount: int) -> bool:
+    def deduct_points(self, user_id: int, amount: int, reason: str = "unspecified") -> bool:
         """포인트를 차감한다. 잔액 확인과 차감이 원자적으로 수행되어야 한다.
-        성공 시 True, 잔액 부족 시 False."""
+        성공 시 True(원장 기록), 잔액 부족 시 False(원장 미기록)."""
 
     @abstractmethod
     def claim_attendance(
@@ -68,8 +77,13 @@ class AttendanceRepository(ABC):
         user_id: int,
         reward: int,
         attendance_date: str,
+        reason: str = "attendance",
     ) -> Optional[int]:
         """당일 첫 출석이면 포인트를 지급하고 새 잔액을, 중복이면 None을 반환한다."""
+
+    @abstractmethod
+    def get_ledger(self, user_id: int, limit: int = 20) -> List[Tuple[int, str, int]]:
+        """최근 포인트 이동 [(delta, reason, created_at), ...]를 최신순으로 반환한다."""
 
     @abstractmethod
     def increment_forbidden_count(self, user_id: int) -> None:
@@ -165,6 +179,20 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 if column not in existing_columns:
                     c.execute(ddl)
 
+            # 모든 포인트 이동을 append-only로 기록한다. 환불 실패 시 대조 근거가 된다.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS point_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    delta INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ledger_user ON point_ledger (user_id, id DESC)"
+            )
+
             conn.commit()
 
     def get_points(self, user_id: int) -> int:
@@ -174,14 +202,15 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             result = c.fetchone()
             return result[0] if result else 0
 
-    def add_points(self, user_id: int, amount: int) -> None:
+    def add_points(self, user_id: int, amount: int, reason: str = "unspecified") -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("INSERT OR IGNORE INTO users (user_id, points) VALUES (?, 0)", (user_id,))
             c.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, user_id))
+            _record_ledger(c, user_id, amount, reason)
             conn.commit()
 
-    def deduct_points(self, user_id: int, amount: int) -> bool:
+    def deduct_points(self, user_id: int, amount: int, reason: str = "unspecified") -> bool:
         # 잔액 확인과 차감을 단일 조건부 UPDATE로 처리하여 race condition을 방지한다.
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
@@ -189,14 +218,18 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
                 (amount, user_id, amount)
             )
+            charged = c.rowcount > 0
+            if charged:  # 실제로 잔액이 줄었을 때만 기록한다.
+                _record_ledger(c, user_id, -amount, reason)
             conn.commit()
-            return c.rowcount > 0
+            return charged
 
     def claim_attendance(
         self,
         user_id: int,
         reward: int,
         attendance_date: str,
+        reason: str = "attendance",
     ) -> Optional[int]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.execute(
@@ -213,6 +246,8 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 (user_id, reward, attendance_date),
             )
             row = cursor.fetchone()
+            if row:  # 중복 출석은 지급이 없으므로 기록하지 않는다.
+                _record_ledger(cursor, user_id, reward, reason)
             conn.commit()
             return row[0] if row else None
 
@@ -234,6 +269,16 @@ class SQLiteAttendanceRepository(AttendanceRepository):
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("SELECT user_id, points FROM users ORDER BY points DESC LIMIT ?", (limit,))
+            return c.fetchall()
+
+    def get_ledger(self, user_id: int, limit: int = 20) -> List[Tuple[int, str, int]]:
+        with closing(_connect(self.db_path)) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT delta, reason, created_at FROM point_ledger "
+                "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            )
             return c.fetchall()
 
     def play_luckybox(self, user_id: int, bet: int, today_str: str, multiplier: float):

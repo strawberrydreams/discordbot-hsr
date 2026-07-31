@@ -44,7 +44,7 @@ class HyacineImageCog(commands.Cog):
             return
 
         cost = 50000
-        if not attendance_cog.deduct_points(inter.user.id, cost):
+        if not attendance_cog.deduct_points(inter.user.id, cost, "image"):
             current = attendance_cog.get_points(inter.user.id)
             await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
             return
@@ -64,7 +64,7 @@ class HyacineImageCog(commands.Cog):
                 return False
             refund_attempted = True
             try:
-                attendance_cog.add_points(inter.user.id, cost)
+                attendance_cog.add_points(inter.user.id, cost, "image_refund")
             except Exception:
                 refund_failed = True
                 print(

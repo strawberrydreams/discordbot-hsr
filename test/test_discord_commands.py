@@ -133,13 +133,16 @@ class RecordingAttendance:
         self.deductions = []
         self.refunds = []
         self.refund_attempts = []
+        self.reasons = []
         self.refund_error = refund_error
 
-    def deduct_points(self, user_id, amount):
+    def deduct_points(self, user_id, amount, reason="unspecified"):
         self.deductions.append((user_id, amount))
+        self.reasons.append(reason)
         return True
 
-    def add_points(self, user_id, amount):
+    def add_points(self, user_id, amount, reason="unspecified"):
+        self.reasons.append(reason)
         self.refund_attempts.append((user_id, amount))
         if self.refund_error:
             raise self.refund_error

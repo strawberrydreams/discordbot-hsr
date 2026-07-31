@@ -19,13 +19,17 @@ class AttendanceCog(commands.Cog):
         """Returns the current points of a user."""
         return self.db.get_points(user_id)
 
-    def deduct_points(self, user_id: int, amount: int) -> bool:
+    def deduct_points(self, user_id: int, amount: int, reason: str = "unspecified") -> bool:
         """Deducts points from a user. Returns True if successful, False if insufficient funds."""
-        return self.db.deduct_points(user_id, amount)
+        return self.db.deduct_points(user_id, amount, reason)
 
-    def add_points(self, user_id: int, amount: int):
+    def add_points(self, user_id: int, amount: int, reason: str = "unspecified"):
         """Adds points to a user (internal use)."""
-        self.db.add_points(user_id, amount)
+        self.db.add_points(user_id, amount, reason)
+
+    def get_ledger(self, user_id: int, limit: int = 20):
+        """Returns recent point movements [(delta, reason, created_at), ...]."""
+        return self.db.get_ledger(user_id, limit)
 
     def increment_forbidden_count(self, user_id: int):
         """Increments the forbidden word count for a user."""
@@ -44,7 +48,7 @@ class AttendanceCog(commands.Cog):
         today_str = datetime.now(kst).date().isoformat()
 
         reward = random.randint(5000, 30000)
-        new_points = self.db.claim_attendance(user_id, reward, today_str)
+        new_points = self.db.claim_attendance(user_id, reward, today_str, "attendance")
         if new_points is None:
             await inter.response.send_message(f"🛑 {inter.user.mention}, 오늘은 이미 출석하셨어요! 내일 또 오세요~", ephemeral=True)
             return

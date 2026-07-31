@@ -180,7 +180,7 @@ class HyacineChatCog(commands.Cog):
                 await inter.response.send_message("❌ 출석체크 모듈 오류.", ephemeral=True)
                 return
 
-            if not attendance_cog.deduct_points(inter.user.id, cost):
+            if not attendance_cog.deduct_points(inter.user.id, cost, f"chat:{model}"):
                 current = attendance_cog.get_points(inter.user.id)
                 await inter.response.send_message(f"❌ 고급 모델(Thinking)은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
                 return
@@ -191,7 +191,7 @@ class HyacineChatCog(commands.Cog):
             if not charged or refunded:
                 return refunded
             try:
-                attendance_cog.add_points(inter.user.id, cost)
+                attendance_cog.add_points(inter.user.id, cost, f"chat_refund:{model}")
             except Exception:
                 print(f"❌ [hyacine_chat] 포인트 환불 실패 (channel={inter.channel_id})")
                 traceback.print_exc()

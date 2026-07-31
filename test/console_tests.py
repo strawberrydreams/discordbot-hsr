@@ -808,6 +808,40 @@ def test_backup_reads_wal_without_writer():
         check("쓰기 프로세스 없이도 백업 가능", points == (10,), f"({points})")
 
 
+def test_point_ledger():
+    print("\n[0] 포인트 원장")
+    with tempfile.TemporaryDirectory() as directory:
+        repo = SQLiteAttendanceRepository(pathlib.Path(directory) / "a.db")
+        repo.add_points(1, 500, reason="attendance")
+        check(
+            "차감 실패는 원장에 남기지 않음",
+            repo.deduct_points(1, 9_999, reason="image") is False,
+        )
+        check("차감 성공", repo.deduct_points(1, 200, reason="image") is True)
+        repo.add_points(1, 200, reason="image_refund")
+
+        entries = repo.get_ledger(1, limit=10)
+        check("모든 성공 이동이 기록됨", len(entries) == 3, f"({entries})")
+        check(
+            "원장 합계가 잔액과 일치",
+            sum(delta for delta, _, _ in entries) == repo.get_points(1),
+        )
+        check(
+            "실패한 차감은 기록되지 않음",
+            all(reason != "image" or delta == -200 for delta, reason, _ in entries),
+        )
+        check(
+            "출석 지급도 원장에 기록",
+            repo.claim_attendance(2, 7_000, "2026-07-30") == 7_000
+            and repo.get_ledger(2) == [(7_000, "attendance", repo.get_ledger(2)[0][2])],
+        )
+        check(
+            "중복 출석은 원장에 기록되지 않음",
+            repo.claim_attendance(2, 7_000, "2026-07-30") is None
+            and len(repo.get_ledger(2)) == 1,
+        )
+
+
 def test_migration() -> SQLiteAttendanceRepository:
     print("\n[1] SQLite 마이그레이션")
     db_path = _TMP_DIR / "attendance_migration.db"
@@ -1879,6 +1913,7 @@ if __name__ == "__main__":
         test_bot_disables_all_mentions()
         test_sqlite_busy_timeout()
         test_backup_reads_wal_without_writer()
+        test_point_ledger()
         repo = test_migration()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
