@@ -9,7 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import discord
+import httpx
+import openai
 
+import module.config as config
 from module.attendance_cog import AttendanceCog
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
@@ -442,6 +445,73 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attendance.refunds, [(123, 2_000)])
         self.assertEqual(interaction.followup.messages, [])
         self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
+
+
+class AICooldownTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
+        self.openai_key.start()
+        self.addCleanup(self.openai_key.stop)
+
+    def test_every_ai_command_carries_a_cooldown(self):
+        chat = HyacineChatCog(bot=None)
+        image = HyacineImageCog(bot=None)
+        commands = {
+            "기본대화": HyacineChatCog._light_talk,
+            "고급대화": HyacineChatCog._deep_talk,
+            "이미지": HyacineImageCog._image,
+        }
+        for name, command in commands.items():
+            with self.subTest(command=name):
+                self.assertIsNotNone(command._buckets.cooldown)
+                self.assertEqual(
+                    command._buckets.cooldown.per, config.AI_COOLDOWN_SECONDS
+                )
+        self.assertTrue(hasattr(chat, "cog_app_command_error"))
+        self.assertTrue(hasattr(image, "cog_app_command_error"))
+
+    async def test_cooldown_notice_is_ephemeral_and_charges_nothing(self):
+        attendance = RecordingAttendance()
+        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
+        interaction = FakeInteraction(channel_id=1)
+        error = discord.app_commands.CommandOnCooldown(
+            discord.app_commands.Cooldown(1, 15), 7.4
+        )
+
+        await cog.cog_app_command_error(interaction, error)
+
+        args, kwargs = interaction.response.messages[-1]
+        self.assertIs(kwargs.get("ephemeral"), True)
+        self.assertIn("7초", args[0])
+        self.assertEqual(attendance.deductions, [])
+
+    async def test_rate_limit_error_gets_its_own_notice_and_refund(self):
+        attendance = RecordingAttendance()
+        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
+        interaction = FakeInteraction(channel_id=1)
+
+        async def rate_limited(**kwargs):
+            raise openai.RateLimitError(
+                "rate limited",
+                response=httpx.Response(
+                    429, request=httpx.Request("POST", "https://api.openai.com")
+                ),
+                body=None,
+            )
+
+        cog.client = SimpleNamespace(responses=SimpleNamespace(create=rate_limited))
+
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await cog._run_talk(
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+            )
+
+        message = interaction.followup.messages[-1][0][0]
+        self.assertIn("요청이 몰려", message)
+        self.assertIn("포인트 환불됨", message)
+        self.assertEqual(attendance.refunds, [(123, 2_000)])
 
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):

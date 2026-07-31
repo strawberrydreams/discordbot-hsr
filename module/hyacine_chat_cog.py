@@ -7,7 +7,7 @@ import openai
 import tiktoken
 from discord import app_commands
 from discord.ext import commands
-from module.config import OPENAI_API_KEY
+from module.config import AI_COOLDOWN_SECONDS, OPENAI_API_KEY
 
 LIGHT_MODEL = "gpt-5.6-terra"
 DEEP_MODEL = "gpt-5.6-sol"
@@ -254,12 +254,17 @@ class HyacineChatCog(commands.Cog):
             await inter.followup.send(f"**{inter.user.mention}**: {내용}")
             await self.send_chunked_followup(inter, reply)
 
-        except Exception:
+        except Exception as exc:
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
             refund_note = " (포인트 환불됨)" if refund_points() else ""
-            error_message = f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}"
+            if isinstance(exc, openai.RateLimitError):
+                error_message = (
+                    f"⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요.{refund_note}"
+                )
+            else:
+                error_message = f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}"
             try:
                 if inter.response.is_done():
                     await inter.followup.send(error_message)
@@ -269,8 +274,23 @@ class HyacineChatCog(commands.Cog):
                 print(f"❌ [hyacine_chat] 오류 메시지 전송 실패 (channel={inter.channel_id})")
                 traceback.print_exc()
 
+    async def cog_app_command_error(
+        self,
+        inter: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ):
+        # 쿨다운은 콜백 진입 전에 걸리므로 포인트는 아직 차감되지 않았다.
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await inter.response.send_message(
+                f"⏳ 조금만 쉬어 가요~ {error.retry_after:.0f}초 뒤에 다시 불러 주세요.",
+                ephemeral=True,
+            )
+            return
+        raise error
+
     @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다. (200 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
+    @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _light_talk(
         self,
         inter: discord.Interaction,
@@ -281,6 +301,7 @@ class HyacineChatCog(commands.Cog):
 
     @app_commands.command(name="고급대화", description="GPT-5.6 Sol과 깊이 대화합니다. (2,000 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
+    @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _deep_talk(
         self,
         inter: discord.Interaction,

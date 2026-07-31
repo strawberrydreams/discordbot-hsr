@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from module.config import GOOGLE_API_KEY
+from module.config import AI_COOLDOWN_SECONDS, GOOGLE_API_KEY
 
 # Model Alias
 # Imagen 계열은 2026-06-24 서비스 종료 예정이라 Gemini 이미지 모델로 교체
@@ -37,8 +37,23 @@ class HyacineImageCog(commands.Cog):
         except Exception as e:
             print(f"⚠️ Failed to delete {file_path}: {e}")
 
+    async def cog_app_command_error(
+        self,
+        inter: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ):
+        # 쿨다운은 콜백 진입 전에 걸리므로 포인트는 아직 차감되지 않았다.
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await inter.response.send_message(
+                f"⏳ 붓을 말리는 중이에요~ {error.retry_after:.0f}초 뒤에 다시 불러 주세요.",
+                ephemeral=True,
+            )
+            return
+        raise error
+
     @app_commands.command(name="이미지", description="Nano Banana 2에게 그림을 그려달라고 요청합니다. (30,000 P)")
     @app_commands.describe(프롬프트="그려줘! 라고 할 내용")
+    @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _image(self, inter: discord.Interaction, 프롬프트: str):
         # 0. Check Points
         attendance_cog = self.bot.get_cog("AttendanceCog")

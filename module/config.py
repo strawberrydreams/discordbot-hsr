@@ -50,6 +50,8 @@ EVENT_CHANNEL_ID = _int_from_env("EVENT_CHANNEL_ID", 0)
 DISCORD_GUILD_ID = _int_from_env("DISCORD_GUILD_ID", 0)
 BACKUP_INTERVAL_SECONDS = _int_from_env("BACKUP_INTERVAL_SECONDS", 21600)
 BACKUP_RETENTION_DAYS = _int_from_env("BACKUP_RETENTION_DAYS", 30)
+# 포인트 잔액이 지속 사용량을 묶고, 쿨다운은 누적 잔액을 한 번에 소진하는 버스트를 막는다.
+AI_COOLDOWN_SECONDS = _int_from_env("AI_COOLDOWN_SECONDS", 15)
 DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
 
 
@@ -75,6 +77,8 @@ def validate_config() -> None:
         raise RuntimeError("BACKUP_INTERVAL_SECONDS는 양의 정수여야 합니다.")
     if BACKUP_RETENTION_DAYS <= 0:
         raise RuntimeError("BACKUP_RETENTION_DAYS는 양의 정수여야 합니다.")
+    if AI_COOLDOWN_SECONDS <= 0:
+        raise RuntimeError("AI_COOLDOWN_SECONDS는 양의 정수여야 합니다.")
     if DB_BACKEND != "sqlite":
         raise RuntimeError("현재 지원하는 DB_BACKEND는 sqlite뿐입니다.")
 

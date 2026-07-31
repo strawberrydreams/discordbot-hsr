@@ -236,6 +236,7 @@ def test_public_env_contract():
         "FORBIDDEN_WORDS_FILE",
         "BACKUP_INTERVAL_SECONDS",
         "BACKUP_RETENTION_DAYS",
+        "AI_COOLDOWN_SECONDS",
         "DB_BACKEND",
     }
     check("공개 env 변수 계약", set(example) == expected)
