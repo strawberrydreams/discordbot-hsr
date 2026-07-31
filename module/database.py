@@ -4,24 +4,31 @@
 # Cog들은 Repository 인터페이스만 사용하므로, 외부 DB로 교체해도 Cog 코드는 바뀌지 않는다.
 #
 # 외부 DB(MySQL, Oracle 등)로 교체하는 방법:
-#   1. AttendanceRepository / PartyRepository를 상속한 구현 클래스를 이 파일에 작성 (database.py)
-#      (예: MySQLAttendanceRepository — SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리하면 됨)
-#   2. 아래 create_attendance_repository / create_party_repository 팩토리에 분기 추가
+#   1. AttendanceRepository / PartyRepository / GuildSettingsRepository를 상속한
+#      구현 클래스를 이 파일에 작성 (SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리)
+#   2. 아래 create_* 팩토리에 분기 추가
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
-# 모든 메서드는 동기(synchronous)로 호출된다. discord.py의 단일 이벤트 루프에서
-# 짧은 쿼리만 수행하므로 현재 규모에서는 문제없지만, 외부 DB(네트워크 왕복)로
-# 전환할 때는 커넥션 풀 사용을 권장한다.
+# ── 멀티 길드 ──
+# 봇은 여러 서버(길드)에 동시에 설치될 수 있다. 포인트·파티·설정은 모두 길드별로
+# 격리되며, 그 격리는 애플리케이션이 아니라 스키마가 보장한다. 모든 테이블의
+# 기본키에 guild_id가 포함되므로 guild_id를 빠뜨린 쿼리는 성립하지 않는다.
+#
+# ── 동시성 ──
+# 리포지토리 메서드는 모두 동기(blocking)다. discord.py의 이벤트 루프에서 직접
+# 호출하면 백업 프로세스와의 락 경합 시 봇 전체가 멈추므로, Cog는 반드시
+# run_db()로 감싸 스레드에서 실행한다. 메서드마다 연결을 새로 열고 닫으므로
+# 스레드 간 커넥션 공유 문제는 없다.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
 import pathlib
 import sqlite3
 import time
 from abc import ABC, abstractmethod
 from contextlib import closing
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from module.config import DATA_DIR, DB_BACKEND
 
 
@@ -45,35 +52,52 @@ def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection
     return conn
 
 
-def _record_ledger(cursor: sqlite3.Cursor, user_id: int, delta: int, reason: str) -> None:
+async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """동기 리포지토리 호출을 스레드로 넘겨 이벤트 루프가 막히지 않게 한다.
+
+    SQLite 쓰기 락은 최대 SQLITE_TIMEOUT_SECONDS(30초)까지 대기할 수 있다.
+    이벤트 루프에서 직접 호출하면 그동안 하트비트가 끊겨 봇 전체가 멈춘다.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _record_ledger(
+    cursor: sqlite3.Cursor, guild_id: int, user_id: int, delta: int, reason: str
+) -> None:
     """포인트를 실제로 변경한 트랜잭션 안에서만 호출한다."""
     cursor.execute(
-        "INSERT INTO point_ledger (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, delta, reason, int(time.time())),
+        "INSERT INTO point_ledger (guild_id, user_id, delta, reason, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, delta, reason, int(time.time())),
     )
 
 
 # ─────────── 인터페이스 ─────────── #
 
 class AttendanceRepository(ABC):
-    """출석/포인트/금지어 카운트 데이터 접근 인터페이스."""
+    """포인트·출석·금지어 카운트 데이터 접근 인터페이스. 모두 길드 단위로 격리된다."""
 
     @abstractmethod
-    def get_points(self, user_id: int) -> int:
-        """유저의 현재 포인트를 반환한다. 미등록 유저는 0."""
+    def get_points(self, guild_id: int, user_id: int) -> int:
+        """해당 길드에서의 포인트 잔액. 미등록 유저는 0."""
 
     @abstractmethod
-    def add_points(self, user_id: int, amount: int, reason: str = "unspecified") -> None:
-        """포인트를 지급한다. 유저가 없으면 생성한다. 이동은 원장에 기록된다."""
+    def add_points(
+        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
+    ) -> None:
+        """포인트를 지급하고 원장에 기록한다."""
 
     @abstractmethod
-    def deduct_points(self, user_id: int, amount: int, reason: str = "unspecified") -> bool:
+    def deduct_points(
+        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
+    ) -> bool:
         """포인트를 차감한다. 잔액 확인과 차감이 원자적으로 수행되어야 한다.
         성공 시 True(원장 기록), 잔액 부족 시 False(원장 미기록)."""
 
     @abstractmethod
     def claim_attendance(
         self,
+        guild_id: int,
         user_id: int,
         reward: int,
         attendance_date: str,
@@ -82,44 +106,51 @@ class AttendanceRepository(ABC):
         """당일 첫 출석이면 포인트를 지급하고 새 잔액을, 중복이면 None을 반환한다."""
 
     @abstractmethod
-    def get_ledger(self, user_id: int, limit: int = 20) -> List[Tuple[int, str, int]]:
+    def get_ledger(
+        self, guild_id: int, user_id: int, limit: int = 20
+    ) -> List[Tuple[int, str, int]]:
         """최근 포인트 이동 [(delta, reason, created_at), ...]를 최신순으로 반환한다."""
 
     @abstractmethod
-    def increment_forbidden_count(self, user_id: int) -> None:
+    def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         """금지어 경고 횟수를 1 증가시킨다. 유저가 없으면 생성한다."""
 
     @abstractmethod
-    def get_forbidden_count(self, user_id: int) -> int:
+    def get_forbidden_count(self, guild_id: int, user_id: int) -> int:
         """금지어 경고 횟수를 반환한다. 미등록 유저는 0."""
 
     @abstractmethod
-    def get_top_rankings(self, limit: int = 5) -> List[Tuple[int, int]]:
-        """포인트 상위 유저 [(user_id, points), ...]를 반환한다."""
+    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
+        """해당 길드의 포인트 상위 유저 [(user_id, points), ...]."""
+
+    @abstractmethod
+    def delete_guild(self, guild_id: int) -> None:
+        """봇이 길드에서 제거됐을 때 해당 길드 데이터를 모두 지운다."""
 
 
 class PartyRepository(ABC):
-    """게임 파티 모집 데이터 접근 인터페이스."""
+    """게임 파티 모집 데이터 접근 인터페이스. 모두 길드 단위로 격리된다."""
 
     @abstractmethod
-    def get_party(self, game: str) -> Optional[Tuple[int]]:
+    def get_party(self, guild_id: int, game: str) -> Optional[Tuple[int]]:
         """파티가 존재하면 (created_at,)을, 없으면 None을 반환한다."""
 
     @abstractmethod
-    def create_party(self, game: str, created_at: int) -> bool:
+    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
         """파티를 생성한다. 새로 만들었으면 True, 이미 있으면 False."""
 
     @abstractmethod
-    def delete_party(self, game: str) -> None:
+    def delete_party(self, guild_id: int, game: str) -> None:
         """파티를 삭제한다. 참가자도 함께 정리되어야 한다."""
 
     @abstractmethod
-    def get_participants(self, game: str) -> Dict[int, Optional[str]]:
+    def get_participants(self, guild_id: int, game: str) -> Dict[int, Optional[str]]:
         """{user_id: role} 형태로 참가자 목록을 반환한다."""
 
     @abstractmethod
     def add_participant(
         self,
+        guild_id: int,
         game: str,
         user_id: int,
         role: Optional[str] = None,
@@ -129,16 +160,44 @@ class PartyRepository(ABC):
         정원 초과와 역할 중복은 DB가 거부하며, 그 경우 행을 남기지 않는다."""
 
     @abstractmethod
-    def remove_participant(self, game: str, user_id: int) -> None:
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
         """참가자를 제거한다."""
 
     @abstractmethod
-    def get_user_party(self, user_id: int) -> Optional[str]:
-        """유저가 참가 중인 파티의 게임 이름을 반환한다. 없으면 None."""
+    def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
+        """유저가 그 길드에서 참가 중인 파티의 게임 이름. 없으면 None."""
 
     @abstractmethod
-    def delete_expired_parties(self, cutoff: int) -> List[str]:
-        """cutoff보다 오래된 파티를 삭제하고, 삭제된 게임 이름 목록을 반환한다."""
+    def delete_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
+        """cutoff보다 오래된 파티를 전 길드에서 삭제하고 [(guild_id, game), ...]를 반환한다."""
+
+    @abstractmethod
+    def delete_guild(self, guild_id: int) -> None:
+        """봇이 길드에서 제거됐을 때 해당 길드 데이터를 모두 지운다."""
+
+
+class GuildSettingsRepository(ABC):
+    """길드별 봇 설정. 채널 ID를 환경변수에 박으면 공개 배포가 불가능하므로 DB에 둔다."""
+
+    @abstractmethod
+    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
+        """파티 모집 채널 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def get_event_channel(self, guild_id: int) -> Optional[int]:
+        """이벤트 채널 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """파티 모집 채널을 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """이벤트 채널을 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def delete_guild(self, guild_id: int) -> None:
+        """봇이 길드에서 제거됐을 때 해당 길드 설정을 지운다."""
 
 
 # ─────────── SQLite 구현 ─────────── #
@@ -152,33 +211,23 @@ class SQLiteAttendanceRepository(AttendanceRepository):
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
+            # (guild_id, user_id)가 기본키다. 같은 사람이 서버마다 별도 잔액을 갖는다.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    points INTEGER DEFAULT 0,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    points INTEGER NOT NULL DEFAULT 0,
                     last_attendance_date TEXT,
-                    forbidden_count INTEGER DEFAULT 0,
-                    luckybox_count INTEGER DEFAULT 0,
-                    last_luckybox_date VARCHAR(20)
+                    forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id)
                 )
             """)
-
-            # Migration for existing tables
-            # SQLite는 "ADD COLUMN IF NOT EXISTS"를 지원하지 않으므로 직접 확인 후 추가
-            c.execute("PRAGMA table_info(users)")
-            existing_columns = {row[1] for row in c.fetchall()}
-            migrations = (
-                ("luckybox_count", "ALTER TABLE users ADD COLUMN luckybox_count INTEGER DEFAULT 0"),
-                ("last_luckybox_date", "ALTER TABLE users ADD COLUMN last_luckybox_date VARCHAR(20)"),
-            )
-            for column, ddl in migrations:
-                if column not in existing_columns:
-                    c.execute(ddl)
 
             # 모든 포인트 이동을 append-only로 기록한다. 환불 실패 시 대조 근거가 된다.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS point_ledger (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
                     delta INTEGER NOT NULL,
                     reason TEXT NOT NULL,
@@ -186,42 +235,57 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 )
             """)
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ledger_user ON point_ledger (user_id, id DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_ledger_user "
+                "ON point_ledger (guild_id, user_id, id DESC)"
             )
-
             conn.commit()
 
-    def get_points(self, user_id: int) -> int:
+    def get_points(self, guild_id: int, user_id: int) -> int:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
-            c.execute("SELECT points FROM users WHERE user_id = ?", (user_id,))
+            c.execute(
+                "SELECT points FROM users WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
             result = c.fetchone()
             return result[0] if result else 0
 
-    def add_points(self, user_id: int, amount: int, reason: str = "unspecified") -> None:
+    def add_points(
+        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
+    ) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO users (user_id, points) VALUES (?, 0)", (user_id,))
-            c.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, user_id))
-            _record_ledger(c, user_id, amount, reason)
+            c.execute(
+                "INSERT OR IGNORE INTO users (guild_id, user_id, points) VALUES (?, ?, 0)",
+                (guild_id, user_id),
+            )
+            c.execute(
+                "UPDATE users SET points = points + ? WHERE guild_id = ? AND user_id = ?",
+                (amount, guild_id, user_id),
+            )
+            _record_ledger(c, guild_id, user_id, amount, reason)
             conn.commit()
 
-    def deduct_points(self, user_id: int, amount: int, reason: str = "unspecified") -> bool:
+    def deduct_points(
+        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
+    ) -> bool:
         # 잔액 확인과 차감을 단일 조건부 UPDATE로 처리하여 race condition을 방지한다.
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute(
-                "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
-                (amount, user_id, amount)
+                "UPDATE users SET points = points - ? "
+                "WHERE guild_id = ? AND user_id = ? AND points >= ?",
+                (amount, guild_id, user_id, amount),
             )
             charged = c.rowcount > 0
             if charged:  # 실제로 잔액이 줄었을 때만 기록한다.
-                _record_ledger(c, user_id, -amount, reason)
+                _record_ledger(c, guild_id, user_id, -amount, reason)
             conn.commit()
             return charged
 
     def claim_attendance(
         self,
+        guild_id: int,
         user_id: int,
         reward: int,
         attendance_date: str,
@@ -230,52 +294,76 @@ class SQLiteAttendanceRepository(AttendanceRepository):
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO users (user_id, points, last_attendance_date)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
+                INSERT INTO users (guild_id, user_id, points, last_attendance_date)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
                     points = users.points + excluded.points,
                     last_attendance_date = excluded.last_attendance_date
                 WHERE users.last_attendance_date IS NULL
                    OR users.last_attendance_date != excluded.last_attendance_date
                 RETURNING points
                 """,
-                (user_id, reward, attendance_date),
+                (guild_id, user_id, reward, attendance_date),
             )
             row = cursor.fetchone()
             if row:  # 중복 출석은 지급이 없으므로 기록하지 않는다.
-                _record_ledger(cursor, user_id, reward, reason)
+                _record_ledger(cursor, guild_id, user_id, reward, reason)
             conn.commit()
             return row[0] if row else None
 
-    def increment_forbidden_count(self, user_id: int) -> None:
+    def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO users (user_id, points, forbidden_count) VALUES (?, 0, 0)", (user_id,))
-            c.execute("UPDATE users SET forbidden_count = forbidden_count + 1 WHERE user_id = ?", (user_id,))
+            c.execute(
+                "INSERT OR IGNORE INTO users (guild_id, user_id, points, forbidden_count) "
+                "VALUES (?, ?, 0, 0)",
+                (guild_id, user_id),
+            )
+            c.execute(
+                "UPDATE users SET forbidden_count = forbidden_count + 1 "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
             conn.commit()
 
-    def get_forbidden_count(self, user_id: int) -> int:
+    def get_forbidden_count(self, guild_id: int, user_id: int) -> int:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
-            c.execute("SELECT forbidden_count FROM users WHERE user_id = ?", (user_id,))
+            c.execute(
+                "SELECT forbidden_count FROM users WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
             result = c.fetchone()
             return result[0] if result else 0
 
-    def get_top_rankings(self, limit: int = 5) -> List[Tuple[int, int]]:
+    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
-            c.execute("SELECT user_id, points FROM users ORDER BY points DESC LIMIT ?", (limit,))
+            c.execute(
+                "SELECT user_id, points FROM users WHERE guild_id = ? "
+                "ORDER BY points DESC LIMIT ?",
+                (guild_id, limit),
+            )
             return c.fetchall()
 
-    def get_ledger(self, user_id: int, limit: int = 20) -> List[Tuple[int, str, int]]:
+    def get_ledger(
+        self, guild_id: int, user_id: int, limit: int = 20
+    ) -> List[Tuple[int, str, int]]:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute(
                 "SELECT delta, reason, created_at FROM point_ledger "
-                "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-                (user_id, limit),
+                "WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+                (guild_id, user_id, limit),
             )
             return c.fetchall()
+
+    def delete_guild(self, guild_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
+            c.execute("DELETE FROM point_ledger WHERE guild_id = ?", (guild_id,))
+            conn.commit()
 
 
 class SQLitePartyRepository(PartyRepository):
@@ -287,97 +375,73 @@ class SQLitePartyRepository(PartyRepository):
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            # Parties table: game is the primary key (one party per game)
+            # 길드당 게임별로 파티 하나.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS parties (
-                    game TEXT PRIMARY KEY,
-                    created_at TIMESTAMP
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, game)
                 )
             """)
-            # Participant table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS participants (
-                    game TEXT,
-                    user_id INTEGER,
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
                     role TEXT,
-                    PRIMARY KEY (game, user_id),
-                    FOREIGN KEY (game) REFERENCES parties (game) ON DELETE CASCADE
+                    PRIMARY KEY (guild_id, game, user_id)
                 )
             """)
-            cursor.execute("SELECT game, created_at FROM parties")
-            for game, value in cursor.fetchall():
-                if value is None:
-                    timestamp = 0  # Legacy NULL is immediately eligible for normal expiry.
-                elif isinstance(value, int):
-                    continue
-                elif isinstance(value, float):
-                    timestamp = int(value)
-                else:
-                    if isinstance(value, bytes):
-                        value = value.decode()
-                    parsed = datetime.fromisoformat(str(value))
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=timezone.utc)
-                    timestamp = int(parsed.timestamp())
-                cursor.execute(
-                    "UPDATE parties SET created_at = ? WHERE game = ?",
-                    (timestamp, game),
-                )
-            # 부분 유니크 인덱스 생성 전에 기존 역할 중복 행을 정리한다(가장 이른 행만 유지).
-            cursor.execute("""
-                DELETE FROM participants
-                WHERE role IS NOT NULL
-                  AND rowid NOT IN (
-                      SELECT MIN(rowid) FROM participants
-                      WHERE role IS NOT NULL GROUP BY game, role
-                  )
-            """)
+            # 역할 중복은 DB가 거부한다. guild_id를 포함해야 서버 간 간섭이 없다.
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_role
-                ON participants (game, role) WHERE role IS NOT NULL
+                ON participants (guild_id, game, role) WHERE role IS NOT NULL
             """)
-            cursor.execute(
-                """
-                DELETE FROM participants
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM parties
-                    WHERE parties.game = participants.game
-                )
-                """
-            )
             conn.commit()
 
-    def get_party(self, game: str) -> Optional[Tuple[int]]:
+    def get_party(self, guild_id: int, game: str) -> Optional[Tuple[int]]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT created_at FROM parties WHERE game = ?", (game,))
+            cursor.execute(
+                "SELECT created_at FROM parties WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
             return cursor.fetchone()
 
-    def create_party(self, game: str, created_at: int) -> bool:
+    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO parties (game, created_at) VALUES (?, ?)",
-                           (game, created_at))
+            cursor.execute(
+                "INSERT OR IGNORE INTO parties (guild_id, game, created_at) VALUES (?, ?, ?)",
+                (guild_id, game, created_at),
+            )
             conn.commit()
             return cursor.rowcount > 0
 
-    def delete_party(self, game: str) -> None:
+    def delete_party(self, guild_id: int, game: str) -> None:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            # SQLite의 FK CASCADE는 기본적으로 꺼져 있으므로 참가자를 직접 정리한다
-            cursor.execute("DELETE FROM participants WHERE game = ?", (game,))
-            cursor.execute("DELETE FROM parties WHERE game = ?", (game,))
+            cursor.execute(
+                "DELETE FROM participants WHERE guild_id = ? AND game = ?", (guild_id, game)
+            )
+            cursor.execute(
+                "DELETE FROM parties WHERE guild_id = ? AND game = ?", (guild_id, game)
+            )
             conn.commit()
 
-    def get_participants(self, game: str) -> Dict[int, Optional[str]]:
+    def get_participants(self, guild_id: int, game: str) -> Dict[int, Optional[str]]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id, role FROM participants WHERE game = ?", (game,))
+            cursor.execute(
+                "SELECT user_id, role FROM participants WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
             return {row[0]: row[1] for row in cursor.fetchall()}
 
     def add_participant(
         self,
+        guild_id: int,
         game: str,
         user_id: int,
         role: Optional[str] = None,
@@ -389,15 +453,16 @@ class SQLitePartyRepository(PartyRepository):
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             if not cursor.execute(
-                "SELECT 1 FROM parties WHERE game = ?", (game,)
+                "SELECT 1 FROM parties WHERE guild_id = ? AND game = ?", (guild_id, game)
             ).fetchone():
                 conn.rollback()
                 return False
 
             if max_players is not None:
                 others = cursor.execute(
-                    "SELECT COUNT(*) FROM participants WHERE game = ? AND user_id != ?",
-                    (game, user_id),
+                    "SELECT COUNT(*) FROM participants "
+                    "WHERE guild_id = ? AND game = ? AND user_id != ?",
+                    (guild_id, game, user_id),
                 ).fetchone()[0]
                 if others >= max_players:
                     conn.rollback()
@@ -405,11 +470,12 @@ class SQLitePartyRepository(PartyRepository):
 
             # 역할 변경은 같은 user_id의 기존 행을 지우고 다시 넣는다.
             cursor.execute(
-                "DELETE FROM participants WHERE game = ? AND user_id = ?", (game, user_id)
+                "DELETE FROM participants WHERE guild_id = ? AND game = ? AND user_id = ?",
+                (guild_id, game, user_id),
             )
             cursor.execute(
-                "INSERT INTO participants (game, user_id, role) VALUES (?, ?, ?)",
-                (game, user_id, role),
+                "INSERT INTO participants (guild_id, game, user_id, role) VALUES (?, ?, ?, ?)",
+                (guild_id, game, user_id, role),
             )
             conn.commit()
             return True
@@ -422,31 +488,104 @@ class SQLitePartyRepository(PartyRepository):
         finally:
             conn.close()
 
-    def remove_participant(self, game: str, user_id: int) -> None:
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM participants WHERE game = ? AND user_id = ?", (game, user_id))
+            cursor.execute(
+                "DELETE FROM participants WHERE guild_id = ? AND game = ? AND user_id = ?",
+                (guild_id, game, user_id),
+            )
             conn.commit()
 
-    def get_user_party(self, user_id: int) -> Optional[str]:
+    def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT game FROM participants WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                "SELECT game FROM participants WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
             row = cursor.fetchone()
             return row[0] if row else None
 
-    def delete_expired_parties(self, cutoff: int) -> List[str]:
+    def delete_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT game FROM parties WHERE created_at < ?", (cutoff,))
-            expired_games = [row[0] for row in cursor.fetchall()]
+            cursor.execute(
+                "SELECT guild_id, game FROM parties WHERE created_at < ?", (cutoff,)
+            )
+            expired = [(row[0], row[1]) for row in cursor.fetchall()]
 
-            if expired_games:
-                placeholders = ",".join("?" * len(expired_games))
-                cursor.execute(f"DELETE FROM participants WHERE game IN ({placeholders})", expired_games)
+            if expired:
+                cursor.executemany(
+                    "DELETE FROM participants WHERE guild_id = ? AND game = ?", expired
+                )
                 cursor.execute("DELETE FROM parties WHERE created_at < ?", (cutoff,))
                 conn.commit()
-            return expired_games
+            return expired
+
+    def delete_guild(self, guild_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM participants WHERE guild_id = ?", (guild_id,))
+            cursor.execute("DELETE FROM parties WHERE guild_id = ?", (guild_id,))
+            conn.commit()
+
+
+class SQLiteGuildSettingsRepository(GuildSettingsRepository):
+    # 컬럼명은 아래 두 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
+    _RECRUIT = "recruit_channel_id"
+    _EVENT = "event_channel_id"
+
+    def __init__(self, db_path: pathlib.Path):
+        self.db_path = pathlib.Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS guild_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    recruit_channel_id INTEGER,
+                    event_channel_id INTEGER
+                )
+            """)
+            conn.commit()
+
+    def _get_column(self, guild_id: int, column: str) -> Optional[int]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                f"SELECT {column} FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+            return row[0] if row and row[0] else None
+
+    def _set_column(self, guild_id: int, column: str, channel_id: Optional[int]) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO guild_settings (guild_id, {column}) VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET {column} = excluded.{column}
+                """,
+                (guild_id, channel_id),
+            )
+            conn.commit()
+
+    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._RECRUIT)
+
+    def get_event_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._EVENT)
+
+    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._RECRUIT, channel_id)
+
+    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._EVENT, channel_id)
+
+    def delete_guild(self, guild_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
+            conn.commit()
 
 
 # ─────────── 팩토리 ─────────── #
@@ -468,7 +607,12 @@ def create_attendance_repository() -> AttendanceRepository:
 def create_party_repository() -> PartyRepository:
     if DB_BACKEND == "sqlite":
         return SQLitePartyRepository(DATA_DIR / "party_data.db")
-    # 외부 DB 분기 예시:
-    # if DB_BACKEND == "mysql":
-    #     return MySQLPartyRepository(DB_URL)
     raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="PartyRepository"))
+
+
+def create_guild_settings_repository() -> GuildSettingsRepository:
+    if DB_BACKEND == "sqlite":
+        return SQLiteGuildSettingsRepository(DATA_DIR / "guild_settings.db")
+    raise NotImplementedError(
+        _UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="GuildSettingsRepository")
+    )

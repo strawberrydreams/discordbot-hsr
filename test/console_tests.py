@@ -47,6 +47,7 @@ import module.database as database
 from module.database import (
     SQLiteAttendanceRepository,
     SQLitePartyRepository,
+    SQLiteGuildSettingsRepository,
     create_attendance_repository,
     create_party_repository,
 )
@@ -64,6 +65,41 @@ def check(name: str, condition: bool, detail: str = ""):
     else:
         FAIL += 1
         print(f"  ❌ {name} {detail}")
+
+
+
+# ─────────── 길드 바인딩 어댑터 ─────────── #
+#
+# 아래 테스트들이 검증하는 것은 원자성·원장·마이그레이션 의미이지 길드 격리가
+# 아니다(격리는 test_guild_isolation이 담당). 매 호출에 guild_id를 적기보다
+# 단일 길드에 고정해 원래 의도를 그대로 둔다.
+
+_TEST_GUILD = 1
+
+
+class _GuildBound:
+    """모든 리포지토리 호출에 고정 guild_id를 앞에 끼워 넣는다."""
+
+    # 길드 인자를 받지 않는 메서드(전 길드 대상 또는 길드 자체가 인자).
+    _UNBOUND = {"delete_expired_parties", "delete_guild"}
+
+    def __init__(self, repo, guild_id=_TEST_GUILD):
+        self._repo = repo
+        self._guild_id = guild_id
+
+    def __getattr__(self, name):
+        attr = getattr(self._repo, name)
+        if not callable(attr) or name in self._UNBOUND:
+            return attr
+
+        def bound(*args, **kwargs):
+            return attr(self._guild_id, *args, **kwargs)
+
+        return bound
+
+
+def _bind(repo):
+    return _GuildBound(repo)
 
 
 def test_config_paths():
@@ -152,9 +188,6 @@ def test_config_validation():
             "DISCORD_TOKEN",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
-            "RECRUIT_CHANNEL_ID",
-            "EVENT_CHANNEL_ID",
-            "DISCORD_GUILD_ID",
         )
         if hasattr(config, name)
     }
@@ -162,21 +195,15 @@ def test_config_validation():
         config.DISCORD_TOKEN = "test-token"
         config.OPENAI_API_KEY = "test-openai"
         config.GOOGLE_API_KEY = "test-google"
-        config.RECRUIT_CHANNEL_ID = 1
-        config.EVENT_CHANNEL_ID = 1
-        config.DISCORD_GUILD_ID = 0
-        try:
-            config.validate_config()
-            check("운영 길드 ID 누락 거부", False)
-        except RuntimeError as exc:
-            check("운영 길드 ID 누락 거부", "DISCORD_GUILD_ID" in str(exc))
-
-        config.DISCORD_GUILD_ID = -1
-        try:
-            config.validate_config()
-            check("운영 길드 ID 음수 거부", False)
-        except RuntimeError as exc:
-            check("운영 길드 ID 음수 거부", "DISCORD_GUILD_ID" in str(exc))
+        # 채널/길드 ID는 더 이상 환경변수가 아니다. 서버 관리자가 /설정으로 지정한다.
+        config.validate_config()
+        check(
+            "채널·길드 ID 없이도 기동 가능",
+            not any(
+                hasattr(config, name)
+                for name in ("RECRUIT_CHANNEL_ID", "EVENT_CHANNEL_ID", "DISCORD_GUILD_ID")
+            ),
+        )
     finally:
         for name, value in original_values.items():
             setattr(config, name, value)
@@ -194,7 +221,7 @@ def test_split_env_loading():
         encoding="utf-8",
     )
     (root / ".env.runtime").write_text(
-        "RECRUIT_CHANNEL_ID=123\n"
+        "BACKUP_RETENTION_DAYS=123\n"
         "OVERLAP_TEST=runtime-loses\n",
         encoding="utf-8",
     )
@@ -202,7 +229,7 @@ def test_split_env_loading():
     names = (
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
-        "RECRUIT_CHANNEL_ID",
+        "BACKUP_RETENTION_DAYS",
         "OVERLAP_TEST",
     )
     original = {name: os.environ.get(name) for name in names}
@@ -212,7 +239,7 @@ def test_split_env_loading():
         os.environ["GOOGLE_API_KEY"] = "process-wins"
         config._load_env_files(root)
         check("secrets 파일 로드", os.environ["OPENAI_API_KEY"] == "file-secret")
-        check("runtime 파일 로드", os.environ["RECRUIT_CHANNEL_ID"] == "123")
+        check("runtime 파일 로드", os.environ["BACKUP_RETENTION_DAYS"] == "123")
         check("프로세스 환경 우선", os.environ["GOOGLE_API_KEY"] == "process-wins")
         check("secrets 파일 우선", os.environ["OVERLAP_TEST"] == "secrets-win")
     finally:
@@ -229,9 +256,6 @@ def test_public_env_contract():
         "DISCORD_TOKEN",
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
-        "RECRUIT_CHANNEL_ID",
-        "EVENT_CHANNEL_ID",
-        "DISCORD_GUILD_ID",
         "DATA_DIR",
         "BACKUP_DIR",
         "FORBIDDEN_WORDS_FILE",
@@ -495,77 +519,17 @@ def test_forbidden_words_load_logs_to_stdout():
     )
 
 
-def test_new_install_verifies_after_loading_cogs():
+def test_startup_syncs_commands_globally():
+    """공개 배포 봇은 전역 sync다. 길드 한정 sync는 설치될 서버를 미리 알아야 한다."""
     import module.main as main
 
     events = []
-    data_dir = _TMP_DIR / "new-install-data"
+    data_dir = _TMP_DIR / "global-sync-data"
     data_dir.mkdir(exist_ok=True)
-    marker = _TMP_DIR / "new-install-state" / ".global-commands-cleared"
-    marker.unlink(missing_ok=True)
 
     class FakeTree:
-        def copy_global_to(self, *, guild):
-            events.append(f"copy:{guild.id}")
-
-        def clear_commands(self, *, guild):
-            events.append(f"clear:{guild}")
-
         async def sync(self, *, guild=None):
-            if guild is None:
-                events.append(f"sync:global:marker={marker.exists()}")
-            else:
-                events.append(f"sync:{guild.id}:marker={marker.exists()}")
-
-    class FakeBot:
-        tree = FakeTree()
-
-        async def load_extension(self, extension):
-            events.append(f"load:{extension}")
-
-    def verify(path, tables):
-        events.append(f"verify:{path.name}")
-        return {}
-
-    with patch.object(main, "DATA_DIR", data_dir), \
-         patch.object(main, "GLOBAL_CLEANUP_MARKER", marker), \
-         patch.object(main, "verify_database", side_effect=verify), \
-         patch.object(main, "DISCORD_GUILD_ID", 123):
-        asyncio.run(main.MyBot.setup_hook(FakeBot()))
-
-    expected = [
-        *(f"load:{extension}" for extension in main.EXTENSIONS),
-        "verify:attendance_data.db",
-        "verify:party_data.db",
-        "copy:123",
-        "clear:None",
-        "sync:global:marker=False",
-        "sync:123:marker=True",
-    ]
-    check("신규 설치는 Cog 로드 전 DB 검증 생략", events == expected, f"({events})")
-    check("global command 정리 marker는 global sync 성공 후 생성", marker.is_file())
-
-
-def test_existing_global_cleanup_marker_skips_only_global_sync():
-    import module.main as main
-
-    events = []
-    data_dir = _TMP_DIR / "existing-global-cleanup-data"
-    data_dir.mkdir(exist_ok=True)
-    state_dir = _TMP_DIR / "existing-global-cleanup-state"
-    state_dir.mkdir(exist_ok=True)
-    marker = state_dir / ".global-commands-cleared"
-    marker.touch()
-
-    class FakeTree:
-        def copy_global_to(self, *, guild):
-            events.append(f"copy:{guild.id}")
-
-        def clear_commands(self, *, guild):
-            events.append(f"clear:{guild}")
-
-        async def sync(self, *, guild=None):
-            events.append("sync:global" if guild is None else f"sync:{guild.id}")
+            events.append("sync:global" if guild is None else f"sync:guild:{guild}")
 
     class FakeBot:
         tree = FakeTree()
@@ -574,67 +538,22 @@ def test_existing_global_cleanup_marker_skips_only_global_sync():
             events.append(f"load:{extension}")
 
     with patch.object(main, "DATA_DIR", data_dir), \
-         patch.object(main, "GLOBAL_CLEANUP_MARKER", marker), \
-         patch.object(main, "_verify_databases"), \
-         patch.object(main, "DISCORD_GUILD_ID", 456):
+         patch.object(main, "_verify_databases"):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
 
-    expected = [
-        *(f"load:{extension}" for extension in main.EXTENSIONS),
-        "copy:456",
-        "sync:456",
-    ]
+    check("전역으로만 sync", [e for e in events if e.startswith("sync")] == ["sync:global"],
+          f"({events})")
+    check("sync는 모든 Cog 로드 후", events[-1] == "sync:global", f"({events})")
     check(
-        "기존 marker는 global sync만 생략하고 guild sync 유지",
-        events == expected,
+        "길드 설정 Cog가 로드 목록에 포함",
+        "load:module.guildsettings_cog" in events,
         f"({events})",
     )
-
-
-def test_global_cleanup_marker_location():
-    import module.backup as backup
-    import module.config as config
-    import module.main as main
-
-    check("마커는 DATA_DIR 밖", not main.GLOBAL_CLEANUP_MARKER.is_relative_to(config.DATA_DIR))
     check(
-        "마커는 백업 대상이 아님",
-        main.GLOBAL_CLEANUP_MARKER.name not in set(backup.DATABASES),
+        "길드 고정 잔재 없음",
+        "copy_global_to" not in inspect.getsource(main.MyBot.setup_hook)
+        and "interaction_check" not in inspect.getsource(main.MyBot.setup_hook),
     )
-
-    # 구버전 위치에 남아 있으면 새 위치로 이관해 재-sync를 피한다.
-    data_dir = _TMP_DIR / "marker-migration-data"
-    data_dir.mkdir(exist_ok=True)
-    legacy = data_dir / ".global-commands-cleared"
-    legacy.touch()
-    new_marker = _TMP_DIR / "marker-migration-state" / ".global-commands-cleared"
-
-    events = []
-
-    class FakeTree:
-        def copy_global_to(self, *, guild):
-            pass
-
-        def clear_commands(self, *, guild):
-            events.append("clear")
-
-        async def sync(self, *, guild=None):
-            events.append("sync:global" if guild is None else "sync:guild")
-
-    class FakeBot:
-        tree = FakeTree()
-
-        async def load_extension(self, extension):
-            pass
-
-    with patch.object(main, "DATA_DIR", data_dir), \
-         patch.object(main, "GLOBAL_CLEANUP_MARKER", new_marker), \
-         patch.object(main, "_verify_databases"), \
-         patch.object(main, "DISCORD_GUILD_ID", 789):
-        asyncio.run(main.MyBot.setup_hook(FakeBot()))
-
-    check("구버전 마커는 새 위치로 이관", new_marker.is_file() and not legacy.exists())
-    check("이관 후 전역 클리어는 재실행되지 않음", events == ["sync:guild"], f"({events})")
 
 
 def test_startup_preverification_failure_stops_cogs_and_sync():
@@ -666,6 +585,7 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
 
 
 def test_startup_cog_failure_stops_postverification_and_sync():
+    import module.backup as backup
     import module.main as main
 
     events = []
@@ -695,8 +615,7 @@ def test_startup_cog_failure_stops_postverification_and_sync():
     check(
         "Cog 로드 실패 시 사후 검증과 sync 미실행",
         events == [
-            "verify:attendance_data.db",
-            "verify:party_data.db",
+            *(f"verify:{name}" for name in backup.DATABASES),
             f"load:{main.EXTENSIONS[0]}",
             f"load:{main.EXTENSIONS[1]}",
         ],
@@ -847,6 +766,7 @@ def test_backup_reads_wal_without_writer():
         data_dir.mkdir()
         source = data_dir / "attendance_data.db"
         repo = SQLiteAttendanceRepository(source)
+        repo = _bind(repo)
         repo.add_points(1, 10)
         del repo  # 쓰기 연결 없음 = 봇 정지 상태
         gc.collect()
@@ -874,11 +794,12 @@ def test_luckybox_removed():
     check("럭키박스 명령 제거", "럭키박스" not in names, f"({sorted(names)})")
 
     repo = SQLiteAttendanceRepository(_TMP_DIR / "luckybox_columns.db")
+    repo = _bind(repo)
     with closing(sqlite3.connect(repo.db_path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     check(
-        "레거시 컬럼은 보존",
-        {"luckybox_count", "last_luckybox_date"} <= columns,
+        "럭키박스 컬럼 완전 제거",
+        not {"luckybox_count", "last_luckybox_date"} & columns,
         f"({sorted(columns)})",
     )
     check(
@@ -891,6 +812,7 @@ def test_point_ledger():
     print("\n[0] 포인트 원장")
     with tempfile.TemporaryDirectory() as directory:
         repo = SQLiteAttendanceRepository(pathlib.Path(directory) / "a.db")
+        repo = _bind(repo)
         repo.add_points(1, 500, reason="attendance")
         check(
             "차감 실패는 원장에 남기지 않음",
@@ -921,28 +843,69 @@ def test_point_ledger():
         )
 
 
-def test_guild_guard():
-    print("\n[0] 길드 경계")
+def test_guild_isolation():
+    print("\n[0] 길드 격리")
+    import module.database as database
     import module.forbiddenfilter_cog as forbiddenfilter_cog
-    import module.main as main
     import module.playwith_cog as playwith_cog
 
+    data_dir = _TMP_DIR / "guild-isolation"
+    data_dir.mkdir(exist_ok=True)
+    points = database.SQLiteAttendanceRepository(data_dir / "a.db")
+    parties = database.SQLitePartyRepository(data_dir / "p.db")
+    settings = database.SQLiteGuildSettingsRepository(data_dir / "s.db")
+
+    A, B, USER = 1001, 1002, 7
+    # 같은 사람이 서버마다 별도 잔액을 갖는다. 경계는 코드가 아니라 스키마가 만든다.
+    points.add_points(A, USER, 500, "t")
+    points.add_points(B, USER, 900, "t")
+    check("포인트는 서버별로 분리", (points.get_points(A, USER), points.get_points(B, USER)) == (500, 900))
+    check("차감은 해당 서버만", points.deduct_points(A, USER, 500, "t") and points.get_points(B, USER) == 900)
+    check("랭킹은 자기 서버만", points.get_top_rankings(B) == [(USER, 900)])
+
+    # 출석은 서버마다 따로 받는다.
+    check("A서버 출석", points.claim_attendance(A, USER, 10, "2026-07-31") is not None)
+    check("A서버 재출석 거부", points.claim_attendance(A, USER, 10, "2026-07-31") is None)
+    check("B서버는 여전히 출석 가능", points.claim_attendance(B, USER, 10, "2026-07-31") is not None)
+
+    # 금지어 카운트도 서버별.
+    points.increment_forbidden_count(A, USER)
+    check("금지어 카운트 분리", (points.get_forbidden_count(A, USER), points.get_forbidden_count(B, USER)) == (1, 0))
+
+    # 파티: 같은 게임을 서버마다 독립적으로 연다.
+    check("같은 게임을 두 서버가 각각 생성", parties.create_party(A, "PUBG", 1) and parties.create_party(B, "PUBG", 1))
+    check("역할 중복은 같은 서버에서만 거부", [
+        parties.add_participant(A, "PUBG", 1, "탑", 4),
+        parties.add_participant(A, "PUBG", 2, "탑", 4),
+        parties.add_participant(B, "PUBG", 2, "탑", 4),
+    ] == [True, False, True])
+    check("참가 조회는 서버별", parties.get_user_party(A, 1) == "PUBG" and parties.get_user_party(B, 1) is None)
+
+    # 설정도 서버별.
+    settings.set_recruit_channel(A, 333)
+    check("설정 분리", settings.get_recruit_channel(A) == 333 and settings.get_recruit_channel(B) is None)
+
+    # 봇이 서버에서 제거되면 그 서버 것만 지운다.
+    for repo in (points, parties, settings):
+        repo.delete_guild(A)
+    check("제거된 서버 데이터 삭제", points.get_points(A, USER) == 0 and parties.get_party(A, "PUBG") is None
+          and settings.get_recruit_channel(A) is None)
+    check("다른 서버는 보존", points.get_points(B, USER) == 910 and parties.get_party(B, "PUBG") is not None)
+
+    # 스키마가 경계를 강제하는지 — 모든 기본키에 guild_id가 있어야 한다.
+    import sqlite3
+    with sqlite3.connect(data_dir / "a.db") as conn:
+        pk = [r[1] for r in conn.execute("PRAGMA table_info(users)") if r[5]]
+    check("users 기본키에 guild_id 포함", "guild_id" in pk, f"({pk})")
+
     check(
-        "메시지 검사가 길드를 확인",
-        "DISCORD_GUILD_ID"
+        "DM은 금지어 집계에서 제외",
+        "message.guild is None"
         in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog._inspect),
     )
     check(
-        "메시지 수정도 같은 검사를 공유",
-        hasattr(forbiddenfilter_cog.ForbiddenFilterCog, "on_message_edit"),
-    )
-    check(
-        "JoinButton이 길드를 확인",
-        "DISCORD_GUILD_ID" in inspect.getsource(playwith_cog.JoinButton.callback),
-    )
-    check(
-        "명령 트리에 길드 검사 등록",
-        "interaction_check" in inspect.getsource(main.MyBot.setup_hook),
+        "JoinButton은 길드 밖 상호작용을 거부",
+        "guild_id is None" in inspect.getsource(playwith_cog.JoinButton.callback),
     )
 
 
@@ -970,35 +933,29 @@ def test_temp_image_lifecycle():
     fresh.unlink()
 
 
-def test_migration() -> SQLiteAttendanceRepository:
-    print("\n[1] SQLite 마이그레이션")
-    db_path = _TMP_DIR / "attendance_migration.db"
+def test_schema_initialization() -> SQLiteAttendanceRepository:
+    print("\n[1] SQLite 스키마 초기화")
+    db_path = _TMP_DIR / "attendance_schema.db"
 
-    # 구버전 스키마 (luckybox 컬럼 없음)를 미리 생성
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("""
-            CREATE TABLE users (
-                user_id INTEGER PRIMARY KEY,
-                points INTEGER DEFAULT 0,
-                last_attendance_date TEXT,
-                forbidden_count INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("INSERT INTO users (user_id, points) VALUES (1, 500)")
-        conn.commit()
-
-    repo = SQLiteAttendanceRepository(db_path)  # __init__에서 마이그레이션 수행
+    repo = SQLiteAttendanceRepository(db_path)
 
     with closing(sqlite3.connect(db_path)) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
-    check("luckybox_count 컬럼 추가됨", "luckybox_count" in cols)
-    check("last_luckybox_date 컬럼 추가됨", "last_luckybox_date" in cols)
-    check("기존 데이터 유지됨", repo.get_points(1) == 500)
+        pk = [row[1] for row in conn.execute("PRAGMA table_info(users)") if row[5]]
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+
+    check("users 컬럼 구성", cols == {"guild_id", "user_id", "points",
+                                     "last_attendance_date", "forbidden_count"}, f"({cols})")
+    check("복합 기본키 (guild_id, user_id)", pk == ["guild_id", "user_id"], f"({pk})")
+    check("원장 테이블 생성", "point_ledger" in tables)
+    check("폐기된 luckybox 컬럼 없음", not {"luckybox_count", "last_luckybox_date"} & cols)
 
     # 중복 실행해도 에러가 없어야 함 (멱등성)
     SQLiteAttendanceRepository(db_path)
-    check("마이그레이션 재실행 시 에러 없음 (멱등성)", True)
-    return repo
+    check("스키마 재생성 시 에러 없음 (멱등성)", True)
+    return _bind(repo)
 
 
 def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
@@ -1077,6 +1034,7 @@ def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
 def test_party_repository():
     print("\n[4] PartyRepository CRUD")
     repo = SQLitePartyRepository(_TMP_DIR / "party_test.db")
+    repo = _bind(repo)
     now = 2_000_000_000
 
     check("없는 파티 조회 시 None", repo.get_party("LOL") is None)
@@ -1113,119 +1071,17 @@ def test_party_repository():
     cutoff = now - 24 * 60 * 60
 
     expired = repo.delete_expired_parties(cutoff)
-    check("만료 파티만 삭제됨", expired == ["PUBG"], f"(삭제 목록 {expired})")
+    check("만료 파티만 삭제됨", expired == [(_TEST_GUILD, "PUBG")], f"(삭제 목록 {expired})")
     check("만료 파티 참가자도 정리됨", repo.get_user_party(3) is None)
     check("유효 파티는 유지됨", repo.get_party("Overwatch") is not None)
 
-    legacy_db = _TMP_DIR / "party_legacy_time.db"
-    with closing(sqlite3.connect(legacy_db)) as conn:
-        conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
-        conn.execute(
-            "CREATE TABLE participants (game TEXT, user_id INTEGER, role TEXT, "
-            "PRIMARY KEY (game, user_id))"
-        )
-        conn.executemany(
-            "INSERT INTO parties VALUES (?, ?)",
-            (
-                ("DockerNaive", "2026-07-29 12:00:00"),
-                ("KstOriginNaive", "2026-07-29 12:00:00"),
-                ("AwareKST", "2026-07-29T12:00:00+09:00"),
-                ("BlobLegacy", sqlite3.Binary(b"2026-07-29 12:00:00")),
-                ("RealLegacy", 1_785_294_000.75),
-                ("IntegerLegacy", 1_785_294_000),
-            ),
-        )
-        conn.executemany(
-            "INSERT INTO participants VALUES (?, ?, ?)",
-            (
-                ("DockerNaive", 50, "valid"),
-                ("MissingParty", 51, "orphan"),
-            ),
-        )
-        conn.commit()
-
-    repo_with_legacy = SQLitePartyRepository(legacy_db)
-    docker_value = repo_with_legacy.get_party("DockerNaive")[0]
-    check(
-        "Docker legacy naive UTC 시각을 동일 UTC epoch로 변환",
-        docker_value == 1_785_326_400 and isinstance(docker_value, int),
-        f"(변환값 {docker_value!r})",
-    )
-    check(
-        "launchd legacy naive KST 시각은 보수적으로 UTC 해석",
-        repo_with_legacy.get_party("KstOriginNaive") == (1_785_326_400,),
-    )
-    check(
-        "timezone-aware legacy 시각은 명시된 offset 반영",
-        repo_with_legacy.get_party("AwareKST") == (1_785_294_000,),
-    )
-    SQLitePartyRepository(legacy_db)
-    check(
-        "legacy 파티 시각 마이그레이션은 재실행해도 동일",
-        repo_with_legacy.get_party("DockerNaive") == (1_785_326_400,),
-    )
-    check(
-        "BLOB legacy 파티 시각도 UTC epoch로 변환",
-        repo_with_legacy.get_party("BlobLegacy") == (1_785_326_400,),
-    )
-    real_value = repo_with_legacy.get_party("RealLegacy")
-    check(
-        "REAL legacy epoch도 정수로 정규화",
-        real_value == (1_785_294_000,)
-        and isinstance(real_value[0], int),
-        f"(변환값 {real_value!r})",
-    )
-    check(
-        "INTEGER legacy epoch는 값과 타입 유지",
-        repo_with_legacy.get_party("IntegerLegacy") == (1_785_294_000,)
-        and isinstance(repo_with_legacy.get_party("IntegerLegacy")[0], int),
-    )
-    check(
-        "legacy migration은 유효 참가자 보존",
-        repo_with_legacy.get_user_party(50) == "DockerNaive",
-    )
-    check(
-        "legacy migration은 고아 참가자 제거",
-        repo_with_legacy.get_user_party(51) is None,
-    )
-    with closing(sqlite3.connect(legacy_db)) as conn:
-        orphan_count = conn.execute(
-            "SELECT COUNT(*) FROM participants WHERE game = 'MissingParty'"
-        ).fetchone()[0]
-    check("고아 참가자 삭제가 DB에 영구 반영", orphan_count == 0)
-    first_expiry = repo_with_legacy.delete_expired_parties(1_785_294_001)
-    check(
-        "naive KST-origin 파티는 실제 만료 시각에 조기 삭제되지 않음",
-        "KstOriginNaive" not in first_expiry
-        and repo_with_legacy.get_party("KstOriginNaive") is not None,
-    )
-    second_expiry = repo_with_legacy.delete_expired_parties(1_785_326_401)
-    check(
-        "naive KST-origin 파티는 최대 9시간 뒤 정상 정리",
-        "KstOriginNaive" in second_expiry
-        and repo_with_legacy.get_party("KstOriginNaive") is None,
-    )
-
-    null_db = _TMP_DIR / "party_legacy_null_time.db"
-    with closing(sqlite3.connect(null_db)) as conn:
-        conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
-        conn.execute("INSERT INTO parties VALUES (?, ?)", ("NullLegacy", None))
-        conn.commit()
-    try:
-        null_value = SQLitePartyRepository(null_db).get_party("NullLegacy")
-    except ValueError:
-        null_value = None
-    check(
-        "NULL legacy 파티 시각을 epoch 0으로 정규화",
-        null_value == (0,) and isinstance(null_value[0], int),
-        f"(변환값 {null_value!r})",
-    )
 
 
 def test_party_capacity_constraint():
     print("\n[4] 파티 정원·역할 SQL 제약")
     with tempfile.TemporaryDirectory() as directory:
         repo = SQLitePartyRepository(pathlib.Path(directory) / "p.db")
+        repo = _bind(repo)
         repo.create_party("PUBG", 1_000)
         results = [repo.add_participant("PUBG", uid, None, max_players=2) for uid in (1, 2, 3)]
         check("정원 초과는 DB에서 거부", results == [True, True, False], f"({results})")
@@ -1237,26 +1093,6 @@ def test_party_capacity_constraint():
         check("거부된 참가는 행을 남기지 않음", repo.get_user_party(11) is None)
         check("거부 후에도 기존 배정 유지", repo.get_participants("LoL") == {10: "탑"})
 
-        # 기존 DB에 남아 있던 역할 중복 행은 인덱스 생성 전에 정리된다.
-        legacy = pathlib.Path(directory) / "legacy.db"
-        with closing(sqlite3.connect(legacy)) as conn:
-            conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
-            conn.execute(
-                "CREATE TABLE participants (game TEXT, user_id INTEGER, role TEXT, "
-                "PRIMARY KEY (game, user_id))"
-            )
-            conn.execute("INSERT INTO parties VALUES ('LoL', 1000)")
-            conn.executemany(
-                "INSERT INTO participants VALUES (?, ?, ?)",
-                (("LoL", 1, "탑"), ("LoL", 2, "탑"), ("LoL", 3, "미드")),
-            )
-            conn.commit()
-        legacy_repo = SQLitePartyRepository(legacy)
-        check(
-            "레거시 역할 중복은 가장 이른 행만 남김",
-            legacy_repo.get_participants("LoL") == {1: "탑", 3: "미드"},
-            f"({legacy_repo.get_participants('LoL')})",
-        )
 
 
 def test_party_cog_uses_epoch_seconds():
@@ -1266,7 +1102,7 @@ def test_party_cog_uses_epoch_seconds():
         created_at = None
         cutoff = None
 
-        def create_party(self, game, created_at):
+        def create_party(self, guild_id, game, created_at):
             self.created_at = created_at
             return True
 
@@ -1278,7 +1114,7 @@ def test_party_cog_uses_epoch_seconds():
     cog = object.__new__(PlayWithCog)
     cog.db = repository
     with patch("time.time", return_value=2_000_000_000.75):
-        cog.create_party("LOL")
+        asyncio.run(cog.create_party(_TEST_GUILD, "LOL"))
         asyncio.run(PlayWithCog.cleanup_parties.coro(cog))
 
     check("Cog 파티 생성 시 epoch 정수 전달", repository.created_at == 2_000_000_000)
@@ -1312,17 +1148,31 @@ def test_factory():
 
 def test_cog_facade():
     print("\n[6] AttendanceCog 파사드 (Repository 주입)")
-    repo = SQLiteAttendanceRepository(_TMP_DIR / "facade_test.db")
-    cog = AttendanceCog(bot=None, repository=repo)
+    raw = SQLiteAttendanceRepository(_TMP_DIR / "facade_test.db")
+    repo = _bind(raw)
+    cog = AttendanceCog(bot=None, repository=raw)
+    G = _TEST_GUILD
 
-    cog.add_points(42, 1_500)
+    # 파사드는 모두 async다. 동기 리포지토리를 스레드로 넘겨 이벤트 루프를 지킨다.
+    asyncio.run(cog.add_points(G, 42, 1_500))
     check("add_points 위임", repo.get_points(42) == 1_500)
-    check("get_points 위임", cog.get_points(42) == 1_500)
-    check("deduct_points 위임", cog.deduct_points(42, 500) is True and repo.get_points(42) == 1_000)
+    check("get_points 위임", asyncio.run(cog.get_points(G, 42)) == 1_500)
+    check(
+        "deduct_points 위임",
+        asyncio.run(cog.deduct_points(G, 42, 500)) is True and repo.get_points(42) == 1_000,
+    )
 
-    cog.increment_forbidden_count(42)
-    cog.increment_forbidden_count(42)
-    check("forbidden_count 위임", cog.get_forbidden_count(42) == 2)
+    asyncio.run(cog.increment_forbidden_count(G, 42))
+    asyncio.run(cog.increment_forbidden_count(G, 42))
+    check("forbidden_count 위임", asyncio.run(cog.get_forbidden_count(G, 42)) == 2)
+    check(
+        "파사드 전체가 코루틴",
+        all(
+            inspect.iscoroutinefunction(getattr(AttendanceCog, name))
+            for name in ("get_points", "add_points", "deduct_points",
+                         "get_ledger", "increment_forbidden_count", "get_forbidden_count")
+        ),
+    )
 
 
 def test_channel_sessions():
@@ -1385,11 +1235,12 @@ def test_backup_round_trip():
 
     backup.DATA_DIR = _TMP_DIR
     backup.BACKUP_DIR = _TMP_DIR / "backups"
-    SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(77, 1234)
+    SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(_TEST_GUILD, 77, 1234)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
-        "LOL",
+        _TEST_GUILD, "LOL",
         2_000_000_000,
     )
+    SQLiteGuildSettingsRepository(_TMP_DIR / "guild_settings.db")
 
     manifest = backup.create_backup_set()
     result = backup.verify_backup_set(manifest)
@@ -1439,10 +1290,11 @@ def test_invalid_retention_prevents_pruning():
         backup.BACKUP_RETENTION_DAYS = 30
         SQLiteAttendanceRepository(
             backup.DATA_DIR / "attendance_data.db"
-        ).add_points(1, 100)
+        ).add_points(_TEST_GUILD, 1, 100)
         SQLitePartyRepository(
             backup.DATA_DIR / "party_data.db"
-        ).create_party("LOL", 2_000_000_000)
+        ).create_party(_TEST_GUILD, "LOL", 2_000_000_000)
+        SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
         created_at = datetime.datetime(
             2026,
             1,
@@ -1836,15 +1688,16 @@ def test_backup_same_timestamp_rejected():
     attendance = SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     )
-    attendance.add_points(1, 100)
+    attendance.add_points(_TEST_GUILD, 1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
-        "LOL",
+        _TEST_GUILD, "LOL",
         2_000_000_000,
     )
+    SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
 
-    attendance.add_points(2, 200)
+    attendance.add_points(_TEST_GUILD, 2, 200)
     try:
         backup.create_backup_set(fixed)
         check("동일 시각 백업 충돌 거부", False)
@@ -1862,11 +1715,12 @@ def test_prune_requires_timestamp_bound_filenames():
     backup.BACKUP_RETENTION_DAYS = 30
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
-    ).add_points(1, 100)
+    ).add_points(_TEST_GUILD, 1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
-        "LOL",
+        _TEST_GUILD, "LOL",
         2_000_000_000,
     )
+    SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
     current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(current)
     copied = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
@@ -1890,11 +1744,12 @@ def test_backup_publication_is_synced():
     backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
-    ).add_points(1, 100)
+    ).add_points(_TEST_GUILD, 1, 100)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
-        "LOL",
+        _TEST_GUILD, "LOL",
         2_000_000_000,
     )
+    SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
     events = []
     synced_directories = []
     real_fsync = backup.os.fsync
@@ -1928,19 +1783,22 @@ def test_backup_publication_is_synced():
         backup.os.replace = real_replace
         backup._fsync_directory = real_fsync_directory
 
-    publication_events = events[-8:]
+    # DB 개수는 backup.DATABASES가 정한다. 개수를 테스트에 박아두지 않는다.
+    db_count = len(backup.DATABASES)
+    publication_events = events[-(2 * db_count + 4):]
     check(
         "DB 파일은 공개 전에 동기화",
-        publication_events[:4]
-        == ["fsync:file", "fsync:file", "replace:db", "replace:db"],
+        publication_events[: 2 * db_count]
+        == ["fsync:file"] * db_count + ["replace:db"] * db_count,
+        f"({publication_events})",
     )
     check(
         "DB rename은 manifest 공개 전에 디렉터리 동기화",
-        publication_events[4:6] == ["fsync:dir", "fsync:file"],
+        publication_events[2 * db_count : 2 * db_count + 2] == ["fsync:dir", "fsync:file"],
     )
     check(
         "manifest rename 후 디렉터리 동기화",
-        publication_events[6:] == ["replace:manifest", "fsync:dir"],
+        publication_events[2 * db_count + 2 :] == ["replace:manifest", "fsync:dir"],
     )
     check(
         "새 백업 디렉터리의 모든 상위 entry 동기화",
@@ -2018,9 +1876,7 @@ if __name__ == "__main__":
         test_deployment_contracts_skip_only_compose_when_cli_missing()
         test_forbidden_words_fail_fast()
         test_forbidden_words_load_logs_to_stdout()
-        test_new_install_verifies_after_loading_cogs()
-        test_existing_global_cleanup_marker_skips_only_global_sync()
-        test_global_cleanup_marker_location()
+        test_startup_syncs_commands_globally()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
@@ -2032,9 +1888,9 @@ if __name__ == "__main__":
         test_backup_reads_wal_without_writer()
         test_point_ledger()
         test_luckybox_removed()
-        test_guild_guard()
+        test_guild_isolation()
         test_temp_image_lifecycle()
-        repo = test_migration()
+        repo = test_schema_initialization()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
         test_party_repository()

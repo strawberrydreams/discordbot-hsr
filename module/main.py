@@ -8,15 +8,9 @@ from module.backup import DATABASES, pid_file, verify_database
 from module.config import (
     BACKUP_DIR,
     DATA_DIR,
-    DISCORD_GUILD_ID,
     DISCORD_TOKEN,
-    PROJECT_ROOT,
     validate_config,
 )
-
-# 데이터가 아니라 봇 설치 상태이므로 백업 대상 밖(runtime/)에 둔다.
-# DATA_DIR에 두면 백업에서 새 데이터 디렉터리로 복구할 때 전역 클리어가 한 번 더 돈다.
-GLOBAL_CLEANUP_MARKER = PROJECT_ROOT / "runtime" / ".global-commands-cleared"
 
 # 실행 커맨드: python -m module.main
 
@@ -27,6 +21,7 @@ intents.message_content = True
 intents.members = True
 
 EXTENSIONS = (
+    "module.guildsettings_cog",
     "module.eventnotice_cog",
     "module.playwith_cog",
     "module.forbiddenfilter_cog",
@@ -65,12 +60,6 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        # 슬래시 명령은 길드 sync로 격리되지만, 남아 있는 등록분이 다른 길드에서 뜰 수 있다.
-        async def _guild_only_check(interaction: discord.Interaction) -> bool:
-            return interaction.guild_id == DISCORD_GUILD_ID
-
-        self.tree.interaction_check = _guild_only_check
-
         _verify_databases(existing_only=True)
 
         for extension in EXTENSIONS:
@@ -78,20 +67,10 @@ class MyBot(commands.Bot):
             print(f"🧩 Loaded extension: {extension}")
 
         _verify_databases()
-        guild = discord.Object(id=DISCORD_GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        global_cleanup_marker = GLOBAL_CLEANUP_MARKER
-        legacy_marker = DATA_DIR / ".global-commands-cleared"
-        if legacy_marker.exists() and not global_cleanup_marker.exists():
-            global_cleanup_marker.parent.mkdir(parents=True, exist_ok=True)
-            legacy_marker.replace(global_cleanup_marker)  # 재-sync를 피한다
-        if not global_cleanup_marker.exists():
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            global_cleanup_marker.parent.mkdir(parents=True, exist_ok=True)
-            global_cleanup_marker.touch()
-        await self.tree.sync(guild=guild)
-        print(f"🔄 Command tree synced to guild {DISCORD_GUILD_ID}")
+        # 공개 배포 봇이므로 전역 sync다. 길드 sync는 봇이 설치된 서버를 미리
+        # 알아야 하는데, 초대는 언제든 일어난다. 데이터 격리는 스키마가 보장한다.
+        await self.tree.sync()
+        print("🔄 Command tree synced globally")
 
     async def on_ready(self):
         print(f"✅ {self.user} 봇이 실행되었습니다!")

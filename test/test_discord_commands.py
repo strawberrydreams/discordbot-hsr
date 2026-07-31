@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import gc
 import json
 import pathlib
@@ -24,6 +25,54 @@ from module.playwith_cog import PlayWithCog
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.backup as backup
+
+
+
+# 단일 운영 길드를 전제하던 상수가 사라졌다. 테스트는 임의의 길드 하나를 쓴다.
+TEST_GUILD_ID = 4_242
+
+
+class _StubSettings:
+    """길드별 채널 설정 스텁. 실제 리포지토리 대신 주입한다."""
+
+    def __init__(self, recruit=None, event=None):
+        self._recruit = recruit
+        self._event = event
+
+    def get_recruit_channel(self, guild_id):
+        return self._recruit
+
+    def get_event_channel(self, guild_id):
+        return self._event
+
+    def set_recruit_channel(self, guild_id, channel_id):
+        self._recruit = channel_id
+
+    def set_event_channel(self, guild_id, channel_id):
+        self._event = channel_id
+
+    def delete_guild(self, guild_id):
+        self._recruit = self._event = None
+
+
+@contextlib.contextmanager
+def _recruit_channel(cog, channel_id):
+    previous = getattr(cog, "settings", None)
+    cog.settings = _StubSettings(recruit=channel_id)
+    try:
+        yield
+    finally:
+        cog.settings = previous
+
+
+@contextlib.contextmanager
+def _event_channel(cog, channel_id):
+    previous = getattr(cog, "settings", None)
+    cog.settings = _StubSettings(event=channel_id)
+    try:
+        yield
+    finally:
+        cog.settings = previous
 
 
 class RecordingResponse:
@@ -91,16 +140,19 @@ class FakeGuild:
         return FakeUser()
 
 
+_UNSET = object()  # guild_id=None(=DM)과 "기본값 사용"을 구분한다
+
+
 class FakeInteraction:
-    def __init__(self, channel_id, guild=None, guild_id=None):
+    def __init__(self, channel_id, guild=None, guild_id=_UNSET):
         self.channel_id = channel_id
         self.user = FakeUser()
         self.response = RecordingResponse()
         self.followup = RecordingFollowup()
         self.guild = guild
         self.created_at = datetime.now(timezone.utc)
-        # 기본값은 설정된 길드 — 경계 테스트만 다른 값을 넘긴다.
-        self.guild_id = config.DISCORD_GUILD_ID if guild_id is None else guild_id
+        # 기본값은 임의의 길드 — 경계 테스트만 다른 값(또는 DM을 뜻하는 None)을 넘긴다.
+        self.guild_id = TEST_GUILD_ID if guild_id is _UNSET else guild_id
 
 
 class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -200,12 +252,15 @@ class RecordingAttendance:
         self.reasons = []
         self.refund_error = refund_error
 
-    def deduct_points(self, user_id, amount, reason="unspecified"):
+    async def deduct_points(self, guild_id, user_id, amount, reason="unspecified"):
         self.deductions.append((user_id, amount))
         self.reasons.append(reason)
         return True
 
-    def add_points(self, user_id, amount, reason="unspecified"):
+    async def get_points(self, guild_id, user_id):
+        return 0
+
+    async def add_points(self, guild_id, user_id, amount, reason="unspecified"):
         self.reasons.append(reason)
         self.refund_attempts.append((user_id, amount))
         if self.refund_error:
@@ -675,7 +730,7 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
 
     async def test_attendance_balance_matches_db_and_duplicate_only_responds_duplicate(self):
-        self.attendance.db.add_points(FakeUser.id, 2_000)
+        self.attendance.db.add_points(TEST_GUILD_ID, FakeUser.id, 2_000)
 
         success = FakeInteraction(channel_id=1)
         with patch("module.attendance_cog.random.randint", return_value=7_000):
@@ -683,7 +738,7 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         success_args, success_kwargs = success.response.messages[0]
         self.assertEqual(success_args, ())
-        self.assertEqual(self.attendance.db.get_points(FakeUser.id), 9_000)
+        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
         self.assertEqual(success_kwargs["embed"].fields[0].value, "9,000 P")
 
         duplicate = FakeInteraction(channel_id=1)
@@ -696,10 +751,10 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("이미 출석", duplicate_args[0])
         self.assertNotIn("embed", duplicate_kwargs)
         self.assertIs(duplicate_kwargs.get("ephemeral"), True)
-        self.assertEqual(self.attendance.db.get_points(FakeUser.id), 9_000)
+        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
 
     async def test_recruit_selector_and_no_available_games_are_ephemeral(self):
-        with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+        with _recruit_channel(self.play, 1):
             selector_interaction = FakeInteraction(channel_id=1)
             await PlayWithCog.모집.callback(self.play, selector_interaction)
             self.assertIs(
@@ -707,7 +762,7 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
             )
 
             for game in playwith_cog.GAMES:
-                self.party_repository.create_party(game, datetime.now().isoformat())
+                self.party_repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
             full_interaction = FakeInteraction(channel_id=1)
             await PlayWithCog.모집.callback(self.play, full_interaction)
             self.assertIs(full_interaction.response.messages[-1][1].get("ephemeral"), True)
@@ -715,7 +770,8 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
     async def test_event_command_rejects_other_channels_before_fetching(self):
         guild = FakeGuild()
         interaction = FakeInteraction(channel_id=-1, guild=guild)
-        with patch("module.eventnotice_cog.EVENT_CHANNEL_ID", 1):
+        event_cog = EventNoticeCog(bot=None)
+        with _event_channel(event_cog, 1):
             await EventNoticeCog.show_specific_event.callback(
                 EventNoticeCog(bot=None), interaction, 1
             )
@@ -737,7 +793,7 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         listing = FakeInteraction(channel_id=1, guild=guild)
         detail = FakeInteraction(channel_id=1, guild=guild)
-        with patch("module.eventnotice_cog.EVENT_CHANNEL_ID", 1):
+        with _event_channel(cog, 1):
             await EventNoticeCog.show_specific_event.callback(cog, listing, None)
             await EventNoticeCog.show_specific_event.callback(cog, detail, 1)
 
@@ -753,9 +809,9 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ResourceWarning)
                 repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-                repository.create_party("PUBG", 1_000)
-                repository.add_participant("PUBG", 123)
-                repository.delete_party("PUBG")
+                repository.create_party(TEST_GUILD_ID, "PUBG", 1_000)
+                repository.add_participant(TEST_GUILD_ID, "PUBG", 123)
+                repository.delete_party(TEST_GUILD_ID, "PUBG")
                 del repository
                 gc.collect()
 
@@ -767,15 +823,15 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
 
-            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+            with _recruit_channel(cog, 1):
                 await PlayWithCog.파티.callback(cog, interaction)
 
-            self.assertIsNotNone(repository.get_party(game))
+            self.assertIsNotNone(repository.get_party(TEST_GUILD_ID, game))
             self.assertEqual(
                 interaction.response.messages[0][1]["embeds"][0].description,
                 f"현재 인원: 0 / {playwith_cog.GAMES[game]['max_players']}",
@@ -792,39 +848,39 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
             await cog.shared_views[game].children[0].callback(interaction)
 
             self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
-            self.assertIsNone(repository.get_user_party(interaction.user.id))
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, interaction.user.id))
 
     async def test_stale_role_update_rejects_deleted_party(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
-            repository.add_participant(game, FakeUser.id, "탑")
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
+            repository.add_participant(TEST_GUILD_ID, game, FakeUser.id, "탑")
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
             select = playwith_cog.RoleUpdateSelect(cog, game, FakeUser.id)
             select._values = ["정글"]
-            repository.delete_party(game)
+            repository.delete_party(TEST_GUILD_ID, game)
             interaction = FakeInteraction(channel_id=1)
 
             await select.callback(interaction)
 
             self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
-            self.assertIsNone(repository.get_user_party(interaction.user.id))
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, interaction.user.id))
 
     async def test_party_status_sends_multiple_embeds_in_one_initial_response(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             games = list(playwith_cog.GAMES)[:2]
             for user_id, game in enumerate(games, start=1):
-                repository.create_party(game, datetime.now().isoformat())
-                repository.add_participant(game, user_id)
+                repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
+                repository.add_participant(TEST_GUILD_ID, game, user_id)
 
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
 
-            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+            with _recruit_channel(cog, 1):
                 await PlayWithCog.파티.callback(cog, interaction)
 
         self.assertEqual(len(interaction.response.messages), 1)
@@ -870,7 +926,7 @@ class RecordingForbiddenCounts:
     def __init__(self):
         self.counts = []
 
-    def increment_forbidden_count(self, user_id):
+    async def increment_forbidden_count(self, guild_id, user_id):
         self.counts.append(user_id)
 
 
@@ -891,59 +947,74 @@ def make_forbidden_cog(counter, words=("나쁜말",)):
 
 
 class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_other_guild_and_dm_messages_are_ignored(self):
+    """봇은 여러 서버에 설치된다. 경계는 '한 서버만 허용'이 아니라 '서버끼리 안 섞임'이다."""
+
+    async def test_dm_messages_are_ignored(self):
         counter = RecordingForbiddenCounts()
         cog = make_forbidden_cog(counter)
 
-        other_guild = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID + 1)
+        # DM은 귀속시킬 길드가 없어 집계 대상이 아니다.
         direct_message = FakeMessage("나쁜말", guild_id=None)
-        for message in (other_guild, direct_message):
-            await cog.on_message(message)
+        await cog.on_message(direct_message)
 
         self.assertEqual(counter.counts, [])
-        self.assertEqual(other_guild.sent + direct_message.sent, [])
+        self.assertEqual(direct_message.sent, [])
 
-    async def test_configured_guild_message_is_still_screened(self):
+    async def test_every_guild_is_screened_independently(self):
         counter = RecordingForbiddenCounts()
         cog = make_forbidden_cog(counter)
-        message = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
 
-        await cog.on_message(message)
+        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        second = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID + 1)
+        for message in (first, second):
+            await cog.on_message(message)
 
-        self.assertEqual(counter.counts, [FakeUser.id])
-        self.assertIn("나쁜말", message.sent[0])
+        # 어느 서버든 검사한다. 카운트는 서버별로 따로 쌓인다(스키마가 분리).
+        self.assertEqual(counter.counts, [FakeUser.id, FakeUser.id])
+        self.assertIn("나쁜말", first.sent[0])
+        self.assertIn("나쁜말", second.sent[0])
 
-    async def test_join_button_from_another_guild_does_not_join(self):
+    async def test_join_button_outside_a_guild_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(
-                channel_id=1, guild_id=config.DISCORD_GUILD_ID + 1
-            )
+            # 영속 버튼은 길드 밖에서도 눌릴 수 있다.
+            interaction = FakeInteraction(channel_id=1, guild_id=None)
 
             await cog.shared_views[game].children[0].callback(interaction)
 
-            self.assertIsNone(repository.get_user_party(FakeUser.id))
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, FakeUser.id))
             self.assertIs(interaction.response.messages[0][1].get("ephemeral"), True)
-            self.assertIn("이 서버에서 사용할 수 없습니다", interaction.response.messages[0][0][0])
+            self.assertIn("서버 안에서만", interaction.response.messages[0][0][0])
 
-    async def test_command_tree_rejects_other_guilds(self):
+    async def test_join_button_binds_to_the_interacting_guild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = "PUBG"  # 역할이 없어 버튼 한 번으로 참가된다
+            other = TEST_GUILD_ID + 1
+            repository.create_party(other, game, 1_000)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            # 파티가 있는 쪽 서버에서 누르면 그 서버 파티에만 들어간다.
+            await cog.shared_views[game].children[0].callback(
+                FakeInteraction(channel_id=1, guild_id=other)
+            )
+
+            self.assertEqual(repository.get_user_party(other, FakeUser.id), game)
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, FakeUser.id))
+
+    async def test_commands_are_registered_globally_without_guild_pinning(self):
         import module.main as main
 
+        events = []
+
         class FakeTree:
-            interaction_check = None
-
-            def copy_global_to(self, *, guild):
-                pass
-
-            def clear_commands(self, *, guild):
-                pass
-
             async def sync(self, *, guild=None):
-                pass
+                events.append("global" if guild is None else f"guild:{guild}")
 
         class FakeBot:
             tree = FakeTree()
@@ -952,18 +1023,15 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         with patch.object(main, "_verify_databases"), patch.object(
-            main, "DISCORD_GUILD_ID", 4_242
-        ), patch.object(main, "DATA_DIR", pathlib.Path(tempfile.mkdtemp())), patch.object(
-            main, "GLOBAL_CLEANUP_MARKER", pathlib.Path(tempfile.mkdtemp()) / "marker"
+            main, "DATA_DIR", pathlib.Path(tempfile.mkdtemp())
         ):
-            bot = FakeBot()
-            await main.MyBot.setup_hook(bot)
-            check = bot.tree.interaction_check
+            await main.MyBot.setup_hook(FakeBot())
 
-            self.assertTrue(await check(FakeInteraction(channel_id=1, guild_id=4_242)))
-            self.assertFalse(await check(FakeInteraction(channel_id=1, guild_id=1)))
-            # DM 상호작용은 guild_id가 없다.
-            self.assertFalse(await check(SimpleNamespace(guild_id=None)))
+        # 공개 배포 봇은 어떤 서버에 초대될지 미리 알 수 없다.
+        self.assertEqual(events, ["global"])
+        self.assertFalse(hasattr(main, "DISCORD_GUILD_ID"))
+
+
 
 
 class RankingCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -973,8 +1041,8 @@ class RankingCommandTests(unittest.IsolatedAsyncioTestCase):
         repository = SQLiteAttendanceRepository(
             pathlib.Path(self.temp_dir.name) / "attendance.db"
         )
-        repository.add_points(1, 500)
-        repository.add_points(2, 400)
+        repository.add_points(TEST_GUILD_ID, 1, 500)
+        repository.add_points(TEST_GUILD_ID, 2, 400)
         self.cog = AttendanceCog(bot=None, repository=repository)
 
     async def test_guild_nickname_wins_and_cache_miss_hides_the_raw_id(self):
@@ -1004,8 +1072,8 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
         self.cog = make_forbidden_cog(self.counter)
 
     async def test_edit_that_introduces_a_forbidden_word_is_caught(self):
-        before = FakeMessage("안녕하세요", guild_id=config.DISCORD_GUILD_ID)
-        after = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
+        before = FakeMessage("안녕하세요", guild_id=TEST_GUILD_ID)
+        after = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
 
         await self.cog.on_message_edit(before, after)
 
@@ -1013,8 +1081,8 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("나쁜말", after.sent[0])
 
     async def test_edit_of_an_already_caught_message_is_not_double_counted(self):
-        before = FakeMessage("나쁜말 하나", guild_id=config.DISCORD_GUILD_ID)
-        after = FakeMessage("나쁜말 둘", guild_id=config.DISCORD_GUILD_ID)
+        before = FakeMessage("나쁜말 하나", guild_id=TEST_GUILD_ID)
+        after = FakeMessage("나쁜말 둘", guild_id=TEST_GUILD_ID)
 
         await self.cog.on_message_edit(before, after)
 
@@ -1022,15 +1090,15 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.sent, [])
 
     async def test_unchanged_content_is_not_rescreened(self):
-        message = FakeMessage("나쁜말", guild_id=config.DISCORD_GUILD_ID)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
 
         await self.cog.on_message_edit(message, message)
 
         self.assertEqual(self.counter.counts, [])
 
     async def test_clean_edit_stays_clean(self):
-        before = FakeMessage("안녕", guild_id=config.DISCORD_GUILD_ID)
-        after = FakeMessage("반가워요", guild_id=config.DISCORD_GUILD_ID)
+        before = FakeMessage("안녕", guild_id=TEST_GUILD_ID)
+        after = FakeMessage("반가워요", guild_id=TEST_GUILD_ID)
 
         await self.cog.on_message_edit(before, after)
 
@@ -1064,15 +1132,15 @@ class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = "PUBG"  # 역할 없는 게임
-            repository.create_party(game, 1_000)
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
 
             for user_id in range(playwith_cog.GAMES[game]["max_players"]):
-                self.assertTrue(cog.add_participant(game, user_id))
+                self.assertTrue(await cog.add_participant(TEST_GUILD_ID, game, user_id))
 
-            self.assertFalse(cog.add_participant(game, 999))
-            self.assertIsNone(repository.get_user_party(999))
+            self.assertFalse(await cog.add_participant(TEST_GUILD_ID, game, 999))
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, 999))
 
 
 class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
@@ -1080,43 +1148,43 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
-            repository.add_participant(game, 42, "탑")
-            repository.add_participant(game, 43, "미드")
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
+            repository.add_participant(TEST_GUILD_ID, game, 42, "탑")
+            repository.add_participant(TEST_GUILD_ID, game, 43, "미드")
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
 
             member = SimpleNamespace(
-                id=42, guild=SimpleNamespace(id=config.DISCORD_GUILD_ID)
+                id=42, guild=SimpleNamespace(id=TEST_GUILD_ID)
             )
             await cog.on_member_remove(member)
 
-            self.assertIsNone(repository.get_user_party(42))
-            self.assertEqual(repository.get_participants(game), {43: "미드"})
-            self.assertIsNotNone(repository.get_party(game))
+            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, 42))
+            self.assertEqual(repository.get_participants(TEST_GUILD_ID, game), {43: "미드"})
+            self.assertIsNotNone(repository.get_party(TEST_GUILD_ID, game))
 
     async def test_last_leaving_member_disbands_the_party(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
-            repository.add_participant(game, 42, "탑")
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
+            repository.add_participant(TEST_GUILD_ID, game, 42, "탑")
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
 
             await cog.on_member_remove(
-                SimpleNamespace(id=42, guild=SimpleNamespace(id=config.DISCORD_GUILD_ID))
+                SimpleNamespace(id=42, guild=SimpleNamespace(id=TEST_GUILD_ID))
             )
 
-            self.assertIsNone(repository.get_party(game))
+            self.assertIsNone(repository.get_party(TEST_GUILD_ID, game))
 
     async def test_party_count_matches_listed_members(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
             game = next(iter(playwith_cog.GAMES))
-            repository.create_party(game, 1_000)
-            repository.add_participant(game, 1, "탑")
-            repository.add_participant(game, 2, "미드")  # 서버를 이미 떠난 유저
+            repository.create_party(TEST_GUILD_ID, game, 1_000)
+            repository.add_participant(TEST_GUILD_ID, game, 1, "탑")
+            repository.add_participant(TEST_GUILD_ID, game, 2, "미드")  # 서버를 이미 떠난 유저
             with patch("discord.ext.tasks.Loop.start"):
                 cog = PlayWithCog(bot=None, repository=repository)
 
@@ -1125,7 +1193,7 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
                     return FakeUser() if user_id == 1 else None
 
             interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
-            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+            with _recruit_channel(cog, 1):
                 await PlayWithCog.파티.callback(cog, interaction)
 
             description = interaction.response.messages[0][1]["embeds"][0].description

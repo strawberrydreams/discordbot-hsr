@@ -45,9 +45,8 @@ FORBIDDEN_WORDS_FILE = _path_from_env(
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-RECRUIT_CHANNEL_ID = _int_from_env("RECRUIT_CHANNEL_ID", 0)
-EVENT_CHANNEL_ID = _int_from_env("EVENT_CHANNEL_ID", 0)
-DISCORD_GUILD_ID = _int_from_env("DISCORD_GUILD_ID", 0)
+# 채널/길드 ID는 환경변수에 두지 않는다. 봇이 여러 서버에 설치되면 운영자가 남의
+# 서버 채널 ID를 알 수 없으므로, 각 서버 관리자가 /설정으로 지정하고 DB에 저장한다.
 BACKUP_INTERVAL_SECONDS = _int_from_env("BACKUP_INTERVAL_SECONDS", 21600)
 BACKUP_RETENTION_DAYS = _int_from_env("BACKUP_RETENTION_DAYS", 30)
 # 포인트 잔액이 지속 사용량을 묶고, 쿨다운은 누적 잔액을 한 번에 소진하는 버스트를 막는다.
@@ -67,12 +66,6 @@ def validate_config() -> None:
     ]
     if missing:
         raise RuntimeError(f"필수 환경변수가 없습니다: {', '.join(missing)}")
-    if RECRUIT_CHANNEL_ID <= 0:
-        raise RuntimeError("RECRUIT_CHANNEL_ID는 양의 정수여야 합니다.")
-    if EVENT_CHANNEL_ID <= 0:
-        raise RuntimeError("EVENT_CHANNEL_ID는 양의 정수여야 합니다.")
-    if DISCORD_GUILD_ID <= 0:
-        raise RuntimeError("DISCORD_GUILD_ID는 양의 정수여야 합니다.")
     if BACKUP_INTERVAL_SECONDS <= 0:
         raise RuntimeError("BACKUP_INTERVAL_SECONDS는 양의 정수여야 합니다.")
     if BACKUP_RETENTION_DAYS <= 0:

@@ -194,18 +194,22 @@ class HyacineChatCog(commands.Cog):
                 await inter.response.send_message("❌ 출석체크 모듈 오류.", ephemeral=True)
                 return
 
-            if not attendance_cog.deduct_points(inter.user.id, cost, f"chat:{model}"):
-                current = attendance_cog.get_points(inter.user.id)
+            if not await attendance_cog.deduct_points(
+                inter.guild_id, inter.user.id, cost, f"chat:{model}"
+            ):
+                current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
                 await inter.response.send_message(f"❌ 이 명령은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
                 return
             charged = True
 
-        def refund_points():
+        async def refund_points():
             nonlocal refunded
             if not charged or refunded:
                 return refunded
             try:
-                attendance_cog.add_points(inter.user.id, cost, f"chat_refund:{model}")
+                await attendance_cog.add_points(
+                    inter.guild_id, inter.user.id, cost, f"chat_refund:{model}"
+                )
             except Exception:
                 print(f"❌ [hyacine_chat] 포인트 환불 실패 (channel={inter.channel_id})")
                 traceback.print_exc()
@@ -240,7 +244,7 @@ class HyacineChatCog(commands.Cog):
                 reply = (resp.output_text or "").strip()
 
                 if not reply.strip():
-                    refund_note = " (포인트 환불됨)" if refund_points() else ""
+                    refund_note = " (포인트 환불됨)" if await refund_points() else ""
                     await inter.followup.send(
                         "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
                         + refund_note
@@ -270,7 +274,7 @@ class HyacineChatCog(commands.Cog):
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
-            refund_note = " (포인트 환불됨)" if refund_points() else ""
+            refund_note = " (포인트 환불됨)" if await refund_points() else ""
             if isinstance(exc, openai.RateLimitError):
                 error_message = (
                     f"⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요.{refund_note}"

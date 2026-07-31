@@ -78,8 +78,10 @@ class HyacineImageCog(commands.Cog):
             return
 
         cost = IMAGE_COST
-        if not attendance_cog.deduct_points(inter.user.id, cost, "image"):
-            current = attendance_cog.get_points(inter.user.id)
+        if not await attendance_cog.deduct_points(
+            inter.guild_id, inter.user.id, cost, "image"
+        ):
+            current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
             await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
             return
 
@@ -92,13 +94,15 @@ class HyacineImageCog(commands.Cog):
         uploaded = False
         file = None
 
-        def refund_points() -> bool:
+        async def refund_points() -> bool:
             nonlocal refund_attempted, refund_failed, refunded
             if not charged or refund_attempted or generation_completed:
                 return False
             refund_attempted = True
             try:
-                attendance_cog.add_points(inter.user.id, cost, "image_refund")
+                await attendance_cog.add_points(
+                    inter.guild_id, inter.user.id, cost, "image_refund"
+                )
             except Exception:
                 refund_failed = True
                 print(
@@ -134,7 +138,7 @@ class HyacineImageCog(commands.Cog):
                     break
 
             if image_data is None:
-                refund_points()
+                await refund_points()
                 print(f"⚠️ Image generation blocked/failed. Response: {response}")
                 message = "❌ 이미지를 생성하지 못했어요."
                 if refunded:
@@ -181,7 +185,7 @@ class HyacineImageCog(commands.Cog):
             )
 
         except Exception:
-            refund_points()
+            await refund_points()
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_image] 이미지 생성 실패 (user={inter.user.id})")
             traceback.print_exc()
