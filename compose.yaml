@@ -19,9 +19,9 @@ services:
 
   backup:
     image: discordbot-hsr:local
+    # module.backup은 Discord/OpenAI/Google 자격증명을 쓰지 않는다. 노출면을 줄인다.
     env_file:
       - .env.runtime
-      - .env.secrets
     command: ["python", "-m", "module.backup", "loop"]
     restart: unless-stopped
     volumes:

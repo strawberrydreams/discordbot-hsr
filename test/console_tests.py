@@ -336,12 +336,14 @@ def test_deployment_contracts():
             bot.get("image") == backup.get("image") == "discordbot-hsr:local",
         )
         check(
-            "Compose 두 서비스 secrets 파일 우선",
-            all(
-                [pathlib.Path(item["path"]).name for item in service["env_file"]]
-                == [".env.runtime", ".env.secrets"]
-                for service in (bot, backup)
-            ),
+            "bot 서비스는 시크릿을 유지",
+            [pathlib.Path(item["path"]).name for item in bot["env_file"]]
+            == [".env.runtime", ".env.secrets"],
+        )
+        check(
+            "backup 서비스는 시크릿을 받지 않음",
+            [pathlib.Path(item["path"]).name for item in backup["env_file"]]
+            == [".env.runtime"],
         )
         check(
             # WAL DB는 읽기 전용 연결이라도 -shm/-wal 생성이 필요하므로 :ro면 백업이 실패한다.
