@@ -106,8 +106,8 @@ class PartyRepository(ABC):
         """파티가 존재하면 (created_at,)을, 없으면 None을 반환한다."""
 
     @abstractmethod
-    def create_party(self, game: str, created_at: int) -> None:
-        """파티를 생성한다. 이미 존재하면 무시한다."""
+    def create_party(self, game: str, created_at: int) -> bool:
+        """파티를 생성한다. 새로 만들었으면 True, 이미 있으면 False."""
 
     @abstractmethod
     def delete_party(self, game: str) -> None:
@@ -118,8 +118,15 @@ class PartyRepository(ABC):
         """{user_id: role} 형태로 참가자 목록을 반환한다."""
 
     @abstractmethod
-    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> bool:
-        """존재하는 파티에만 참가자를 추가하거나 역할을 갱신한다."""
+    def add_participant(
+        self,
+        game: str,
+        user_id: int,
+        role: Optional[str] = None,
+        max_players: Optional[int] = None,
+    ) -> bool:
+        """존재하는 파티에만 참가자를 추가하거나 역할을 갱신한다.
+        정원 초과와 역할 중복은 DB가 거부하며, 그 경우 행을 남기지 않는다."""
 
     @abstractmethod
     def remove_participant(self, game: str, user_id: int) -> None:
@@ -316,6 +323,19 @@ class SQLitePartyRepository(PartyRepository):
                     "UPDATE parties SET created_at = ? WHERE game = ?",
                     (timestamp, game),
                 )
+            # 부분 유니크 인덱스 생성 전에 기존 역할 중복 행을 정리한다(가장 이른 행만 유지).
+            cursor.execute("""
+                DELETE FROM participants
+                WHERE role IS NOT NULL
+                  AND rowid NOT IN (
+                      SELECT MIN(rowid) FROM participants
+                      WHERE role IS NOT NULL GROUP BY game, role
+                  )
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_role
+                ON participants (game, role) WHERE role IS NOT NULL
+            """)
             cursor.execute(
                 """
                 DELETE FROM participants
@@ -334,12 +354,13 @@ class SQLitePartyRepository(PartyRepository):
             cursor.execute("SELECT created_at FROM parties WHERE game = ?", (game,))
             return cursor.fetchone()
 
-    def create_party(self, game: str, created_at: int) -> None:
+    def create_party(self, game: str, created_at: int) -> bool:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT OR IGNORE INTO parties (game, created_at) VALUES (?, ?)",
                            (game, created_at))
             conn.commit()
+            return cursor.rowcount > 0
 
     def delete_party(self, game: str) -> None:
         with closing(_connect(self.db_path)) as conn:
@@ -355,16 +376,51 @@ class SQLitePartyRepository(PartyRepository):
             cursor.execute("SELECT user_id, role FROM participants WHERE game = ?", (game,))
             return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def add_participant(self, game: str, user_id: int, role: Optional[str] = None) -> bool:
-        with closing(_connect(self.db_path)) as conn:
+    def add_participant(
+        self,
+        game: str,
+        user_id: int,
+        role: Optional[str] = None,
+        max_players: Optional[int] = None,
+    ) -> bool:
+        # 정원 확인과 쓰기를 BEGIN IMMEDIATE로 묶고, 역할 중복은 유니크 인덱스가 거부한다.
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO participants (game, user_id, role)
-                SELECT ?, ?, ?
-                WHERE EXISTS (SELECT 1 FROM parties WHERE game = ?)
-            """, (game, user_id, role, game))
+            cursor.execute("BEGIN IMMEDIATE")
+            if not cursor.execute(
+                "SELECT 1 FROM parties WHERE game = ?", (game,)
+            ).fetchone():
+                conn.rollback()
+                return False
+
+            if max_players is not None:
+                others = cursor.execute(
+                    "SELECT COUNT(*) FROM participants WHERE game = ? AND user_id != ?",
+                    (game, user_id),
+                ).fetchone()[0]
+                if others >= max_players:
+                    conn.rollback()
+                    return False
+
+            # 역할 변경은 같은 user_id의 기존 행을 지우고 다시 넣는다.
+            cursor.execute(
+                "DELETE FROM participants WHERE game = ? AND user_id = ?", (game, user_id)
+            )
+            cursor.execute(
+                "INSERT INTO participants (game, user_id, role) VALUES (?, ?, ?)",
+                (game, user_id, role),
+            )
             conn.commit()
-            return cursor.rowcount > 0
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()  # 역할 중복 — 지웠던 자기 행도 함께 복원된다.
+            return False
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def remove_participant(self, game: str, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:

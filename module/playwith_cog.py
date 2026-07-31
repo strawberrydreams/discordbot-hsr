@@ -38,7 +38,7 @@ class PlayWithCog(commands.Cog):
         return self.db.get_party(game)
 
     def create_party(self, game):
-        self.db.create_party(game, int(time.time()))
+        return self.db.create_party(game, int(time.time()))
 
     def delete_party(self, game):
         self.db.delete_party(game)
@@ -47,7 +47,10 @@ class PlayWithCog(commands.Cog):
         return self.db.get_participants(game)
 
     def add_participant(self, game, user_id, role=None):
-        return self.db.add_participant(game, user_id, role)
+        # 정원은 DB가 최종 판정한다. 파이썬 검사는 친절한 메시지를 위해서만 남긴다.
+        return self.db.add_participant(
+            game, user_id, role, max_players=GAMES[game]["max_players"]
+        )
 
     def remove_participant(self, game, user_id):
         self.db.remove_participant(game, user_id)
@@ -193,8 +196,12 @@ class GameSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         selected_game = self.values[0]
-        # Create party in DB
-        self.cog.create_party(selected_game)
+        # 드롭다운 선택 사이에 사용자 대기 시간이 있어 두 사람이 같은 게임을 고를 수 있다.
+        if not self.cog.create_party(selected_game):
+            await interaction.response.send_message(
+                f"⚠️ `{selected_game}` 파티는 이미 생성되어 있습니다.", ephemeral=True
+            )
+            return
         await send_party_embed(self.cog, interaction, selected_game)
 
 async def send_party_embed(cog, interaction, game):
@@ -251,7 +258,9 @@ class JoinButton(Button):
             await interaction.response.send_message("🎯 역할을 선택하세요:", view=view, ephemeral=True)
         else:
             if not self.cog.add_participant(game, user_id):
-                await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+                await interaction.response.send_message(
+                    "❌ 참가하지 못했어요. 파티가 종료되었거나 자리가 찼습니다.", ephemeral=True
+                )
                 return
             await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 참가했습니다!", ephemeral=False)
 
@@ -288,7 +297,9 @@ class RoleSelect(Select):
                 return
 
         if not self.cog.add_participant(game, user_id, role):
-            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 참가하지 못했어요. 파티가 종료되었거나 자리·역할이 이미 찼습니다.", ephemeral=True
+            )
             return
         await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 역할 `{role}`로 참가했어요!", ephemeral=False)
 
@@ -319,7 +330,9 @@ class RoleUpdateSelect(Select):
                 return
 
         if not self.cog.add_participant(game, self.user_id, role):
-            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 역할을 바꾸지 못했어요. 파티가 종료되었거나 역할이 이미 찼습니다.", ephemeral=True
+            )
             return
         await interaction.response.send_message(f"🔄 역할이 `{role}`(으)로 변경되었습니다!", ephemeral=True)
 

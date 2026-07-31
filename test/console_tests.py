@@ -981,11 +981,11 @@ def test_party_repository():
     check("없는 파티 참가 거부", repo.add_participant("missing", 99) is False)
     check("거부된 참가자는 고아 행을 남기지 않음", repo.get_user_party(99) is None)
 
-    repo.create_party("LOL", now)
+    check("첫 생성은 True", repo.create_party("LOL", now) is True)
     check("파티 시각을 epoch 정수로 저장", repo.get_party("LOL") == (now,))
 
-    repo.create_party("LOL", now)  # INSERT OR IGNORE
-    check("중복 생성은 무시됨", True)
+    check("중복 생성은 False", repo.create_party("LOL", now + 1) is False)
+    check("중복 생성이 시각을 덮어쓰지 않음", repo.get_party("LOL") == (now,))
 
     repo.add_participant("LOL", 1, "탑")
     repo.add_participant("LOL", 2, None)
@@ -1120,6 +1120,43 @@ def test_party_repository():
     )
 
 
+def test_party_capacity_constraint():
+    print("\n[4] 파티 정원·역할 SQL 제약")
+    with tempfile.TemporaryDirectory() as directory:
+        repo = SQLitePartyRepository(pathlib.Path(directory) / "p.db")
+        repo.create_party("PUBG", 1_000)
+        results = [repo.add_participant("PUBG", uid, None, max_players=2) for uid in (1, 2, 3)]
+        check("정원 초과는 DB에서 거부", results == [True, True, False], f"({results})")
+
+        repo.create_party("LoL", 1_000)
+        check("역할 배정", repo.add_participant("LoL", 10, "탑", max_players=5) is True)
+        check("역할 중복은 DB에서 거부", repo.add_participant("LoL", 11, "탑", max_players=5) is False)
+        check("본인 역할 재지정은 허용", repo.add_participant("LoL", 10, "탑", max_players=5) is True)
+        check("거부된 참가는 행을 남기지 않음", repo.get_user_party(11) is None)
+        check("거부 후에도 기존 배정 유지", repo.get_participants("LoL") == {10: "탑"})
+
+        # 기존 DB에 남아 있던 역할 중복 행은 인덱스 생성 전에 정리된다.
+        legacy = pathlib.Path(directory) / "legacy.db"
+        with closing(sqlite3.connect(legacy)) as conn:
+            conn.execute("CREATE TABLE parties (game TEXT PRIMARY KEY, created_at TIMESTAMP)")
+            conn.execute(
+                "CREATE TABLE participants (game TEXT, user_id INTEGER, role TEXT, "
+                "PRIMARY KEY (game, user_id))"
+            )
+            conn.execute("INSERT INTO parties VALUES ('LoL', 1000)")
+            conn.executemany(
+                "INSERT INTO participants VALUES (?, ?, ?)",
+                (("LoL", 1, "탑"), ("LoL", 2, "탑"), ("LoL", 3, "미드")),
+            )
+            conn.commit()
+        legacy_repo = SQLitePartyRepository(legacy)
+        check(
+            "레거시 역할 중복은 가장 이른 행만 남김",
+            legacy_repo.get_participants("LoL") == {1: "탑", 3: "미드"},
+            f"({legacy_repo.get_participants('LoL')})",
+        )
+
+
 def test_party_cog_uses_epoch_seconds():
     from module.playwith_cog import PlayWithCog
 
@@ -1129,6 +1166,7 @@ def test_party_cog_uses_epoch_seconds():
 
         def create_party(self, game, created_at):
             self.created_at = created_at
+            return True
 
         def delete_expired_parties(self, cutoff):
             self.cutoff = cutoff
@@ -1895,6 +1933,7 @@ if __name__ == "__main__":
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
         test_party_repository()
+        test_party_capacity_constraint()
         test_party_cog_uses_epoch_seconds()
         test_factory()
         test_cog_facade()

@@ -753,6 +753,43 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.children[0].custom_id, f"party:join:{game}")
 
 
+class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_selection_of_same_game_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            first = FakeInteraction(channel_id=1)
+            second = FakeInteraction(channel_id=1)
+            select = playwith_cog.GameSelect(cog, [game])
+            select._values = [game]
+
+            await select.callback(first)
+            await select.callback(second)
+
+            self.assertIn("embed", first.response.messages[0][1])
+            args, kwargs = second.response.messages[0]
+            self.assertNotIn("embed", kwargs)
+            self.assertIs(kwargs.get("ephemeral"), True)
+            self.assertIn("이미 생성", args[0])
+
+    async def test_full_party_rejects_further_joins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = "PUBG"  # 역할 없는 게임
+            repository.create_party(game, 1_000)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            for user_id in range(playwith_cog.GAMES[game]["max_players"]):
+                self.assertTrue(cog.add_participant(game, user_id))
+
+            self.assertFalse(cog.add_participant(game, 999))
+            self.assertIsNone(repository.get_user_party(999))
+
+
 class BackupConnectionTests(unittest.TestCase):
     def test_backup_database_connections_are_closed(self):
         with tempfile.TemporaryDirectory() as directory:
