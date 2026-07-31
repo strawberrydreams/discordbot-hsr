@@ -907,6 +907,63 @@ class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(repository.get_user_party(999))
 
 
+class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_leaving_member_frees_party_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            repository.add_participant(game, 42, "탑")
+            repository.add_participant(game, 43, "미드")
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            member = SimpleNamespace(
+                id=42, guild=SimpleNamespace(id=config.DISCORD_GUILD_ID)
+            )
+            await cog.on_member_remove(member)
+
+            self.assertIsNone(repository.get_user_party(42))
+            self.assertEqual(repository.get_participants(game), {43: "미드"})
+            self.assertIsNotNone(repository.get_party(game))
+
+    async def test_last_leaving_member_disbands_the_party(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            repository.add_participant(game, 42, "탑")
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            await cog.on_member_remove(
+                SimpleNamespace(id=42, guild=SimpleNamespace(id=config.DISCORD_GUILD_ID))
+            )
+
+            self.assertIsNone(repository.get_party(game))
+
+    async def test_party_count_matches_listed_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            game = next(iter(playwith_cog.GAMES))
+            repository.create_party(game, 1_000)
+            repository.add_participant(game, 1, "탑")
+            repository.add_participant(game, 2, "미드")  # 서버를 이미 떠난 유저
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+
+            class PartialGuild(FakeGuild):
+                def get_member(self, user_id):
+                    return FakeUser() if user_id == 1 else None
+
+            interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
+            with patch.object(playwith_cog, "RECRUIT_CHANNEL_ID", 1):
+                await PlayWithCog.파티.callback(cog, interaction)
+
+            description = interaction.response.messages[0][1]["embeds"][0].description
+            self.assertIn("현재 인원: 1 /", description)
+
+
 class BackupConnectionTests(unittest.TestCase):
     def test_backup_database_connections_are_closed(self):
         with tempfile.TemporaryDirectory() as directory:

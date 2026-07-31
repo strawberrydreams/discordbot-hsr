@@ -24,6 +24,18 @@ class PlayWithCog(commands.Cog):
     def cog_unload(self):
         self.cleanup_parties.cancel()
 
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """서버를 나간 멤버가 파티 자리와 역할을 영구 점유하지 않게 한다."""
+        if member.guild.id != DISCORD_GUILD_ID:
+            return
+        game = self.get_user_party(member.id)
+        if not game:
+            return
+        self.remove_participant(game, member.id)
+        if not self.get_participants(game):
+            self.delete_party(game)
+
     @tasks.loop(minutes=10)
     async def cleanup_parties(self):
         # Delete parties older than 24 hours
@@ -141,7 +153,7 @@ class PlayWithCog(commands.Cog):
 
             embed = discord.Embed(
                 title=f"{game} 파티 현황",
-                description=f"현재 인원: {len(participants)} / {info['max_players']}",
+                description=f"현재 인원: {len(player_lines)} / {info['max_players']}",
                 color=discord.Color.teal()
             )
             if player_lines:
