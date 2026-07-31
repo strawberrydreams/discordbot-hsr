@@ -8,7 +8,44 @@
 
 Discord 클라이언트의 사용자 설정에서 개발자 모드를 켠 뒤 운영 서버를 우클릭해 서버 ID를 복사하고, `.env.runtime`의 `DISCORD_GUILD_ID`에 넣으세요. 명령 변경은 다음 봇 시작 때 이 운영 길드에 즉시 동기화됩니다.
 
-업그레이드 후 첫 시작은 운영 길드용 명령을 복사한 뒤 기존 전역 명령을 한 번 삭제합니다. 전역 동기화가 성공해야만 `DATA_DIR/.global-commands-cleared` marker가 생성되며, 이후 시작은 전역 API 호출 없이 운영 길드만 동기화합니다. marker를 운영자가 미리 만들지 마세요.
+업그레이드 후 첫 시작은 운영 길드용 명령을 복사한 뒤 기존 전역 명령을 한 번 삭제합니다. 전역 동기화가 성공해야만 `runtime/.global-commands-cleared` marker가 생성되며, 이후 시작은 전역 API 호출 없이 운영 길드만 동기화합니다. marker를 운영자가 미리 만들지 마세요.
+
+이 marker는 데이터가 아니라 봇 설치 상태이므로 `DATA_DIR` 밖(`runtime/`)에 두어 백업 대상에서 제외합니다. 구버전 위치(`DATA_DIR/.global-commands-cleared`)에 파일이 있으면 첫 시작에서 새 위치로 자동 이관하므로 재-sync가 일어나지 않습니다.
+
+봇은 `DISCORD_GUILD_ID`로 지정한 길드 밖에서는 동작하지 않습니다. 다른 길드나 DM의 메시지는 금지어 검사와 경고 카운트 대상이 아니고, 파티 참가 버튼과 슬래시 명령도 거부됩니다.
+
+### 포인트 경제
+
+포인트의 유일한 수입원은 `/출석`입니다(하루 5,000~30,000 P, 평균 17,500 P). 통화를 발행하는 다른 경로를 추가하지 마세요 — 발행처가 둘이면 아래 가격의 근거가 무너집니다. 이 이유로 `/럭키박스`는 제거했습니다.
+
+| 명령 | 가격 | 평균 수입 기준 하루 한도 | 상수 |
+|---|---|---|---|
+| `/기본대화` | 200 P | 약 87회 | `hyacine_chat_cog.LIGHT_COST` |
+| `/고급대화` | 2,000 P | 약 8.7회 | `hyacine_chat_cog.DEEP_COST` |
+| `/이미지` | 30,000 P | 약 0.6회(이틀에 1회) | `hyacine_image_cog.IMAGE_COST` |
+
+가격을 조정할 때는 구현 계획(`docs/superpowers/plans/2026-07-30-followup-hardening.md`)의 「포인트 경제 근거」 절을 함께 갱신하세요.
+
+포인트는 유량이 아니라 저량이므로 누적 잔액을 한 번에 소진하는 버스트가 남습니다. `.env.runtime`의 `AI_COOLDOWN_SECONDS`(기본 15초)가 사용자별로 그 속도를 제한합니다. 값을 바꾼 뒤에는 봇을 재시작하세요.
+
+**최후의 안전망은 앱이 아니라 OpenAI 계정 예산 한도입니다.** 앱에는 전역 kill switch를 두지 않았으므로, OpenAI 대시보드에서 월 예산 상한을 반드시 설정해 두세요.
+
+### 포인트 원장으로 환불 실패 대조하기
+
+모든 포인트 이동은 `attendance_data.db`의 `point_ledger` 테이블에 append-only로 기록됩니다(`delta`, `reason`, `created_at` epoch 초). 실패한 차감은 기록되지 않습니다. 사용자가 "자동 환불에 실패했습니다. 관리자에게 수동 정산을 요청해 주세요" 안내를 받았다면 다음으로 대조합니다.
+
+```bash
+.venv/bin/python -c '
+from module.database import create_attendance_repository
+import datetime
+USER_ID = 000000000000000000  # 대상 사용자 ID로 교체
+repo = create_attendance_repository()
+for delta, reason, at in repo.get_ledger(USER_ID, limit=50):
+    print(datetime.datetime.fromtimestamp(at), f"{delta:+,}", reason)
+print("잔액:", repo.get_points(USER_ID))'
+```
+
+`chat:<model>` / `image` 차감에 짝이 되는 `chat_refund:<model>` / `image_refund` 행이 없으면 환불이 누락된 것입니다. 원장 합계는 항상 현재 잔액과 일치해야 합니다.
 
 이전 버전의 파티 `created_at` 중 timezone이 없는 값은 Docker가 UTC, launchd가 KST로 기록했을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석합니다. 기존 launchd 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
 
@@ -115,6 +152,10 @@ Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 ```
 
 `verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+
+DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도** `-shm`/`-wal` 파일을 만들 수 있어야 하므로, Docker `backup` 서비스의 `./runtime/data` 마운트는 `:ro`가 아니라 쓰기 가능해야 합니다. `:ro`로 되돌리면 봇이 정지한 상태(= `-shm` 부재)에서만 백업이 `attempt to write a readonly database`로 실패하고, `module.backup loop`이 예외를 삼켜 조용히 재시도만 반복합니다. 백업 코드는 SQLite 온라인 백업 API로 읽기만 하므로 rw 마운트가 데이터를 바꾸지는 않습니다.
+
+`backup` 서비스에는 `.env.secrets`를 전달하지 않습니다. `module.backup`은 Discord·OpenAI·Google 자격증명을 사용하지 않고 `module/config.py`가 import 시점에 `validate_config()`를 부르지 않으므로, 토큰 없이도 정상 기동합니다.
 
 `runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
 

@@ -98,6 +98,7 @@ class FakeInteraction:
         self.response = RecordingResponse()
         self.followup = RecordingFollowup()
         self.guild = guild
+        self.created_at = datetime.now(timezone.utc)
         # 기본값은 설정된 길드 — 경계 테스트만 다른 값을 넘긴다.
         self.guild_id = config.DISCORD_GUILD_ID if guild_id is None else guild_id
 
@@ -582,7 +583,7 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
 
-    def test_every_ai_command_carries_a_cooldown(self):
+    async def test_every_ai_command_carries_a_cooldown(self):
         chat = HyacineChatCog(bot=None)
         image = HyacineImageCog(bot=None)
         commands = {
@@ -592,9 +593,16 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         }
         for name, command in commands.items():
             with self.subTest(command=name):
-                self.assertIsNotNone(command._buckets.cooldown)
-                self.assertEqual(
-                    command._buckets.cooldown.per, config.AI_COOLDOWN_SECONDS
+                self.assertTrue(command.checks, "쿨다운 검사가 등록되어 있지 않다")
+                predicate = command.checks[0]
+                interaction = FakeInteraction(channel_id=1)
+                self.assertTrue(await predicate(interaction))
+                with self.assertRaises(
+                    discord.app_commands.CommandOnCooldown
+                ) as raised:
+                    await predicate(FakeInteraction(channel_id=1))
+                self.assertLessEqual(
+                    raised.exception.retry_after, config.AI_COOLDOWN_SECONDS
                 )
         self.assertTrue(hasattr(chat, "cog_app_command_error"))
         self.assertTrue(hasattr(image, "cog_app_command_error"))
@@ -929,6 +937,9 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
             interaction_check = None
 
             def copy_global_to(self, *, guild):
+                pass
+
+            def clear_commands(self, *, guild):
                 pass
 
             async def sync(self, *, guild=None):
