@@ -135,6 +135,62 @@ class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(interaction.followup.messages[0][1]["embed"].fields), len(cog.tickers))
 
 
+class FinanceTimeoutAndCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_ticker_does_not_block_the_other_results(self):
+        cog = FinanceCog(bot=None)
+        slow_symbol = list(cog.tickers.values())[0]
+
+        def fetch(symbol):
+            return {"price": 1.0, "change": 0.0, "change_percent": 0.0}
+
+        async def maybe_hang(function, symbol):
+            if symbol == slow_symbol:
+                await asyncio.sleep(10)
+            return function(symbol)
+
+        interaction = FakeInteraction(channel_id=1)
+        with patch.object(FinanceCog, "get_stock_data", side_effect=fetch), patch(
+            "module.finance_cog.FETCH_TIMEOUT_SECONDS", 0.05
+        ), patch("module.finance_cog.asyncio.to_thread", side_effect=maybe_hang):
+            await asyncio.wait_for(
+                FinanceCog.stock_price.callback(cog, interaction), timeout=2
+            )
+
+        fields = interaction.followup.messages[0][1]["embed"].fields
+        failed = [field for field in fields if field.value == "데이터 조회 실패"]
+        self.assertEqual(len(fields), len(cog.tickers))
+        self.assertEqual(len(failed), 1)
+
+    async def test_second_call_within_ttl_uses_cache(self):
+        cog = FinanceCog(bot=None)
+        calls = []
+
+        def fetch(symbol):
+            calls.append(symbol)
+            return {"price": 1.0, "change": 0.0, "change_percent": 0.0}
+
+        with patch.object(FinanceCog, "get_stock_data", side_effect=fetch):
+            await FinanceCog.stock_price.callback(cog, FakeInteraction(channel_id=1))
+            self.assertEqual(len(calls), len(cog.tickers))
+            await FinanceCog.stock_price.callback(cog, FakeInteraction(channel_id=1))
+            self.assertEqual(len(calls), len(cog.tickers))
+
+    async def test_expired_cache_is_served_when_the_fetch_times_out(self):
+        cog = FinanceCog(bot=None)
+        symbol = list(cog.tickers.values())[0]
+        cog._cache[symbol] = (0.0, {"price": 9.0, "change": 0.0, "change_percent": 0.0})
+
+        async def always_hang(function, argument):
+            await asyncio.sleep(10)
+
+        with patch("module.finance_cog.CACHE_TTL_SECONDS", 0.0), patch(
+            "module.finance_cog.FETCH_TIMEOUT_SECONDS", 0.05
+        ), patch("module.finance_cog.asyncio.to_thread", side_effect=always_hang):
+            data = await cog._fetch(symbol)
+
+        self.assertEqual(data["price"], 9.0)
+
+
 class RecordingAttendance:
     def __init__(self, refund_error=None):
         self.deductions = []

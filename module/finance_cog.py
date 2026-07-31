@@ -1,4 +1,6 @@
 import asyncio
+import time
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -6,9 +8,16 @@ import yfinance as yf
 from datetime import datetime
 import pytz
 
+# Yahoo가 응답을 끌면 스레드 풀 슬롯을 점유한 채 인터랙션이 만료된다.
+FETCH_TIMEOUT_SECONDS = 8.0
+# TTL 캐시는 지연과 남용 경로를 함께 줄인다.
+CACHE_TTL_SECONDS = 60.0
+
+
 class FinanceCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._cache = {}  # symbol -> (fetched_at, data)
         # Ticker configuration
         self.tickers = {
             "S&P 500": "^GSPC",
@@ -51,6 +60,20 @@ class FinanceCog(commands.Cog):
             print(f"Error fetching data for {ticker_symbol}: {e}")
             return None
 
+    async def _fetch(self, symbol):
+        cached = self._cache.get(symbol)
+        if cached and time.monotonic() - cached[0] < CACHE_TTL_SECONDS:
+            return cached[1]
+        try:
+            data = await asyncio.wait_for(
+                asyncio.to_thread(self.get_stock_data, symbol),
+                timeout=FETCH_TIMEOUT_SECONDS,
+            )
+        except Exception:  # TimeoutError 포함
+            return cached[1] if cached else None  # 만료된 캐시라도 있으면 그것을 쓴다
+        self._cache[symbol] = (time.monotonic(), data)
+        return data
+
     @app_commands.command(name="주가", description="주요 금융 지표(S&P500, 나스닥, 미국 국채, 유가, 코인, 금)의 실시간 시세를 조회합니다.")
     async def stock_price(self, interaction: discord.Interaction):
         await interaction.response.defer() # Fetching data might take a few seconds
@@ -62,9 +85,7 @@ class FinanceCog(commands.Cog):
         )
 
         items = list(self.tickers.items())
-        results = await asyncio.gather(
-            *(asyncio.to_thread(self.get_stock_data, symbol) for _, symbol in items)
-        )
+        results = await asyncio.gather(*(self._fetch(symbol) for _, symbol in items))
 
         # Iterate through tickers and add fields
         for (name, _), data in zip(items, results):
