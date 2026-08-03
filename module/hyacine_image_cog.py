@@ -23,9 +23,8 @@ MAX_PROMPT_DISPLAY = 1_000
 TEMP_IMAGE_TTL_SECONDS = 300
 
 class HyacineImageCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, nickname: str = "회색"):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.nickname = nickname
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
         
         # CWD 상대 경로는 Docker 볼륨 밖이라 재시작 시 고아 파일이 남는다.

@@ -1259,3 +1259,30 @@ class SettingsLoaderTest(unittest.TestCase):
             (pathlib.Path(directory) / "a.json").write_text("{not json", encoding="utf-8")
             with self._with_settings_dir(directory):
                 self.assertEqual(config.load_settings_json("a.json", default={}), {})
+
+
+class PersonaExternalizationTest(unittest.TestCase):
+    def test_persona_comes_from_settings_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "persona.json").write_text(
+                json.dumps({"system_prompt": "테스트 프롬프트", "greeting": "테스트 인사"}),
+                encoding="utf-8",
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                cog = HyacineChatCog(bot=None)
+        self.assertEqual(cog.system_prompt, "테스트 프롬프트")
+        self.assertEqual(cog.greeting, "테스트 인사")
+
+    def test_missing_persona_keys_fall_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "persona.json").write_text(
+                json.dumps({"system_prompt": "프롬프트만"}), encoding="utf-8"
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                cog = HyacineChatCog(bot=None)
+        self.assertEqual(cog.system_prompt, "프롬프트만")
+        self.assertTrue(cog.greeting)
+
+    def test_constructors_take_no_nickname(self):
+        with self.assertRaises(TypeError):
+            HyacineChatCog(bot=None, nickname="회색")
