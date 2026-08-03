@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     volumes:
+      - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
     logging:
