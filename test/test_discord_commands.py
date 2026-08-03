@@ -314,6 +314,11 @@ class RecordingAttendance:
 
 
 class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.google_key = patch("module.hyacine_image_cog.GOOGLE_API_KEY", "test-dummy")
+        self.google_key.start()
+        self.addCleanup(self.google_key.stop)
+
     async def test_defer_and_refund_failures_request_manual_reconciliation_once(self):
         attendance = RecordingAttendance(
             refund_error=RuntimeError("database unavailable")
@@ -682,6 +687,9 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
+        self.google_key = patch("module.hyacine_image_cog.GOOGLE_API_KEY", "test-dummy")
+        self.google_key.start()
+        self.addCleanup(self.google_key.stop)
 
     async def test_every_ai_command_carries_a_cooldown(self):
         chat = HyacineChatCog(bot=None)
