@@ -94,17 +94,30 @@ def validate_config() -> None:
         raise RuntimeError("현재 지원하는 DB_BACKEND는 sqlite뿐입니다.")
 
 
-GAMES = {
-    "League of Legends": {
-        "max_players": 5,
-        "roles": ["탑", "정글", "미드", "원딜", "서포터"],
-    },
-    "PUBG": {
-        "max_players": 4,
-        "roles": [],
-    },
-    "Overwatch": {
-        "max_players": 5,
-        "roles": ["딜러1", "딜러2", "탱커", "힐러1", "힐러2"],
-    },
-}
+def load_games() -> dict:
+    """settings/games.json → games.example.json 순으로 읽는다.
+
+    형태가 어긋난 항목은 버린다. playwith_cog가 max_players/roles를 무조건
+    참조하므로, 잘못된 항목 하나가 파티 기능 전체를 깨뜨리면 안 된다.
+    """
+    raw = load_settings_json("games.json", "games.example.json", default={})
+    if not isinstance(raw, dict):
+        return {}
+    games = {}
+    for name, info in raw.items():
+        if not isinstance(info, dict):
+            print(f"⚠️ games.json 항목이 객체가 아닙니다: {name}")
+            continue
+        max_players = info.get("max_players")
+        roles = info.get("roles", [])
+        if not isinstance(max_players, int) or max_players <= 0:
+            print(f"⚠️ games.json의 max_players가 양의 정수가 아닙니다: {name}")
+            continue
+        if not isinstance(roles, list) or not all(isinstance(r, str) for r in roles):
+            print(f"⚠️ games.json의 roles가 문자열 배열이 아닙니다: {name}")
+            continue
+        games[name] = {"max_players": max_players, "roles": roles}
+    return games
+
+
+GAMES = load_games()

@@ -1261,6 +1261,29 @@ class SettingsLoaderTest(unittest.TestCase):
                 self.assertEqual(config.load_settings_json("a.json", default={}), {})
 
 
+class GamesExternalizationTest(unittest.TestCase):
+    def test_games_load_from_settings_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "games.json").write_text(
+                json.dumps({"Test Game": {"max_players": 2, "roles": ["A", "B"]}}),
+                encoding="utf-8",
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                games = config.load_games()
+        self.assertEqual(games["Test Game"]["max_players"], 2)
+
+    def test_malformed_entries_are_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "games.json").write_text(
+                json.dumps({"Good": {"max_players": 2, "roles": []}, "Bad": "문자열"}),
+                encoding="utf-8",
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                games = config.load_games()
+        self.assertIn("Good", games)
+        self.assertNotIn("Bad", games)
+
+
 class PersonaExternalizationTest(unittest.TestCase):
     def test_persona_comes_from_settings_file(self):
         with tempfile.TemporaryDirectory() as directory:
