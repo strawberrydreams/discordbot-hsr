@@ -55,7 +55,7 @@ def load_settings_json(*names: str, default):
                 return json.load(fp)
         except FileNotFoundError:
             continue
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             print(f"⚠️ 설정 파일을 읽을 수 없습니다: {path} ({exc})")
             continue
     return default

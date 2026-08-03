@@ -1305,6 +1305,12 @@ class SettingsLoaderTest(unittest.TestCase):
             with self._with_settings_dir(directory):
                 self.assertEqual(config.load_settings_json("a.json", default={}), {})
 
+    def test_non_utf8_json_falls_back_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "a.json").write_bytes(b"\xff")
+            with self._with_settings_dir(directory):
+                self.assertEqual(config.load_settings_json("a.json", default={}), {})
+
 
 class GamesExternalizationTest(unittest.TestCase):
     def test_games_load_from_settings_file(self):
