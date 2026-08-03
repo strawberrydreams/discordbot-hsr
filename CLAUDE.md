@@ -9,7 +9,7 @@
 - 이력에 있는 OpenAI / Google API 키도 동일하게 교체되었습니다.
 - 실제 유효한 자격증명은 git이 추적하지 않는 `.env.secrets` / `.env.runtime`에만 존재하며, 두 파일 모두 `.gitignore`에 등재되어 있습니다.
 
-따라서 이력 rewrite(`git filter-repo`, BFG 등)는 **필요하지 않습니다.** 이미 push된 커밋이라 rewrite로 회수되지 않고, 값이 무효인 이상 실익이 없습니다. 원 판단 근거는 `docs/superpowers/plans/2026-07-30-followup-hardening.md`의 "Explicitly Deferred or Excluded" 절에 있습니다.
+따라서 이력 rewrite(`git filter-repo`, BFG 등)는 **필요하지 않습니다.** 이미 push된 커밋이라 rewrite로 회수되지 않고, 값이 무효인 이상 실익이 없습니다.
 
 새로 발생한 유출을 발견한 경우에만 보고하세요. 위 항목의 재발견은 보고 대상이 아닙니다.
 

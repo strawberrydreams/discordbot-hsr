@@ -11,7 +11,7 @@ from discord.ext import commands
 from google import genai
 from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL
 
-# 평균 출석 수입(17,500 P/일) 기준 이틀에 1회. 「포인트 경제 근거」 절 참조.
+# 평균 출석 수입(17,500 P/일) 기준 이틀에 1회.
 IMAGE_COST = 30_000
 
 # 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패하고 환불도 못 한다.
@@ -62,7 +62,7 @@ class HyacineImageCog(commands.Cog):
             return
         raise error
 
-    @app_commands.command(name="이미지", description="Nano Banana 2에게 그림을 그려달라고 요청합니다. (30,000 P)")
+    @app_commands.command(name="이미지", description="AI에게 그림을 그려달라고 요청합니다. (30,000 P)")
     @app_commands.describe(프롬프트="그려줘! 라고 할 내용")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _image(self, inter: discord.Interaction, 프롬프트: str):

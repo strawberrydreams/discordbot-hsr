@@ -55,7 +55,7 @@ def load_settings_json(*names: str, default):
                 return json.load(fp)
         except FileNotFoundError:
             continue
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             print(f"⚠️ 설정 파일을 읽을 수 없습니다: {path} ({exc})")
             continue
     return default
@@ -123,15 +123,19 @@ def load_games() -> dict:
             continue
         max_players = info.get("max_players")
         roles = info.get("roles", [])
-        if type(max_players) is not int or max_players <= 0:
-            print(f"⚠️ games.json의 max_players가 양의 정수가 아닙니다: {name}")
+        if type(max_players) is not int or not 1 <= max_players <= 25:
+            print(f"⚠️ games.json의 max_players가 1~25의 정수가 아닙니다: {name}")
             continue
         if (
             not isinstance(roles, list)
             or len(roles) > 25
             or not all(isinstance(role, str) and 1 <= len(role) <= 100 for role in roles)
+            or len(", ".join(roles)) > 1_024
         ):
-            print(f"⚠️ games.json의 roles가 최대 25개의 1~100자 문자열 배열이 아닙니다: {name}")
+            print(
+                "⚠️ games.json의 roles가 최대 25개·각 1~100자·합계 1,024자 이내가 "
+                f"아닙니다: {name}"
+            )
             continue
         if len(games) == 25:
             print("⚠️ games.json의 게임 수가 Discord 선택 메뉴 한도(25개)를 넘습니다.")

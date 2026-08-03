@@ -7,6 +7,8 @@ venv
 .env.secrets
 .env.runtime
 settings/*.env
+settings/*.json
+!settings/*.example.json
 runtime
 data
 backups

@@ -13,6 +13,19 @@ from module.database import (
     run_db,
 )
 
+EMBED_FIELD_VALUE_LIMIT = 1_024
+EMBEDS_PER_MESSAGE = 10
+EMBED_TOTAL_LIMIT = 6_000
+
+
+def _bounded_field_value(value: str) -> str:
+    return (
+        value
+        if len(value) <= EMBED_FIELD_VALUE_LIMIT
+        else value[: EMBED_FIELD_VALUE_LIMIT - 1] + "…"
+    )
+
+
 class PlayWithCog(commands.Cog):
     def __init__(
         self,
@@ -201,7 +214,11 @@ class PlayWithCog(commands.Cog):
                 color=discord.Color.teal()
             )
             if player_lines:
-                embed.add_field(name="👥 참가자", value="\n".join(player_lines), inline=False)
+                embed.add_field(
+                    name="👥 참가자",
+                    value=_bounded_field_value("\n".join(player_lines)),
+                    inline=False,
+                )
 
             if info["roles"]:
                 role_lines = []
@@ -209,12 +226,27 @@ class PlayWithCog(commands.Cog):
                     key = role.strip().lower()
                     members = role_members.get(key, [])
                     role_lines.append(f"{role}: {', '.join(members) if members else ''}")
-                embed.add_field(name="🧙 역할 현황", value="\n".join(role_lines), inline=False)
+                embed.add_field(
+                    name="🧙 역할 현황",
+                    value=_bounded_field_value("\n".join(role_lines)),
+                    inline=False,
+                )
 
             embeds.append(embed)
 
         if embeds:
-            await interaction.response.send_message(embeds=embeds)
+            batches = []
+            for embed in embeds:
+                if (
+                    not batches
+                    or len(batches[-1]) == EMBEDS_PER_MESSAGE
+                    or sum(map(len, batches[-1])) + len(embed) > EMBED_TOTAL_LIMIT
+                ):
+                    batches.append([])
+                batches[-1].append(embed)
+            await interaction.response.send_message(embeds=batches[0])
+            for batch in batches[1:]:
+                await interaction.followup.send(embeds=batch)
         else:
             await interaction.response.send_message("📭 현재 모집 중인 파티가 없습니다.")
 
@@ -270,7 +302,11 @@ async def send_party_embed(cog, interaction, game):
         color=discord.Color.green()
     )
     if info["roles"]:
-        embed.add_field(name="역할 목록", value=", ".join(info["roles"]), inline=False)
+        embed.add_field(
+            name="역할 목록",
+            value=_bounded_field_value(", ".join(info["roles"])),
+            inline=False,
+        )
 
     view = cog.shared_views[game]
 

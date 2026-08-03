@@ -32,6 +32,18 @@ import module.backup as backup
 # 단일 운영 길드를 전제하던 상수가 사라졌다. 테스트는 임의의 길드 하나를 쓴다.
 TEST_GUILD_ID = 4_242
 
+_PARTY_TEST_GAMES = {
+    "League of Legends": {"max_players": 5, "roles": ["탑", "정글", "미드", "원딜", "서포터"]},
+    "PUBG": {"max_players": 4, "roles": []},
+    "Overwatch": {"max_players": 5, "roles": ["딜러1", "딜러2", "탱커", "힐러1", "힐러2"]},
+}
+
+
+def setUpModule():
+    games_patch = patch.object(playwith_cog, "GAMES", _PARTY_TEST_GAMES)
+    games_patch.start()
+    unittest.addModuleCleanup(games_patch.stop)
+
 
 class MinimalConfigTest(unittest.TestCase):
     def test_only_discord_token_is_required(self):
@@ -715,6 +727,18 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hasattr(chat, "cog_app_command_error"))
         self.assertTrue(hasattr(image, "cog_app_command_error"))
 
+    def test_ai_command_descriptions_are_model_neutral(self):
+        descriptions = " ".join(
+            command.description
+            for command in (
+                HyacineChatCog._light_talk,
+                HyacineChatCog._deep_talk,
+                HyacineImageCog._image,
+            )
+        )
+        for model_label in ("GPT-5.6", "Terra", "Sol", "Nano Banana"):
+            self.assertNotIn(model_label, descriptions)
+
     async def test_cooldown_notice_is_ephemeral_and_charges_nothing(self):
         attendance = RecordingAttendance()
         cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
@@ -938,6 +962,53 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(interaction.response.messages), 1)
         self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 2)
+
+    async def test_party_status_batches_eleven_active_games(self):
+        games = {
+            f"Game {index}": {"max_players": 1, "roles": []}
+            for index in range(11)
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            playwith_cog, "GAMES", games
+        ):
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            for game in games:
+                repository.create_party(TEST_GUILD_ID, game, 1_000)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
+
+            with _recruit_channel(cog, 1):
+                await PlayWithCog.파티.callback(cog, interaction)
+
+        self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 10)
+        self.assertEqual(len(interaction.followup.messages), 1)
+        self.assertEqual(len(interaction.followup.messages[0][1]["embeds"]), 1)
+
+    async def test_largest_party_roster_keeps_embed_fields_within_discord_limit(self):
+        roles = [f"{index:02d}" + "r" * 37 for index in range(25)]
+        games = {"Max Roster": {"max_players": 25, "roles": roles}}
+
+        class MentionGuild(FakeGuild):
+            def get_member(self, user_id):
+                return SimpleNamespace(mention=f"<@{10**18 + user_id}>")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            playwith_cog, "GAMES", games
+        ):
+            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            repository.create_party(TEST_GUILD_ID, "Max Roster", 1_000)
+            for user_id, role in enumerate(roles):
+                repository.add_participant(TEST_GUILD_ID, "Max Roster", user_id, role)
+            with patch("discord.ext.tasks.Loop.start"):
+                cog = PlayWithCog(bot=None, repository=repository)
+            interaction = FakeInteraction(channel_id=1, guild=MentionGuild())
+
+            with _recruit_channel(cog, 1):
+                await PlayWithCog.파티.callback(cog, interaction)
+
+        fields = interaction.response.messages[0][1]["embeds"][0].fields
+        self.assertEqual([len(field.value) for field in fields], [1_024, 1_024])
 
     def test_join_views_are_persistent_and_registered_at_cog_load(self):
         class Bot:
@@ -1319,6 +1390,30 @@ class SettingsLoaderTest(unittest.TestCase):
             with self._with_settings_dir(directory):
                 self.assertEqual(config.load_settings_json("a.json", default={}), {})
 
+    def test_integer_beyond_digit_limit_falls_back_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "a.json").write_text(
+                "1" * 5_000, encoding="utf-8"
+            )
+            with self._with_settings_dir(directory):
+                self.assertEqual(config.load_settings_json("a.json", default={}), {})
+
+    def test_excessive_nesting_falls_back_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "a.json").write_text(
+                "[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8"
+            )
+            with self._with_settings_dir(directory):
+                self.assertEqual(config.load_settings_json("a.json", default={}), {})
+
+    def test_process_control_exceptions_still_escape(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "module.config.json.load", side_effect=KeyboardInterrupt
+        ):
+            (pathlib.Path(directory) / "a.json").touch()
+            with self._with_settings_dir(directory), self.assertRaises(KeyboardInterrupt):
+                config.load_settings_json("a.json", default={})
+
 
 class GamesExternalizationTest(unittest.TestCase):
     def test_games_load_from_settings_file(self):
@@ -1379,6 +1474,25 @@ class GamesExternalizationTest(unittest.TestCase):
 
         self.assertNotIn("Boolean Capacity", games)
 
+    def test_largest_roster_and_aggregate_role_bounds_are_enforced(self):
+        roles = [f"{index:02d}" + "r" * 37 for index in range(25)]
+        roster = {
+            "Largest": {"max_players": 25, "roles": roles},
+            "Too Many Players": {"max_players": 26, "roles": []},
+            "Too Much Role Text": {
+                "max_players": 25,
+                "roles": [*roles[:-1], roles[-1] + "xx"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "games.json").write_text(
+                json.dumps(roster), encoding="utf-8"
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                games = config.load_games()
+
+        self.assertEqual(games, {"Largest": roster["Largest"]})
+
 
 class PersonaExternalizationTest(unittest.TestCase):
     def setUp(self):
@@ -1424,3 +1538,59 @@ class PersonaExternalizationTest(unittest.TestCase):
             HyacineChatCog(bot=None, nickname="회색")
         with self.assertRaises(TypeError):
             HyacineImageCog(bot=None, nickname="회색")
+
+
+class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
+    async def test_new_session_refreshes_persona_without_changing_old_session(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy"
+        ):
+            persona_path = pathlib.Path(directory) / "persona.json"
+            persona_path.write_text(
+                json.dumps({"system_prompt": "old prompt", "greeting": "old greeting"}),
+                encoding="utf-8",
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                cog = HyacineChatCog(bot=None)
+                old_session = cog.get_session(1)
+                persona_path.write_text(
+                    json.dumps({"system_prompt": "new prompt", "greeting": "new greeting"}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(cog.greeting, "old greeting")
+                new_session = cog.get_session(2)
+
+                captured_instructions = []
+
+                async def response(**kwargs):
+                    captured_instructions.append(kwargs["instructions"])
+                    return SimpleNamespace(
+                        output_text="reply",
+                        model="test-model",
+                        usage=SimpleNamespace(
+                            input_tokens=1, output_tokens=1, total_tokens=2
+                        ),
+                    )
+
+                cog.client = SimpleNamespace(
+                    responses=SimpleNamespace(create=response)
+                )
+                await cog._run_talk(
+                    FakeInteraction(channel_id=1), "old", None, "test-model", "none", 0
+                )
+                await cog._run_talk(
+                    FakeInteraction(channel_id=2), "new", None, "test-model", "none", 0
+                )
+                old_hello = FakeInteraction(channel_id=1)
+                new_hello = FakeInteraction(channel_id=2)
+                await HyacineChatCog._hello.callback(cog, old_hello)
+                await HyacineChatCog._hello.callback(cog, new_hello)
+
+        self.assertEqual(old_session.system_prompt, "old prompt")
+        self.assertEqual(new_session.system_prompt, "new prompt")
+        self.assertEqual(old_session.greeting, "old greeting")
+        self.assertEqual(new_session.greeting, "new greeting")
+        self.assertEqual(cog.greeting, "new greeting")
+        self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
+        self.assertIn("old greeting", old_hello.response.messages[0][0][0])
+        self.assertIn("new greeting", new_hello.response.messages[0][0][0])

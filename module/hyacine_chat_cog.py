@@ -16,7 +16,6 @@ from module.config import (
 )
 
 # 포인트 수입원은 /출석 하나뿐이다. 가격이 곧 하루 사용 빈도 상한이 된다.
-# 값을 바꿀 때 docs/superpowers/plans의 「포인트 경제 근거」 절을 함께 갱신한다.
 LIGHT_COST = 200
 DEEP_COST = 2_000
 
@@ -38,7 +37,9 @@ class ChannelSession:
     """채널 하나의 대화 상태 (히스토리, 사용량).
     채널별로 분리하여 다른 채널의 대화 내용이 섞이지 않도록 한다."""
 
-    def __init__(self, system_prompt: str):
+    def __init__(self, system_prompt: str, greeting: str):
+        self.system_prompt = system_prompt
+        self.greeting = greeting
         self.history: deque[Dict[str, Any]] = deque(
             [{"role": "system", "content": system_prompt}],
             maxlen=120
@@ -70,7 +71,10 @@ class HyacineChatCog(commands.Cog):
         """채널의 세션을 가져오거나 새로 만든다."""
         session = self.sessions.pop(channel_id, None)
         if session is None:
-            session = ChannelSession(self.system_prompt)
+            persona = load_persona()
+            self.system_prompt = persona["system_prompt"]
+            self.greeting = persona["greeting"]
+            session = ChannelSession(self.system_prompt, self.greeting)
         self.sessions[channel_id] = session
         while len(self.sessions) > self.MAX_CHANNEL_SESSIONS:
             # 응답 대기 중인 세션을 버리면 코루틴이 고아 객체에 append해 턴이 유실된다.
@@ -221,7 +225,7 @@ class HyacineChatCog(commands.Cog):
 
                 kwargs = {
                     "model": model,
-                    "instructions": self.system_prompt,
+                    "instructions": session.system_prompt,
                     "input": recent_turns + [{"role": "user", "content": parts}],
                     "max_output_tokens": max_tokens,
                     "reasoning": {"effort": reasoning_effort},
@@ -292,7 +296,7 @@ class HyacineChatCog(commands.Cog):
             return
         raise error
 
-    @app_commands.command(name="기본대화", description="GPT-5.6 Terra와 빠르게 대화합니다. (200 P)")
+    @app_commands.command(name="기본대화", description="AI와 빠르게 대화합니다. (200 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _light_talk(
@@ -303,7 +307,7 @@ class HyacineChatCog(commands.Cog):
     ):
         await self._run_talk(inter, 내용, 이미지, LIGHT_MODEL, "none", LIGHT_COST)
 
-    @app_commands.command(name="고급대화", description="GPT-5.6 Sol과 깊이 대화합니다. (2,000 P)")
+    @app_commands.command(name="고급대화", description="AI와 깊이 대화합니다. (2,000 P)")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _deep_talk(
@@ -332,8 +336,9 @@ class HyacineChatCog(commands.Cog):
 
     @app_commands.command(name="인사", description="가벼운 인삿말")
     async def _hello(self, interaction: discord.Interaction):
+        session = self.get_session(interaction.channel_id)
         await interaction.response.send_message(
-            f"{interaction.user.mention}, {self.greeting}"
+            f"{interaction.user.mention}, {session.greeting}"
         )
 
 async def setup(bot: commands.Bot):

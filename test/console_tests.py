@@ -250,6 +250,17 @@ def test_deployment_contracts():
     import plistlib
 
     services = None
+    dockerignore = (
+        (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    )
+    check(
+        "Docker build context excludes private settings JSON only",
+        "settings/*.env" in dockerignore
+        and "settings/*.json" in dockerignore
+        and "!settings/*.example.json" in dockerignore
+        and dockerignore.index("settings/*.json")
+        < dockerignore.index("!settings/*.example.json"),
+    )
     docker = shutil.which("docker")
     if docker is not None:
         compose_version = subprocess.run(
