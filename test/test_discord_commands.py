@@ -1373,6 +1373,11 @@ class GamesExternalizationTest(unittest.TestCase):
 
 
 class PersonaExternalizationTest(unittest.TestCase):
+    def setUp(self):
+        self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
+        self.openai_key.start()
+        self.addCleanup(self.openai_key.stop)
+
     def test_persona_comes_from_settings_file(self):
         with tempfile.TemporaryDirectory() as directory:
             (pathlib.Path(directory) / "persona.json").write_text(
@@ -1394,6 +1399,20 @@ class PersonaExternalizationTest(unittest.TestCase):
         self.assertEqual(cog.system_prompt, "프롬프트만")
         self.assertTrue(cog.greeting)
 
+    def test_missing_system_prompt_keeps_hyacine_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "persona.json").write_text(
+                json.dumps({"greeting": "테스트 인사"}), encoding="utf-8"
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                cog = HyacineChatCog(bot=None)
+
+        self.assertIn("히아킨", cog.system_prompt)
+        self.assertIn("회색둥이 씨", cog.system_prompt)
+        self.assertEqual(cog.greeting, "테스트 인사")
+
     def test_constructors_take_no_nickname(self):
         with self.assertRaises(TypeError):
             HyacineChatCog(bot=None, nickname="회색")
+        with self.assertRaises(TypeError):
+            HyacineImageCog(bot=None, nickname="회색")
