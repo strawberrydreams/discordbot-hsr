@@ -39,7 +39,6 @@ from dotenv import dotenv_values
 _TMP_DIR = pathlib.Path(tempfile.mkdtemp(prefix="hsr_test_"))
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 os.environ["DATA_DIR"] = str(_TMP_DIR)
-os.environ["FORBIDDEN_WORDS_FILE"] = str(_TMP_DIR / "forbidden_words.json")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
 
@@ -108,31 +107,6 @@ def test_config_paths():
     check("PROJECT_ROOT는 절대 경로", config.PROJECT_ROOT.is_absolute())
     check("DATA_DIR는 절대 경로", config.DATA_DIR.is_absolute())
     check("BACKUP_DIR는 절대 경로", config.BACKUP_DIR.is_absolute())
-    check("금지어 경로는 절대 경로", config.FORBIDDEN_WORDS_FILE.is_absolute())
-    check(
-        "금지어 파일은 DATA_DIR에 저장",
-        config.FORBIDDEN_WORDS_FILE == config.DATA_DIR / "forbidden_words.json",
-    )
-    check(
-        "runtime 금지어 파일은 Git ignore",
-        subprocess.run(
-            ["git", "check-ignore", "-q", "runtime/data/forbidden_words.json"],
-            cwd=PROJECT_ROOT,
-            check=False,
-        ).returncode
-        == 0,
-    )
-    check(
-        "실제 금지어 파일은 Git 비추적",
-        subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "runtime/data/forbidden_words.json"],
-            cwd=PROJECT_ROOT,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        != 0,
-    )
     check(
         "금지어 예시 파일은 Git 추적",
         subprocess.run(
@@ -144,29 +118,6 @@ def test_config_paths():
         ).returncode
         == 0,
     )
-
-
-def test_forbidden_words_default_uses_data_dir():
-    import module.config as config
-
-    original_env = os.environ.copy()
-    data_dir = (_TMP_DIR / "isolated-config-data").resolve()
-    try:
-        os.environ["DATA_DIR"] = str(data_dir)
-        os.environ.pop("FORBIDDEN_WORDS_FILE", None)
-        with patch("dotenv.load_dotenv"):
-            importlib.reload(config)
-        default_path = config.FORBIDDEN_WORDS_FILE
-    finally:
-        os.environ.clear()
-        os.environ.update(original_env)
-        importlib.reload(config)
-
-    check(
-        "금지어 기본 경로는 DATA_DIR 사용",
-        default_path == data_dir / "forbidden_words.json",
-    )
-
 
 def test_config_validation():
     import module.config as config
@@ -258,7 +209,6 @@ def test_public_env_contract():
         "GOOGLE_API_KEY",
         "DATA_DIR",
         "BACKUP_DIR",
-        "FORBIDDEN_WORDS_FILE",
         "BACKUP_INTERVAL_SECONDS",
         "BACKUP_RETENTION_DAYS",
         "AI_COOLDOWN_SECONDS",
@@ -288,12 +238,6 @@ def test_public_env_contract():
         ).returncode
         == 0,
     )
-    check(
-        "공개 env 금지어 경로",
-        example["FORBIDDEN_WORDS_FILE"] == "runtime/data/forbidden_words.json",
-    )
-
-
 def test_deployment_contracts():
     import plistlib
 
@@ -485,33 +429,30 @@ def test_deployment_contracts_skip_only_compose_when_cli_missing():
     )
 
 
-def test_forbidden_words_fail_fast():
+def test_forbidden_words_degrade_gracefully():
+    import module.config as config
     from module.forbiddenfilter_cog import load_forbidden_words
 
-    missing = _TMP_DIR / "missing-forbidden.json"
-    try:
-        load_forbidden_words(missing)
-        check("금지어 파일 누락 거부", False)
-    except RuntimeError:
-        check("금지어 파일 누락 거부", True)
-
-    invalid = _TMP_DIR / "invalid-forbidden.json"
-    invalid.write_text("{}", encoding="utf-8")
-    try:
-        load_forbidden_words(invalid)
-        check("금지어 JSON 구조 오류 거부", False)
-    except RuntimeError:
-        check("금지어 JSON 구조 오류 거부", True)
+    with tempfile.TemporaryDirectory() as directory:
+        settings_dir = pathlib.Path(directory)
+        with patch.object(config, "SETTINGS_DIR", settings_dir):
+            check("금지어 파일 누락 시 필터 비활성", load_forbidden_words() == [])
+            (settings_dir / "forbidden_words.json").write_text("{}", encoding="utf-8")
+            check("금지어 JSON 구조 오류 시 필터 비활성", load_forbidden_words() == [])
 
 
 def test_forbidden_words_load_logs_to_stdout():
     import module.forbiddenfilter_cog as forbiddenfilter_cog
 
-    words = _TMP_DIR / "forbidden-log.json"
-    words.write_text('["금지어"]', encoding="utf-8")
-    output = StringIO()
-    with patch.object(forbiddenfilter_cog, "DATA_FILE", words), redirect_stdout(output):
-        forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+    import module.config as config
+
+    with tempfile.TemporaryDirectory() as directory:
+        pathlib.Path(directory, "forbidden_words.json").write_text(
+            '["금지어"]', encoding="utf-8"
+        )
+        output = StringIO()
+        with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)), redirect_stdout(output):
+            forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
 
     check(
         "금지어 로드 로그가 stdout에 기록",
@@ -1868,13 +1809,12 @@ def test_prune_skips_invalid_utf8_manifest():
 if __name__ == "__main__":
     try:
         test_config_paths()
-        test_forbidden_words_default_uses_data_dir()
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
         test_deployment_contracts()
         test_deployment_contracts_skip_only_compose_when_cli_missing()
-        test_forbidden_words_fail_fast()
+        test_forbidden_words_degrade_gracefully()
         test_forbidden_words_load_logs_to_stdout()
         test_startup_syncs_commands_globally()
         test_startup_preverification_failure_stops_cogs_and_sync()
