@@ -7,10 +7,13 @@ import openai
 import tiktoken
 from discord import app_commands
 from discord.ext import commands
-from module.config import AI_COOLDOWN_SECONDS, OPENAI_API_KEY, load_settings_json
-
-LIGHT_MODEL = "gpt-5.6-terra"
-DEEP_MODEL = "gpt-5.6-sol"
+from module.config import (
+    AI_COOLDOWN_SECONDS,
+    CHAT_MODEL_DEEP as DEEP_MODEL,
+    CHAT_MODEL_LIGHT as LIGHT_MODEL,
+    OPENAI_API_KEY,
+    load_settings_json,
+)
 
 # 포인트 수입원은 /출석 하나뿐이다. 가격이 곧 하루 사용 빈도 상한이 된다.
 # 값을 바꿀 때 docs/superpowers/plans의 「포인트 경제 근거」 절을 함께 갱신한다.

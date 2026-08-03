@@ -9,11 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY
-
-# Model Alias
-# Imagen 계열은 2026-06-24 서비스 종료 예정이라 Gemini 이미지 모델로 교체
-IMAGE_MODEL = "gemini-3.1-flash-image" # Nano Banana 2 (Gemini 3.1 Flash Image)
+from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL
 
 # 평균 출석 수입(17,500 P/일) 기준 이틀에 1회. 「포인트 경제 근거」 절 참조.
 IMAGE_COST = 30_000

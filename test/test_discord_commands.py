@@ -32,6 +32,25 @@ import module.backup as backup
 TEST_GUILD_ID = 4_242
 
 
+class MinimalConfigTest(unittest.TestCase):
+    def test_only_discord_token_is_required(self):
+        with patch.object(config, "DISCORD_TOKEN", "t"), \
+             patch.object(config, "OPENAI_API_KEY", None), \
+             patch.object(config, "GOOGLE_API_KEY", None):
+            config.validate_config()
+
+    def test_missing_discord_token_still_raises(self):
+        with patch.object(config, "DISCORD_TOKEN", None):
+            with self.assertRaises(RuntimeError):
+                config.validate_config()
+
+    def test_model_and_limit_defaults_exist(self):
+        self.assertTrue(config.CHAT_MODEL_LIGHT)
+        self.assertTrue(config.IMAGE_MODEL)
+        self.assertGreater(config.LIMIT_LIGHT, 0)
+        self.assertGreater(config.LIMIT_IMAGE, 0)
+
+
 class _StubSettings:
     """길드별 채널 설정 스텁. 실제 리포지토리 대신 주입한다."""
 

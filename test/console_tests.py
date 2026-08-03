@@ -144,8 +144,8 @@ def test_config_validation():
     }
     try:
         config.DISCORD_TOKEN = "test-token"
-        config.OPENAI_API_KEY = "test-openai"
-        config.GOOGLE_API_KEY = "test-google"
+        config.OPENAI_API_KEY = None
+        config.GOOGLE_API_KEY = None
         # 채널/길드 ID는 더 이상 환경변수가 아니다. 서버 관리자가 /설정으로 지정한다.
         config.validate_config()
         check(
@@ -207,12 +207,20 @@ def test_public_env_contract():
         "DISCORD_TOKEN",
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
+        "ADMIN_TOKEN",
         "DATA_DIR",
         "BACKUP_DIR",
+        "SETTINGS_DIR",
         "BACKUP_INTERVAL_SECONDS",
         "BACKUP_RETENTION_DAYS",
         "AI_COOLDOWN_SECONDS",
         "DB_BACKEND",
+        "CHAT_MODEL_LIGHT",
+        "CHAT_MODEL_DEEP",
+        "IMAGE_MODEL",
+        "LIMIT_LIGHT",
+        "LIMIT_DEEP",
+        "LIMIT_IMAGE",
     }
     check("공개 env 변수 계약", set(example) == expected)
     check(
