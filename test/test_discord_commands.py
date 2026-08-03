@@ -1334,6 +1334,43 @@ class GamesExternalizationTest(unittest.TestCase):
         self.assertIn("Good", games)
         self.assertNotIn("Bad", games)
 
+    def test_discord_component_bounds_are_enforced(self):
+        roster = {
+            "": {"max_players": 2, "roles": []},
+            "G" * 90: {"max_players": 2, "roles": []},
+            "Too Many Roles": {
+                "max_players": 2,
+                "roles": [f"Role {index}" for index in range(26)],
+            },
+            "Empty Role": {"max_players": 2, "roles": [""]},
+            "Long Role": {"max_players": 2, "roles": ["R" * 101]},
+            "G" * 89: {"max_players": 2, "roles": ["R" * 100]},
+        }
+        roster.update(
+            {f"Game {index}": {"max_players": 2, "roles": []} for index in range(25)}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "games.json").write_text(
+                json.dumps(roster), encoding="utf-8"
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                games = config.load_games()
+
+        self.assertEqual(
+            list(games), ["G" * 89, *(f"Game {index}" for index in range(24))]
+        )
+
+    def test_boolean_max_players_is_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "games.json").write_text(
+                json.dumps({"Boolean Capacity": {"max_players": True, "roles": []}}),
+                encoding="utf-8",
+            )
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                games = config.load_games()
+
+        self.assertNotIn("Boolean Capacity", games)
+
 
 class PersonaExternalizationTest(unittest.TestCase):
     def test_persona_comes_from_settings_file(self):
