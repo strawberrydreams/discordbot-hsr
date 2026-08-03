@@ -38,10 +38,6 @@ def _int_from_env(name: str, default: int | None = None) -> int:
 
 DATA_DIR = _path_from_env("DATA_DIR", "runtime/data")
 BACKUP_DIR = _path_from_env("BACKUP_DIR", "runtime/backups")
-FORBIDDEN_WORDS_FILE = _path_from_env(
-    "FORBIDDEN_WORDS_FILE",
-    str(DATA_DIR / "forbidden_words.json"),
-)
 SETTINGS_DIR = _path_from_env("SETTINGS_DIR", "settings")
 
 

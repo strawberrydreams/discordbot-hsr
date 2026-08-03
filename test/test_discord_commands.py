@@ -931,19 +931,30 @@ class RecordingForbiddenCounts:
 
 
 def make_forbidden_cog(counter, words=("나쁜말",)):
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".json", delete=False, encoding="utf-8"
-    ) as handle:
-        json.dump(list(words), handle)
-        path = pathlib.Path(handle.name)
-    with patch.object(forbiddenfilter_cog, "DATA_FILE", path), patch(
-        "module.forbiddenfilter_cog.print"
-    ):
-        cog = forbiddenfilter_cog.ForbiddenFilterCog(
-            SimpleNamespace(get_cog=lambda _: counter)
+    with tempfile.TemporaryDirectory() as directory:
+        pathlib.Path(directory, "forbidden_words.json").write_text(
+            json.dumps(list(words)), encoding="utf-8"
         )
-    path.unlink()
+        with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)), patch(
+            "module.forbiddenfilter_cog.print"
+        ):
+            cog = forbiddenfilter_cog.ForbiddenFilterCog(
+                SimpleNamespace(get_cog=lambda _: counter)
+            )
     return cog
+
+
+class ForbiddenFilterDegradesTest(unittest.TestCase):
+    def test_missing_file_yields_empty_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                self.assertEqual(forbiddenfilter_cog.load_forbidden_words(), [])
+
+    def test_cog_constructs_without_word_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                cog = forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+        self.assertIsNone(cog._find_match("아무 말이나"))
 
 
 class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):

@@ -1,16 +1,11 @@
 from __future__ import annotations
 import discord
-import json
 import re
 import unicodedata
-from pathlib import Path
 from typing import List, Optional
 from discord.ext import commands
 
-from module.config import FORBIDDEN_WORDS_FILE
-
-# ─────────── 설정 ─────────── #
-DATA_FILE = FORBIDDEN_WORDS_FILE
+from module.config import load_settings_json
 
 # 옵션: 자모 입력(ㅍ ㅔ ㄴ ...)을 완성형으로 결합할지
 COMBINE_JAMO = True
@@ -76,20 +71,17 @@ def _build_pattern(terms: List[str]) -> re.Pattern:
     return re.compile("|".join(escaped))
 
 
-def load_forbidden_words(path: Path) -> List[str]:
-    if not path.is_file():
-        raise RuntimeError(f"금지어 파일이 없습니다: {path}")
-    try:
-        with path.open(encoding="utf-8") as fp:
-            data = json.load(fp)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"금지어 파일을 읽을 수 없습니다: {path}") from exc
+def load_forbidden_words() -> List[str]:
+    """금지어 목록을 읽는다. 없거나 비었으면 빈 목록 — 필터만 꺼진다.
+
+    예외를 던지면 setup_hook의 load_extension에서 터져 봇 전체가 죽는다.
+    금지어는 선택 기능이므로 부팅을 막을 이유가 없다.
+    """
+    data = load_settings_json("forbidden_words.json", default=[])
     if not isinstance(data, list):
-        raise RuntimeError("금지어 JSON 최상단은 배열이어야 합니다.")
-    words = [_normalize_term(str(word)) for word in data if str(word).strip()]
-    if not words:
-        raise RuntimeError("금지어 목록이 비어 있습니다.")
-    return words
+        print("⚠️ 금지어 JSON 최상단은 배열이어야 합니다. 필터를 비활성합니다.")
+        return []
+    return [_normalize_term(str(word)) for word in data if str(word).strip()]
 
 
 class ForbiddenFilterCog(commands.Cog):
@@ -101,7 +93,7 @@ class ForbiddenFilterCog(commands.Cog):
 
     def load_prohibited_words(self) -> List[str]:
         """JSON을 읽어 내부 캐시에 저장하고 패턴을 갱신합니다."""
-        self._banned = load_forbidden_words(DATA_FILE)
+        self._banned = load_forbidden_words()
         self._banned_pattern = _build_pattern(self._banned)
         print(f"📥 금지어 {len(self._banned)}개 로드")
         return self._banned
