@@ -1216,3 +1216,35 @@ class BackupConnectionTests(unittest.TestCase):
         self.assertFalse(
             [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
         )
+
+
+class SettingsLoaderTest(unittest.TestCase):
+    def _with_settings_dir(self, directory):
+        return patch.object(config, "SETTINGS_DIR", pathlib.Path(directory))
+
+    def test_reads_first_existing_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "a.json").write_text('{"k": 1}', encoding="utf-8")
+            with self._with_settings_dir(directory):
+                self.assertEqual(
+                    config.load_settings_json("a.json", "b.json", default={}), {"k": 1}
+                )
+
+    def test_falls_back_to_next_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "b.json").write_text('{"k": 2}', encoding="utf-8")
+            with self._with_settings_dir(directory):
+                self.assertEqual(
+                    config.load_settings_json("a.json", "b.json", default={}), {"k": 2}
+                )
+
+    def test_returns_default_when_all_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self._with_settings_dir(directory):
+                self.assertEqual(config.load_settings_json("a.json", default=[]), [])
+
+    def test_broken_json_falls_back_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "a.json").write_text("{not json", encoding="utf-8")
+            with self._with_settings_dir(directory):
+                self.assertEqual(config.load_settings_json("a.json", default={}), {})

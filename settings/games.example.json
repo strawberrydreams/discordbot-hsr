@@ -1,0 +1,5 @@
+{
+  "League of Legends": {"max_players": 5, "roles": ["탑", "정글", "미드", "원딜", "서포터"]},
+  "PUBG": {"max_players": 4, "roles": []},
+  "Overwatch": {"max_players": 5, "roles": ["딜러1", "딜러2", "탱커", "힐러1", "힐러2"]}
+}

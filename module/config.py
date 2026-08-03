@@ -1,4 +1,5 @@
 # Configuration Module
+import json
 import os
 from pathlib import Path
 
@@ -41,6 +42,27 @@ FORBIDDEN_WORDS_FILE = _path_from_env(
     "FORBIDDEN_WORDS_FILE",
     str(DATA_DIR / "forbidden_words.json"),
 )
+SETTINGS_DIR = _path_from_env("SETTINGS_DIR", "settings")
+
+
+def load_settings_json(*names: str, default):
+    """settings/ 아래 JSON을 읽는다.
+
+    names를 순서대로 시도해 처음 성공한 것을 반환한다. 실서비스 파일이 없으면
+    커밋된 *.example.json으로 떨어지는 용도다. 전부 실패하면 default를 돌려준다.
+    운영자 설정 하나가 없다고 봇 전체가 죽으면 안 된다.
+    """
+    for name in names:
+        path = SETTINGS_DIR / name
+        try:
+            with path.open(encoding="utf-8") as fp:
+                return json.load(fp)
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"⚠️ 설정 파일을 읽을 수 없습니다: {path} ({exc})")
+            continue
+    return default
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

@@ -5,7 +5,8 @@
 .env.secrets
 .env.runtime
 settings/*.env
-settings/forbidden_words.json
+settings/*.json
+!settings/*.example.json
 
 # Runtime state
 runtime/
