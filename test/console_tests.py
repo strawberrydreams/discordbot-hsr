@@ -547,7 +547,7 @@ def test_startup_cog_failure_stops_postverification_and_sync():
 
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
-            if extension == main.EXTENSIONS[1]:
+            if extension == main.EXTENSIONS[1][0]:
                 raise RuntimeError("broken cog")
 
     def verify(path, tables):
@@ -565,8 +565,8 @@ def test_startup_cog_failure_stops_postverification_and_sync():
         "Cog 로드 실패 시 사후 검증과 sync 미실행",
         events == [
             *(f"verify:{name}" for name in backup.DATABASES),
-            f"load:{main.EXTENSIONS[0]}",
-            f"load:{main.EXTENSIONS[1]}",
+            f"load:{main.EXTENSIONS[0][0]}",
+            f"load:{main.EXTENSIONS[1][0]}",
         ],
         f"({events})",
     )

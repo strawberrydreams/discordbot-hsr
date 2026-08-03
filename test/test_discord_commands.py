@@ -15,6 +15,7 @@ import httpx
 import openai
 
 import module.config as config
+import module.main as bot_main
 from module.attendance_cog import AttendanceCog
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
@@ -49,6 +50,31 @@ class MinimalConfigTest(unittest.TestCase):
         self.assertTrue(config.IMAGE_MODEL)
         self.assertGreater(config.LIMIT_LIGHT, 0)
         self.assertGreater(config.LIMIT_IMAGE, 0)
+
+
+class ConditionalExtensionTest(unittest.TestCase):
+    def test_all_extensions_load_when_every_key_present(self):
+        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": "a", "GOOGLE_API_KEY": "b"}):
+            names = bot_main.available_extensions()
+        self.assertIn("module.hyacine_chat_cog", names)
+        self.assertIn("module.hyacine_image_cog", names)
+
+    def test_ai_extensions_skipped_without_keys(self):
+        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}):
+            names = bot_main.available_extensions()
+        self.assertNotIn("module.hyacine_chat_cog", names)
+        self.assertNotIn("module.hyacine_image_cog", names)
+
+    def test_core_extensions_survive_with_no_optional_keys(self):
+        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}):
+            names = bot_main.available_extensions()
+        for required in (
+            "module.guildsettings_cog",
+            "module.playwith_cog",
+            "module.forbiddenfilter_cog",
+            "module.attendance_cog",
+        ):
+            self.assertIn(required, names)
 
 
 class _StubSettings:

@@ -9,6 +9,8 @@ from module.config import (
     BACKUP_DIR,
     DATA_DIR,
     DISCORD_TOKEN,
+    GOOGLE_API_KEY,
+    OPENAI_API_KEY,
     validate_config,
 )
 
@@ -20,16 +22,38 @@ intents.guild_scheduled_events = True
 intents.message_content = True
 intents.members = True
 
+# (확장 경로, 그 확장이 요구하는 환경변수 이름들)
 EXTENSIONS = (
-    "module.guildsettings_cog",
-    "module.eventnotice_cog",
-    "module.playwith_cog",
-    "module.forbiddenfilter_cog",
-    "module.hyacine_chat_cog",
-    "module.hyacine_image_cog",
-    "module.attendance_cog",
-    "module.finance_cog",
+    ("module.guildsettings_cog", ()),
+    ("module.eventnotice_cog", ()),
+    ("module.playwith_cog", ()),
+    ("module.forbiddenfilter_cog", ()),
+    ("module.hyacine_chat_cog", ("OPENAI_API_KEY",)),
+    ("module.hyacine_image_cog", ("GOOGLE_API_KEY",)),
+    ("module.attendance_cog", ()),
+    ("module.finance_cog", ()),
 )
+
+ENV_VALUES = {
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "GOOGLE_API_KEY": GOOGLE_API_KEY,
+}
+
+
+def available_extensions() -> list[str]:
+    """키가 갖춰진 확장만 돌려준다.
+
+    키가 없는 확장은 어차피 동작할 수 없다. 로드해서 런타임에 터지게 두는 것보다
+    건너뛰고 로그를 남기는 편이 낫다. 기능 선택 토글이 아니라 의존성 가드다.
+    """
+    names = []
+    for extension, required in EXTENSIONS:
+        missing = [key for key in required if not ENV_VALUES.get(key)]
+        if missing:
+            print(f"⏭️ Skipped: {extension} ({', '.join(missing)} 없음)")
+            continue
+        names.append(extension)
+    return names
 
 
 def _verify_databases(existing_only: bool = False) -> None:
@@ -62,7 +86,7 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         _verify_databases(existing_only=True)
 
-        for extension in EXTENSIONS:
+        for extension in available_extensions():
             await self.load_extension(extension)
             print(f"🧩 Loaded extension: {extension}")
 
