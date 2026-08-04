@@ -63,7 +63,6 @@ def load_settings_json(*names: str, default):
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 CHAT_MODEL_LIGHT = os.getenv("CHAT_MODEL_LIGHT", "gpt-5.6-terra")
 CHAT_MODEL_DEEP = os.getenv("CHAT_MODEL_DEEP", "gpt-5.6-sol")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")

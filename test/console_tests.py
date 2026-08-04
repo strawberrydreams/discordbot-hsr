@@ -207,7 +207,6 @@ def test_public_env_contract():
         "DISCORD_TOKEN",
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
-        "ADMIN_TOKEN",
         "DATA_DIR",
         "BACKUP_DIR",
         "SETTINGS_DIR",
@@ -223,6 +222,7 @@ def test_public_env_contract():
         "LIMIT_IMAGE",
     }
     check("공개 env 변수 계약", set(example) == expected)
+    check("죽은 ADMIN_TOKEN 비공개", "ADMIN_TOKEN" not in example)
     check(
         "실제 env 파일 ignore",
         all(
@@ -246,6 +246,19 @@ def test_public_env_contract():
         ).returncode
         == 0,
     )
+
+
+def test_forbidden_word_document_path():
+    public_docs = "\n".join(
+        (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for name in ("README.md", "docs/operations.md")
+    )
+    check("금지어 기준 경로는 settings", "settings/forbidden_words.json" in public_docs)
+    check(
+        "폐기된 금지어 runtime 경로 없음",
+        "runtime/data/forbidden_words.json" not in public_docs,
+    )
+    check("폐기된 금지어 env 없음", "FORBIDDEN_WORDS_FILE" not in public_docs)
 
 
 def test_operations_document_contract():

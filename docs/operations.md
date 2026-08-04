@@ -52,18 +52,13 @@ print("잔액:", repo.get_points(GUILD_ID, USER_ID))'
 
 ### 기존 설치 금지어 파일 마이그레이션
 
-봇을 중지한 뒤 대상 파일이 없는지 확인하고 기존 목록을 복사합니다. 대상 파일이 이미 있으면 덮어쓰지 말고 두 파일을 비교해 사용할 목록을 먼저 결정하세요.
+기존 금지어 파일이 있는 운영자만 봇을 중지한 뒤 목록을 한 번 복사합니다. 새 설치는 README의 복사 명령만 따릅니다.
 
 ```bash
-mkdir -p runtime/data
-test -f settings/forbidden_words.json
-test ! -e runtime/data/forbidden_words.json
-cp settings/forbidden_words.json runtime/data/forbidden_words.json
-chmod 600 runtime/data/forbidden_words.json
-cmp settings/forbidden_words.json runtime/data/forbidden_words.json
+legacy_file=runtime/data/"forbidden_words.json"
+cp "$legacy_file" settings/forbidden_words.json
+chmod 600 settings/forbidden_words.json
 ```
-
-`.env.runtime`의 `FORBIDDEN_WORDS_FILE`을 `runtime/data/forbidden_words.json`으로 변경합니다. 봇 재시작 직전에 `cmp settings/forbidden_words.json runtime/data/forbidden_words.json`이 성공하는지 다시 확인하세요.
 
 ## 실행 방식 선택
 

@@ -20,8 +20,8 @@
 ```bash
 touch .env.secrets .env.runtime
 mkdir -p runtime/data runtime/backups runtime/logs
-cp settings/forbidden_words.example.json runtime/data/forbidden_words.json
-chmod 600 .env.secrets .env.runtime runtime/data/forbidden_words.json
+cp settings/forbidden_words.example.json settings/forbidden_words.json
+chmod 600 .env.secrets .env.runtime settings/forbidden_words.json
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
@@ -38,7 +38,7 @@ python3 -m venv .venv
 `/설정 이벤트채널`로 지정하며, 값은 서버별로 DB에 저장됩니다. 지정 전에는 해당
 기능이 안내 메시지와 함께 잠깁니다.
 
-실제 금지어는 `runtime/data/forbidden_words.json`에 작성합니다. 이 목록은 봇
+실제 금지어는 `settings/forbidden_words.json`에 작성합니다. 이 목록은 봇
 인스턴스 전체에 공통 적용되며, 경고 횟수는 서버별로 따로 집계됩니다.
 
 ### 3. DB 초기화와 초기 백업
