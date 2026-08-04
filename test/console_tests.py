@@ -693,16 +693,41 @@ def test_startup_syncs_commands_globally():
     class FakeBot:
         tree = FakeTree()
 
+        def add_view(self, view):
+            events.append("view:setup")
+
+        async def add_cog(self, cog):
+            events.append("cog:guildsettings")
+
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
+            if extension == "module.guildsettings_cog":
+                from module.guildsettings_cog import setup
+
+                await setup(self)
+
+    def verify(*, existing_only=False, allow_legacy=False):
+        events.append("verify:pre" if existing_only and allow_legacy else "verify:post")
 
     with patch.object(main, "DATA_DIR", data_dir), \
-         patch.object(main, "_verify_databases"):
+         patch.object(main, "_verify_databases", side_effect=verify):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
 
     check("전역으로만 sync", [e for e in events if e.startswith("sync")] == ["sync:global"],
           f"({events})")
     check("sync는 모든 Cog 로드 후", events[-1] == "sync:global", f"({events})")
+    check(
+        "persistent SetupView는 전역 sync 전에 등록",
+        events.index("view:setup") < events.index("sync:global"),
+        f"({events})",
+    )
+    check(
+        "DB 사전 검증·마이그레이션 뒤 사후 검증 후 sync",
+        events.index("verify:pre") < events.index("load:module.guildsettings_cog")
+        < events.index("verify:post")
+        < events.index("sync:global"),
+        f"({events})",
+    )
     check(
         "길드 설정 Cog가 로드 목록에 포함",
         "load:module.guildsettings_cog" in events,
@@ -1657,6 +1682,8 @@ def test_imports():
         "module.config",
         "module.database",
         "module.main",
+        "module.panel",
+        "module.guildsettings_cog",
         "module.attendance_cog",
         "module.playwith_cog",
         "module.eventnotice_cog",

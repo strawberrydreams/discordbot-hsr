@@ -16,12 +16,18 @@ import openai
 import module.config as config
 import module.main as bot_main
 from module.attendance_cog import AttendanceCog, KST
-from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
+from module.database import (
+    SQLiteAttendanceRepository,
+    SQLiteGuildSettingsRepository,
+    SQLitePartyRepository,
+)
 from module.eventnotice_cog import EventNoticeCog
 from module.finance_cog import FinanceCog
+from module.guildsettings_cog import GuildSettingsCog, SetupView
 from module.hyacine_chat_cog import HyacineChatCog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
+from module.panel import drop_panel_locks, panel_lock, upsert_panel
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.backup as backup
@@ -1284,6 +1290,186 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
         # 공개 배포 봇은 어떤 서버에 초대될지 미리 알 수 없다.
         self.assertEqual(events, ["global"])
         self.assertFalse(hasattr(main, "DISCORD_GUILD_ID"))
+
+
+class _FakeResponse:
+    def __init__(self, status=404):
+        self.status = status
+        self.reason = "test"
+        self.headers = {}
+        self.text = ""
+
+
+class _PanelMessage:
+    def __init__(self, message_id):
+        self.id = message_id
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+class _PanelChannel:
+    def __init__(self):
+        self.message = _PanelMessage(10)
+        self.fetch_error = None
+        self.sent = []
+
+    async def fetch_message(self, message_id):
+        if self.fetch_error:
+            raise self.fetch_error
+        return self.message
+
+    async def send(self, **kwargs):
+        message = _PanelMessage(11)
+        self.sent.append((message, kwargs))
+        return message
+
+
+class PanelLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upsert_edits_or_replaces_without_hiding_transport_errors(self):
+        channel = _PanelChannel()
+        embed = object()
+        view = object()
+
+        first = await upsert_panel(channel, 10, embed=embed, view=view)
+        self.assertEqual(first.id, 10)
+        self.assertEqual(channel.message.edits[-1], {"embed": embed, "view": view})
+
+        channel.fetch_error = discord.NotFound(_FakeResponse(), "missing")
+        replacement = await upsert_panel(channel, 10, embed=embed, view=view)
+        self.assertEqual(replacement.id, 11)
+
+        channel.fetch_error = discord.Forbidden(_FakeResponse(403), "forbidden")
+        with self.assertRaises(discord.Forbidden):
+            await upsert_panel(channel, 10, embed=embed, view=view)
+
+        channel.fetch_error = discord.HTTPException(_FakeResponse(500), "failed")
+        with self.assertRaises(discord.HTTPException):
+            await upsert_panel(channel, 10, embed=embed, view=view)
+
+    def test_panel_locks_are_scoped_by_guild_and_key(self):
+        try:
+            self.assertIs(panel_lock(1, "party:A"), panel_lock(1, "party:A"))
+            self.assertIsNot(panel_lock(1, "party:A"), panel_lock(2, "party:A"))
+        finally:
+            drop_panel_locks(1)
+            drop_panel_locks(2)
+
+
+class _SetupChannel:
+    def __init__(self, channel_id, name):
+        self.id = channel_id
+        self.name = name
+        self.mention = f"<#{channel_id}>"
+
+
+class _SetupGuild:
+    def __init__(self):
+        self.id = 999
+        self.default_role = object()
+        self.me = object()
+        self.categories = []
+        self.channels = {}
+        self.created_categories = []
+        self.created_channels = []
+        self.system_channel = None
+
+    def get_channel(self, channel_id):
+        return self.channels.get(channel_id)
+
+    async def create_category(self, name, *, overwrites):
+        category = SimpleNamespace(name=name, overwrites=overwrites)
+        self.categories.append(category)
+        self.created_categories.append(category)
+        return category
+
+    async def create_text_channel(self, name, *, category):
+        channel = _SetupChannel(len(self.channels) + 1, name)
+        self.channels[channel.id] = channel
+        self.created_channels.append((channel, category))
+        return channel
+
+
+class _SetupBot:
+    def __init__(self):
+        self.views = []
+
+    def add_view(self, view):
+        self.views.append(view)
+
+
+class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_creates_private_channels_once_and_reuses_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            bot = _SetupBot()
+            cog = GuildSettingsCog(bot, settings)
+            guild = _SetupGuild()
+
+            first = await cog.ensure_bot_channels(guild)
+            second = await cog.ensure_bot_channels(guild)
+
+        self.assertEqual([category.name for category in guild.created_categories], ["🤖 봇"])
+        self.assertEqual(
+            [channel.name for channel, _ in guild.created_channels], ["🎮-파티", "🎵-음악"]
+        )
+        self.assertEqual(first, second)
+        category = guild.created_categories[0]
+        self.assertIs(category.overwrites[guild.default_role].send_messages, False)
+        bot_permissions = category.overwrites[guild.me]
+        self.assertTrue(bot_permissions.view_channel)
+        self.assertTrue(bot_permissions.send_messages)
+        self.assertTrue(bot_permissions.read_message_history)
+        self.assertTrue(bot_permissions.embed_links)
+        self.assertTrue(bot_permissions.attach_files)
+        self.assertEqual(len(bot.views), 1)
+        self.assertIsInstance(bot.views[0], SetupView)
+        self.assertTrue(bot.views[0].is_persistent())
+        self.assertEqual(bot.views[0].children[0].custom_id, "setup:start")
+
+    async def test_join_notice_requires_a_sendable_system_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cog = GuildSettingsCog(
+                _SetupBot(), SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            )
+            guild = _SetupGuild()
+            await cog.on_guild_join(guild)
+
+            sent = []
+
+            class SystemChannel:
+                def __init__(self, send_messages):
+                    self.send_messages = send_messages
+
+                def permissions_for(self, member):
+                    return SimpleNamespace(send_messages=self.send_messages)
+
+                async def send(self, *args, **kwargs):
+                    sent.append((args, kwargs))
+
+            guild.system_channel = SystemChannel(False)
+            await cog.on_guild_join(guild)
+            guild.system_channel = SystemChannel(True)
+            await cog.on_guild_join(guild)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIs(sent[0][1]["view"], cog.setup_view)
+
+    async def test_setup_button_rejects_users_without_manage_guild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cog = GuildSettingsCog(
+                _SetupBot(), SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            )
+            interaction = SimpleNamespace(
+                guild=_SetupGuild(),
+                user=SimpleNamespace(guild_permissions=SimpleNamespace(manage_guild=False)),
+                response=RecordingResponse(),
+            )
+            await cog.setup_view.children[0].callback(interaction)
+
+        self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
+        self.assertIn("관리 권한", interaction.response.messages[0][0][0])
 
 
 

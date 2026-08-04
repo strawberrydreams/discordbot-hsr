@@ -1,0 +1,28 @@
+"""Shared helpers for persistent Discord panels."""
+
+import asyncio
+
+import discord
+
+
+_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def panel_lock(guild_id: int, panel_key: str) -> asyncio.Lock:
+    return _LOCKS.setdefault((guild_id, panel_key), asyncio.Lock())
+
+
+def drop_panel_locks(guild_id: int) -> None:
+    for key in [key for key in _LOCKS if key[0] == guild_id]:
+        del _LOCKS[key]
+
+
+async def upsert_panel(channel, message_id, *, embed, view) -> discord.Message:
+    if message_id is not None:
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.edit(embed=embed, view=view)
+            return message
+        except discord.NotFound:
+            pass
+    return await channel.send(embed=embed, view=view)
