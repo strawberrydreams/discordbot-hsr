@@ -6,13 +6,13 @@
 <string>com.discordbot.hsr-backup</string>
 <key>ProgramArguments</key>
 <array>
-  <string>/Users/strawberrydreams/coding/discordbot-hsr/.venv/bin/python</string>
+  <string>__PROJECT_ROOT__/.venv/bin/python</string>
   <string>-m</string>
   <string>module.backup</string>
   <string>loop</string>
 </array>
 <key>WorkingDirectory</key>
-<string>/Users/strawberrydreams/coding/discordbot-hsr</string>
+<string>__PROJECT_ROOT__</string>
 <key>RunAtLoad</key>
 <true/>
 <key>KeepAlive</key>
@@ -20,8 +20,8 @@
 <key>ThrottleInterval</key>
 <integer>10</integer>
 <key>StandardOutPath</key>
-<string>/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup.log</string>
+<string>__PROJECT_ROOT__/runtime/logs/backup.log</string>
 <key>StandardErrorPath</key>
-<string>/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup-error.log</string>
+<string>__PROJECT_ROOT__/runtime/logs/backup-error.log</string>
 </dict>
 </plist>

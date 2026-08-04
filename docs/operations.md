@@ -66,14 +66,16 @@ chmod 600 settings/forbidden_words.json
 
 ### macOS LaunchAgent
 
-제공된 plist와 newsyslog 예제는 이 저장소의 현재 절대 경로(`/Users/strawberrydreams/coding/discordbot-hsr`)를 사용합니다. 다른 위치에 복제했다면 두 plist 템플릿의 Python, 작업 디렉터리, 로그 경로와 newsyslog 예제의 로그·PID 경로를 실제 절대 경로로 바꾼 뒤 설치합니다.
+제공된 템플릿은 현재 저장소 경로와 로그인 사용자의 그룹을 자동으로 넣어 설치용 파일을 만듭니다.
 
 최초 설치:
 
 ```bash
 mkdir -p "$HOME/Library/LaunchAgents" runtime/data runtime/backups runtime/logs
-cp deploy/macos/com.discordbot.hsr.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
-cp deploy/macos/com.discordbot.hsr-backup.plist.example "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
+.venv/bin/python deploy/macos/render_templates.py
+cp runtime/generated/macos/com.discordbot.hsr.plist "$HOME/Library/LaunchAgents/"
+cp runtime/generated/macos/com.discordbot.hsr-backup.plist "$HOME/Library/LaunchAgents/"
+sudo cp runtime/generated/macos/com.discordbot.hsr.conf /etc/newsyslog.d/
 plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
@@ -94,7 +96,8 @@ backup_plist="$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
 if launchctl print "$backup_target" >/dev/null 2>&1; then
   launchctl bootout --wait "$backup_target"
 fi
-cp deploy/macos/com.discordbot.hsr-backup.plist.example "$backup_plist"
+.venv/bin/python deploy/macos/render_templates.py
+cp runtime/generated/macos/com.discordbot.hsr-backup.plist "$backup_plist"
 plutil -lint "$backup_plist"
 launchctl bootstrap "$launchd_domain" "$backup_plist"
 launchctl kickstart -k "$backup_target"
@@ -104,11 +107,10 @@ launchctl kickstart -k "$backup_target"
 로그 로테이션 설치와 구문 확인:
 
 ```bash
-sudo cp deploy/macos/com.discordbot.hsr.newsyslog.conf.example /etc/newsyslog.d/com.discordbot.hsr.conf
 sudo newsyslog -nvv
 ```
 
-newsyslog 예제의 `strawberrydreams:staff`도 실제 LaunchAgent 사용자와 그룹(`id -un`, `id -gn`)으로 바꾸세요. 네 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. PID와 companion lock은 launchd로 실행하는 macOS에서만 생성되며 Docker에서는 만들지 않습니다. SIGHUP 뒤 남은 PID는 launchd 재시작이 lock을 다시 획득한 뒤 원자적으로 교체합니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
+네 newsyslog 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. PID와 companion lock은 launchd로 실행하는 macOS에서만 생성되며 Docker에서는 만들지 않습니다. SIGHUP 뒤 남은 PID는 launchd 재시작이 lock을 다시 획득한 뒤 원자적으로 교체합니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
 
 상태와 로그:
 

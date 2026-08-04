@@ -431,8 +431,8 @@ def test_deployment_contracts():
         },
     )
     check(
-        "newsyslog replacement 로그 owner/group 명시",
-        all(entry[1] == "strawberrydreams:staff" for entry in newsyslog_entries),
+        "newsyslog template owner/group placeholder 명시",
+        all(entry[1] == "__USER__:__GROUP__" for entry in newsyslog_entries),
     )
     working_directory = pathlib.Path(bot_plist["WorkingDirectory"])
     expected_pid_by_log = {
@@ -456,6 +456,62 @@ def test_deployment_contracts():
             and entry[7] == expected_pid_by_log.get(entry[0])
             and entry[8] == "1"
             for entry in newsyslog_entries
+        ),
+    )
+
+
+def test_macos_templates_render_portably():
+    import plistlib
+    from deploy.macos.render_templates import render_templates
+
+    template_dir = PROJECT_ROOT / "deploy/macos"
+    template_texts = [
+        (template_dir / name).read_text(encoding="utf-8")
+        for name in (
+            "com.discordbot.hsr.plist.example",
+            "com.discordbot.hsr-backup.plist.example",
+            "com.discordbot.hsr.newsyslog.conf.example",
+        )
+    ]
+    check(
+        "macOS templates have no author-specific values",
+        all(
+            "/Users/strawberrydreams" not in text
+            and "strawberrydreams:staff" not in text
+            for text in template_texts
+        ),
+    )
+
+    project_root = pathlib.Path("/tmp/portable-clone/discordbot-hsr")
+    with tempfile.TemporaryDirectory() as directory:
+        output_dir = pathlib.Path(directory)
+        render_templates(project_root, output_dir, "portable-user", "portable-group")
+        bot_plist = plistlib.loads((output_dir / "com.discordbot.hsr.plist").read_bytes())
+        backup_plist = plistlib.loads(
+            (output_dir / "com.discordbot.hsr-backup.plist").read_bytes()
+        )
+        newsyslog = (output_dir / "com.discordbot.hsr.conf").read_text(encoding="utf-8")
+
+    check(
+        "rendered plist paths use clone root",
+        all(
+            project_root.as_posix() in value
+            for plist in (bot_plist, backup_plist)
+            for value in (
+                plist["ProgramArguments"][0],
+                plist["WorkingDirectory"],
+                plist["StandardOutPath"],
+                plist["StandardErrorPath"],
+            )
+        ),
+    )
+    check(
+        "rendered newsyslog uses clone user and group",
+        project_root.as_posix() in newsyslog
+        and "portable-user:portable-group" in newsyslog
+        and not any(
+            placeholder in newsyslog
+            for placeholder in ("__PROJECT_ROOT__", "__USER__", "__GROUP__")
         ),
     )
 
@@ -2002,6 +2058,7 @@ if __name__ == "__main__":
         test_public_env_contract()
         test_operations_document_contract()
         test_deployment_contracts()
+        test_macos_templates_render_portably()
         test_deployment_contracts_skip_only_compose_when_cli_missing()
         test_forbidden_words_degrade_gracefully()
         test_forbidden_words_load_logs_to_stdout()
