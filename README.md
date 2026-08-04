@@ -19,7 +19,7 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 
 ### 1. Discord Application 생성과 설치
 
-각 운영자는 Discord Developer Portal에서 **자신의** Application과 봇 토큰을 생성합니다. Installation은 **Guild Install만** 사용하고, 설치 scope는 `bot`, `applications.commands`로 설정합니다. 봇 권한은 다음만 부여합니다.
+각 운영자는 Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 생성합니다. Installation은 **Guild Install만** 사용하고, 설치 scope는 `bot`, `applications.commands`로 설정합니다. 봇 권한은 다음만 부여합니다.
 
 - `View Channel`
 - `Send Messages`
