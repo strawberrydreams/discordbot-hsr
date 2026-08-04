@@ -1140,8 +1140,9 @@ def test_guild_isolation():
         in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog._inspect),
     )
     check(
-        "JoinButton은 길드 밖 상호작용을 거부",
-        "guild_id is None" in inspect.getsource(playwith_cog.JoinButton.callback),
+        "파티 패널은 길드 밖 상호작용을 거부",
+        "guild_id is None"
+        in inspect.getsource(playwith_cog.PlayWithCog._reject_invalid_interaction),
     )
 
 
@@ -1581,6 +1582,26 @@ def test_party_cog_uses_epoch_seconds():
     check(
         "Cog 만료 정리 시 24시간 전 epoch 정수 전달",
         repository.cutoff == 1_999_913_600,
+    )
+
+
+def test_persistent_party_panel_contract():
+    import module.playwith_cog as playwith_cog
+
+    source = inspect.getsource(playwith_cog)
+    check(
+        "구 파티 slash command 제거",
+        all(f'name="{name}"' not in source for name in ("모집", "파티", "나가기", "변경")),
+    )
+    check(
+        "파티 패널 custom_id는 SHA-256 digest 사용",
+        "hashlib.sha256" in source and "_game_key(game)" in source,
+    )
+    check(
+        "파티 패널은 startup/setup/cleanup 복구 경로 제공",
+        all(name in playwith_cog.PlayWithCog.__dict__ for name in (
+            "ensure_panels", "render_game_panel", "on_ready", "on_member_remove"
+        )),
     )
 
 
@@ -2831,6 +2852,7 @@ if __name__ == "__main__":
         test_party_repository()
         test_party_capacity_constraint()
         test_party_cog_uses_epoch_seconds()
+        test_persistent_party_panel_contract()
         test_factory()
         test_cog_facade()
         test_channel_sessions()

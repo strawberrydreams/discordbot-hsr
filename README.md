@@ -9,7 +9,7 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 ## 주요 기능
 
 - `/출석`, `/지갑`, `/프로필`, `/랭킹`
-- `/모집`, `/파티`, `/나가기`, `/변경`
+- 게임별 영속 파티 패널 — 파티 채널에서 버튼으로 모집·참가·역할 변경·나가기
 - 어느 서버 채널에서나 `/이벤트`
 - `/기본대화`, `/고급대화`, `/이미지`
 - `/주가`와 금지어 경고
@@ -37,7 +37,8 @@ Bot 설정에서 privileged intent인 `Message Content`와 `Server Members`를 �
 touch .env.secrets .env.runtime
 mkdir -p runtime/data runtime/backups runtime/logs
 cp settings/forbidden_words.example.json settings/forbidden_words.json
-chmod 600 .env.secrets .env.runtime settings/forbidden_words.json
+cp settings/games.example.json settings/games.json
+chmod 600 .env.secrets .env.runtime settings/forbidden_words.json settings/games.json
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
@@ -50,7 +51,7 @@ python3 -m venv .venv
 - `.env.secrets`: 방금 만든 Discord 토큰과 OpenAI·Google 자격 증명
 - `.env.runtime`: 데이터·백업 경로, 백업 주기, AI 쿨다운과 한도
 
-채널 ID는 환경변수가 아닙니다. 봇을 Guild에 설치한 뒤 각 서버 관리자가 `/설정 파티채널`, `/설정 음악채널`, `/설정 공지허용`으로 서버별 설정을 저장할 수 있습니다. `/모집`·`/파티`·`/나가기`·`/변경`과 `/이벤트`는 어느 서버 채널에서나 사용할 수 있습니다.
+채널 ID는 환경변수가 아닙니다. 봇을 Guild에 설치한 뒤 서버 관리자가 `/설정 시작`으로 봇 채널을 만들거나 `/설정 파티채널`로 기존 채널을 지정합니다. 파티 채널에는 `settings/games.json`의 게임별 패널이 하나씩 유지됩니다. 빈 자리 버튼을 누르면 참가하고, 본인 자리 버튼을 다시 누르면 나가며, 다른 역할 버튼을 누르면 역할이 바뀝니다. 게임·역할 설정을 바꾼 뒤에는 봇을 재시작하세요.
 
 실제 금지어 목록은 `settings/forbidden_words.json`에 작성합니다. 이 목록은 한 봇 인스턴스에 공통 적용되며, 경고 횟수는 서버별로 집계됩니다.
 

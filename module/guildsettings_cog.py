@@ -89,7 +89,15 @@ class GuildSettingsCog(commands.Cog):
         self, guild: discord.Guild
     ) -> tuple[discord.TextChannel, discord.TextChannel]:
         async with panel_lock(guild.id, "setup"):
-            return await self.ensure_bot_channels(guild)
+            channels = await self.ensure_bot_channels(guild)
+            await self._ensure_party_panels(guild)
+            return channels
+
+    async def _ensure_party_panels(self, guild: discord.Guild) -> None:
+        get_cog = getattr(self.bot, "get_cog", None)
+        play_cog = get_cog("PlayWithCog") if get_cog else None
+        if play_cog is not None:
+            await play_cog.ensure_panels(guild)
 
     async def ensure_bot_channels(
         self, guild: discord.Guild
@@ -139,8 +147,10 @@ class GuildSettingsCog(commands.Cog):
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
+        await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
-        await inter.response.send_message(
+        await self._ensure_party_panels(inter.guild)
+        await inter.followup.send(
             f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
 

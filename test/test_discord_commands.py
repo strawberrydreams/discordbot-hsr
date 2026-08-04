@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import json
 import pathlib
 import tempfile
@@ -108,7 +109,7 @@ class RecordingResponse:
     def is_done(self):
         return self.deferred or bool(self.messages)
 
-    async def defer(self):
+    async def defer(self, **kwargs):
         self.deferred = True
 
 
@@ -149,6 +150,7 @@ def fake_event(event_id, name, start_time, end_time=None):
 
 class FakeGuild:
     def __init__(self, events=None):
+        self.id = TEST_GUILD_ID
         self.fetch_scheduled_events_calls = 0
         self.events = events or []
 
@@ -164,15 +166,16 @@ _UNSET = object()  # guild_id=None(=DM)과 "기본값 사용"을 구분한다
 
 
 class FakeInteraction:
-    def __init__(self, channel_id, guild=None, guild_id=_UNSET):
+    def __init__(self, channel_id, guild=None, guild_id=_UNSET, message_id=10, user=None):
         self.channel_id = channel_id
-        self.user = FakeUser()
+        self.user = user or FakeUser()
         self.response = RecordingResponse()
         self.followup = RecordingFollowup()
         self.guild = guild
         self.created_at = datetime.now(timezone.utc)
         # 기본값은 임의의 길드 — 경계 테스트만 다른 값(또는 DM을 뜻하는 None)을 넘긴다.
         self.guild_id = TEST_GUILD_ID if guild_id is _UNSET else guild_id
+        self.message = SimpleNamespace(id=message_id) if message_id is not None else None
 
 
 class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -959,26 +962,12 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(duplicate_kwargs.get("ephemeral"), True)
         self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
 
-    async def test_recruit_selector_and_no_available_games_are_ephemeral(self):
-        selector_interaction = FakeInteraction(channel_id=1)
-        await PlayWithCog.모집.callback(self.play, selector_interaction)
-        self.assertIs(
-            selector_interaction.response.messages[-1][1].get("ephemeral"), True
-        )
+    async def test_legacy_party_slash_commands_are_removed(self):
+        for command in ("모집", "파티", "나가기", "변경"):
+            self.assertNotIn(command, PlayWithCog.__dict__)
 
-        for game in playwith_cog.GAMES:
-            self.party_repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
-        full_interaction = FakeInteraction(channel_id=1)
-        await PlayWithCog.모집.callback(self.play, full_interaction)
-        self.assertIs(full_interaction.response.messages[-1][1].get("ephemeral"), True)
-
-    async def test_party_and_event_commands_reach_their_backends_from_any_channel(self):
-        self.assertNotIn("ensure_recruit_channel", PlayWithCog.__dict__)
+    async def test_event_commands_reach_their_backend_from_any_channel(self):
         self.assertNotIn("settings", EventNoticeCog.__init__.__code__.co_varnames)
-
-        party_interaction = FakeInteraction(channel_id=-1)
-        await PlayWithCog.모집.callback(self.play, party_interaction)
-        self.assertIn("view", party_interaction.response.messages[-1][1])
 
         guild = FakeGuild()
         interaction = FakeInteraction(channel_id=-1, guild=guild)
@@ -1009,150 +998,255 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("같은 시각 앞", detail.followup.messages[0][1]["embed"].title)
 
 
-class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
-    def test_party_repository_closes_connections(self):
+class _PartyMessage:
+    def __init__(self, message_id, author_id=999):
+        self.id = message_id
+        self.author = SimpleNamespace(id=author_id)
+        self.edits = []
+        self.deleted = False
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _PartyChannel:
+    def __init__(self, channel_id=50):
+        self.id = channel_id
+        self.messages = {}
+        self.sent = []
+        self.fetch_errors = {}
+
+    async def fetch_message(self, message_id):
+        if message_id in self.fetch_errors:
+            raise self.fetch_errors[message_id]
+        if message_id not in self.messages:
+            raise discord.NotFound(_FakeResponse(), "missing")
+        return self.messages[message_id]
+
+    async def send(self, **kwargs):
+        message = _PartyMessage(100 + len(self.sent))
+        self.messages[message.id] = message
+        self.sent.append((message, kwargs))
+        return message
+
+
+class _PartyGuild(FakeGuild):
+    def __init__(self, guild_id=TEST_GUILD_ID, channel=None, members=None):
+        super().__init__()
+        self.id = guild_id
+        self.channel = channel or _PartyChannel()
+        self.members = members or {FakeUser.id: FakeUser()}
+
+    def get_channel(self, channel_id):
+        return self.channel if channel_id == self.channel.id else None
+
+    def get_member(self, user_id):
+        return self.members.get(user_id)
+
+
+class _PartyBot:
+    def __init__(self, guild):
+        self.guilds = [guild]
+        self.user = SimpleNamespace(id=999)
+        self.registered = []
+
+    def add_view(self, view):
+        self.registered.append(view)
+
+    def get_guild(self, guild_id):
+        return self.guilds[0] if self.guilds[0].id == guild_id else None
+
+
+class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
+    def _make_cog(self, root, guild, games=None):
+        party = SQLitePartyRepository(root / "party.db")
+        settings = SQLiteGuildSettingsRepository(root / "settings.db")
+        settings.set_party_channel(guild.id, guild.channel.id)
+        bot = _PartyBot(guild)
+        patches = patch.object(playwith_cog, "GAMES", games) if games else None
+        if patches:
+            patches.start()
+            self.addCleanup(patches.stop)
+        with patch("discord.ext.tasks.Loop.start"):
+            cog = PlayWithCog(bot, party, settings)
+        return cog, party, settings, bot
+
+    def test_views_use_digest_ids_and_stay_within_component_limit(self):
         with tempfile.TemporaryDirectory() as directory:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", ResourceWarning)
-                repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-                repository.create_party(TEST_GUILD_ID, "PUBG", 1_000)
-                repository.add_participant(TEST_GUILD_ID, "PUBG", 123)
-                repository.delete_party(TEST_GUILD_ID, "PUBG")
-                del repository
-                gc.collect()
+            guild = _PartyGuild()
+            cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild)
 
-        self.assertFalse(
-            [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
-        )
-
-    async def test_party_status_keeps_empty_active_party(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            repository.create_party(TEST_GUILD_ID, game, 1_000)
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
-
-            await PlayWithCog.파티.callback(cog, interaction)
-
-            self.assertIsNotNone(repository.get_party(TEST_GUILD_ID, game))
-            self.assertEqual(
-                interaction.response.messages[0][1]["embeds"][0].description,
-                f"현재 인원: 0 / {playwith_cog.GAMES[game]['max_players']}",
-            )
-
-    async def test_stale_join_button_rejects_deleted_party(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(channel_id=1)
-
-            await cog.shared_views[game].children[0].callback(interaction)
-
-            self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
-            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, interaction.user.id))
-
-    async def test_stale_role_update_rejects_deleted_party(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            repository.create_party(TEST_GUILD_ID, game, 1_000)
-            repository.add_participant(TEST_GUILD_ID, game, FakeUser.id, "탑")
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            select = playwith_cog.RoleUpdateSelect(cog, game, FakeUser.id)
-            select._values = ["정글"]
-            repository.delete_party(TEST_GUILD_ID, game)
-            interaction = FakeInteraction(channel_id=1)
-
-            await select.callback(interaction)
-
-            self.assertIn("모집이 종료된 파티", interaction.response.messages[0][0][0])
-            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, interaction.user.id))
-
-    async def test_party_status_sends_multiple_embeds_in_one_initial_response(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            games = list(playwith_cog.GAMES)[:2]
-            for user_id, game in enumerate(games, start=1):
-                repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
-                repository.add_participant(TEST_GUILD_ID, game, user_id)
-
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
-
-            await PlayWithCog.파티.callback(cog, interaction)
-
-        self.assertEqual(len(interaction.response.messages), 1)
-        self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 2)
-
-    async def test_party_status_batches_eleven_active_games(self):
-        games = {
-            f"Game {index}": {"max_players": 1, "roles": []}
-            for index in range(11)
-        }
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            playwith_cog, "GAMES", games
-        ):
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            for game in games:
-                repository.create_party(TEST_GUILD_ID, game, 1_000)
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
-
-            await PlayWithCog.파티.callback(cog, interaction)
-
-        self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 10)
-        self.assertEqual(len(interaction.followup.messages), 1)
-        self.assertEqual(len(interaction.followup.messages[0][1]["embeds"]), 1)
-
-    async def test_largest_party_roster_keeps_embed_fields_within_discord_limit(self):
-        roles = [f"{index:02d}" + "r" * 37 for index in range(25)]
-        games = {"Max Roster": {"max_players": 25, "roles": roles}}
-
-        class MentionGuild(FakeGuild):
-            def get_member(self, user_id):
-                return SimpleNamespace(mention=f"<@{10**18 + user_id}>")
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            playwith_cog, "GAMES", games
-        ):
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            repository.create_party(TEST_GUILD_ID, "Max Roster", 1_000)
-            for user_id, role in enumerate(roles):
-                repository.add_participant(TEST_GUILD_ID, "Max Roster", user_id, role)
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            interaction = FakeInteraction(channel_id=1, guild=MentionGuild())
-
-            await PlayWithCog.파티.callback(cog, interaction)
-
-        fields = interaction.response.messages[0][1]["embeds"][0].fields
-        self.assertEqual([len(field.value) for field in fields], [1_024, 1_024])
-
-    def test_join_views_are_persistent_and_registered_at_cog_load(self):
-        class Bot:
-            def __init__(self):
-                self.views = []
-
-            def add_view(self, view):
-                self.views.append(view)
-
-        bot = Bot()
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=bot, repository=repository)
-
-        self.assertEqual(len(bot.views), len(playwith_cog.GAMES))
-        for game, view in cog.shared_views.items():
+        self.assertEqual(set(cog.views), set(playwith_cog.GAMES))
+        self.assertEqual(len(bot.registered), len(playwith_cog.GAMES))
+        for game, view in cog.views.items():
             self.assertTrue(view.is_persistent())
-            self.assertEqual(view.children[0].custom_id, f"party:join:{game}")
+            self.assertLessEqual(len(view.children), 25)
+            expected = hashlib.sha256(game.encode("utf-8")).hexdigest()[:16]
+            for child in view.children:
+                self.assertIn(expected, child.custom_id)
+                self.assertNotIn(game, child.custom_id)
+                self.assertLess(len(child.custom_id), 100)
+            expected_count = len(playwith_cog.GAMES[game]["roles"]) + 1
+            self.assertEqual(len(view.children), expected_count if expected_count > 1 else 1)
+
+    async def test_over_limit_game_is_disabled_without_stopping_other_panels(self):
+        games = {
+            "Too Many": {"max_players": 25, "roles": [f"r{i}" for i in range(25)]},
+            "Okay": {"max_players": 2, "roles": []},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild, games)
+            await cog.ensure_panels(guild)
+
+        self.assertEqual(len(bot.registered), 1)
+        disabled = guild.channel.sent[0][1]
+        self.assertIn("비활성", disabled["embed"].title)
+        self.assertIsNone(disabled["view"])
+        self.assertIsNotNone(guild.channel.sent[1][1]["view"])
+
+    async def test_role_and_no_role_buttons_cover_create_change_leave_and_toggle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+
+            game = "League of Legends"
+            panel_id = settings.get_party_panels(guild.id)[game]
+            inactive, top = cog.views[game].children[:2]
+            await inactive.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: None})
+            await top.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: "탑"})
+            await top.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertIsNone(party.get_party(guild.id, game))
+
+            game = "PUBG"
+            panel_id = settings.get_party_panels(guild.id)[game]
+            toggle = cog.views[game].children[0]
+            await toggle.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertEqual(party.get_user_party(guild.id, FakeUser.id), game)
+            await toggle.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertIsNone(party.get_user_party(guild.id, FakeUser.id))
+
+    async def test_repository_rejections_and_concurrent_role_clicks_are_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            users = {uid: SimpleNamespace(id=uid, mention=f"<@{uid}>") for uid in range(1, 8)}
+            guild = _PartyGuild(members=users)
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            game = "League of Legends"
+            panel_id = settings.get_party_panels(guild.id)[game]
+            party.create_party(guild.id, game, 1_000)
+            for uid, role in zip(range(1, 6), playwith_cog.GAMES[game]["roles"]):
+                party.add_participant(guild.id, game, uid, role, 5)
+
+            full = FakeInteraction(50, guild, message_id=panel_id, user=users[6])
+            await cog.views[game].children[0].callback(full)
+            self.assertIn("가득", full.followup.messages[0][0][0])
+            self.assertIsNone(party.get_user_party(guild.id, 6))
+
+            party.remove_participant(guild.id, game, 5)
+            racer = users[7]
+            first = FakeInteraction(50, guild, message_id=panel_id, user=racer)
+            second = FakeInteraction(50, guild, message_id=panel_id, user=racer)
+            await asyncio.gather(
+                cog.views[game].children[4].callback(first),
+                cog.views[game].children[5].callback(second),
+            )
+            self.assertEqual(party.get_participants(guild.id, game)[7], "서포터")
+            self.assertTrue(first.followup.messages and second.followup.messages)
+
+    async def test_dm_cross_guild_stale_panel_and_deleted_member_do_not_mutate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            game = "PUBG"
+            button = cog.views[game].children[0]
+            panel_id = settings.get_party_panels(guild.id)[game]
+
+            dm = FakeInteraction(50, guild=None, guild_id=None, message_id=panel_id)
+            await button.callback(dm)
+            wrong = FakeInteraction(50, guild, guild_id=guild.id + 1, message_id=panel_id)
+            await button.callback(wrong)
+            stale = FakeInteraction(50, guild, message_id=panel_id + 1)
+            await button.callback(stale)
+            guild.members.clear()
+            deleted = FakeInteraction(50, guild, message_id=panel_id)
+            await button.callback(deleted)
+
+        self.assertIsNone(party.get_user_party(guild.id, FakeUser.id))
+        self.assertTrue(all(item.response.messages for item in (dm, wrong, stale, deleted)))
+
+    async def test_ensure_panels_edits_recreates_and_cleans_only_bot_stale_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, _, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            current = next(iter(playwith_cog.GAMES))
+            guild.channel.messages[10] = _PartyMessage(10)
+            guild.channel.messages[20] = _PartyMessage(20)
+            settings.set_party_panel(guild.id, current, 10)
+            settings.set_party_panel(guild.id, "Removed", 20)
+            await cog.ensure_panels(guild)
+
+            self.assertTrue(guild.channel.messages[10].edits)
+            self.assertTrue(guild.channel.messages[20].deleted)
+            self.assertNotIn("Removed", settings.get_party_panels(guild.id))
+
+            missing_game = list(playwith_cog.GAMES)[1]
+            old_id = settings.get_party_panels(guild.id)[missing_game]
+            guild.channel.messages.pop(old_id)
+            await cog.ensure_panels(guild)
+            self.assertNotEqual(settings.get_party_panels(guild.id)[missing_game], old_id)
+
+    async def test_transport_error_preserves_panel_row_and_renderer_reads_latest_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            game = "League of Legends"
+            settings.set_party_panel(guild.id, game, 77)
+            settings.set_party_panel(guild.id, "Removed", 88)
+            guild.channel.fetch_errors[77] = discord.Forbidden(_FakeResponse(403), "no")
+            guild.channel.fetch_errors[88] = discord.HTTPException(_FakeResponse(500), "no")
+            await cog.ensure_panels(guild)
+            self.assertEqual(settings.get_party_panels(guild.id)[game], 77)
+            self.assertEqual(settings.get_party_panels(guild.id)["Removed"], 88)
+
+            guild.channel.fetch_errors.clear()
+            guild.channel.messages[77] = _PartyMessage(77)
+            party.create_party(guild.id, game, 1_000)
+            party.add_participant(guild.id, game, FakeUser.id, "탑", 5)
+            await cog.render_game_panel(guild.id, game)
+            embed = guild.channel.messages[77].edits[-1]["embed"]
+            self.assertIn("1 / 5", embed.description)
+            self.assertIn("탑: <@123>", embed.fields[0].value)
+
+    async def test_startup_member_removal_and_expiry_render_only_affected_panels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, _, _ = self._make_cog(pathlib.Path(directory), guild)
+            with patch.object(cog, "ensure_panels") as ensure:
+                await cog.on_ready()
+                await cog.on_ready()
+                ensure.assert_awaited_once_with(guild)
+
+            party.create_party(guild.id, "PUBG", 1_000)
+            party.add_participant(guild.id, "PUBG", FakeUser.id, None, 4)
+            member = SimpleNamespace(id=FakeUser.id, guild=guild)
+            with patch.object(cog, "render_game_panel") as render:
+                await cog.on_member_remove(member)
+                render.assert_awaited_once_with(guild.id, "PUBG")
+
+            party.create_party(guild.id, "Overwatch", 1_000)
+            with patch("module.playwith_cog.time.time", return_value=100_000), patch.object(
+                cog, "render_game_panel"
+            ) as render:
+                await PlayWithCog.cleanup_parties.coro(cog)
+                render.assert_awaited_once_with(guild.id, "Overwatch")
 
 
 class FakeMessage:
@@ -1233,39 +1327,6 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter.counts, [FakeUser.id, FakeUser.id])
         self.assertIn("나쁜말", first.sent[0])
         self.assertIn("나쁜말", second.sent[0])
-
-    async def test_join_button_outside_a_guild_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            repository.create_party(TEST_GUILD_ID, game, 1_000)
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-            # 영속 버튼은 길드 밖에서도 눌릴 수 있다.
-            interaction = FakeInteraction(channel_id=1, guild_id=None)
-
-            await cog.shared_views[game].children[0].callback(interaction)
-
-            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, FakeUser.id))
-            self.assertIs(interaction.response.messages[0][1].get("ephemeral"), True)
-            self.assertIn("서버 안에서만", interaction.response.messages[0][0][0])
-
-    async def test_join_button_binds_to_the_interacting_guild(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = "PUBG"  # 역할이 없어 버튼 한 번으로 참가된다
-            other = TEST_GUILD_ID + 1
-            repository.create_party(other, game, 1_000)
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-
-            # 파티가 있는 쪽 서버에서 누르면 그 서버 파티에만 들어간다.
-            await cog.shared_views[game].children[0].callback(
-                FakeInteraction(channel_id=1, guild_id=other)
-            )
-
-            self.assertEqual(repository.get_user_party(other, FakeUser.id), game)
-            self.assertIsNone(repository.get_user_party(TEST_GUILD_ID, FakeUser.id))
 
     async def test_commands_are_registered_globally_without_guild_pinning(self):
         import module.main as main
@@ -1392,11 +1453,15 @@ class _SetupGuild:
 
 
 class _SetupBot:
-    def __init__(self):
+    def __init__(self, play_cog=None):
         self.views = []
+        self.play_cog = play_cog
 
     def add_view(self, view):
         self.views.append(view)
+
+    def get_cog(self, name):
+        return self.play_cog if name == "PlayWithCog" else None
 
 
 class _DeferredSetupResponse:
@@ -1419,6 +1484,50 @@ class _DeferredSetupFollowup:
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_completion_ensures_party_panels(self):
+        calls = []
+
+        async def ensure_panels(guild):
+            calls.append(guild)
+
+        play_cog = SimpleNamespace(ensure_panels=ensure_panels)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            guild = _SetupGuild()
+            cog = GuildSettingsCog(_SetupBot(play_cog), settings)
+            await cog._ensure_bot_channels(guild)
+
+        self.assertEqual(calls, [guild])
+
+    async def test_deleted_party_channel_is_recreated_with_panels_on_next_setup(self):
+        calls = []
+
+        async def ensure_panels(guild):
+            calls.append(guild)
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            guild = _SetupGuild()
+            old_party = _SetupChannel(30, "old-party")
+            music = _SetupChannel(31, "music")
+            guild.channels = {30: old_party, 31: music}
+            settings.set_party_channel(guild.id, 30)
+            settings.set_music_channel(guild.id, 31)
+            cog = GuildSettingsCog(
+                _SetupBot(SimpleNamespace(ensure_panels=ensure_panels)), settings
+            )
+
+            await cog.on_guild_channel_delete(
+                SimpleNamespace(id=30, guild=guild)
+            )
+            guild.channels.pop(30)
+            party, returned_music = await cog._ensure_bot_channels(guild)
+
+        self.assertIsNone(guild.get_channel(30))
+        self.assertIs(returned_music, music)
+        self.assertNotEqual(party.id, 30)
+        self.assertEqual(calls, [guild])
+
     async def test_setup_creates_private_channels_once_and_reuses_them(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
@@ -1625,27 +1734,6 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_second_selection_of_same_game_is_refused(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-
-            first = FakeInteraction(channel_id=1)
-            second = FakeInteraction(channel_id=1)
-            select = playwith_cog.GameSelect(cog, [game])
-            select._values = [game]
-
-            await select.callback(first)
-            await select.callback(second)
-
-            self.assertIn("embed", first.response.messages[0][1])
-            args, kwargs = second.response.messages[0]
-            self.assertNotIn("embed", kwargs)
-            self.assertIs(kwargs.get("ephemeral"), True)
-            self.assertIn("이미 생성", args[0])
-
     async def test_full_party_rejects_further_joins(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
@@ -1695,26 +1783,6 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIsNone(repository.get_party(TEST_GUILD_ID, game))
-
-    async def test_party_count_matches_listed_members(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
-            game = next(iter(playwith_cog.GAMES))
-            repository.create_party(TEST_GUILD_ID, game, 1_000)
-            repository.add_participant(TEST_GUILD_ID, game, 1, "탑")
-            repository.add_participant(TEST_GUILD_ID, game, 2, "미드")  # 서버를 이미 떠난 유저
-            with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
-
-            class PartialGuild(FakeGuild):
-                def get_member(self, user_id):
-                    return FakeUser() if user_id == 1 else None
-
-            interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
-            await PlayWithCog.파티.callback(cog, interaction)
-
-            description = interaction.response.messages[0][1]["embeds"][0].description
-            self.assertIn("현재 인원: 1 /", description)
 
 
 class BackupConnectionTests(unittest.TestCase):
