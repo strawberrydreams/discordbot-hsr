@@ -20,13 +20,28 @@ from module.config import (
     BACKUP_RETENTION_DAYS,
     DATA_DIR,
 )
-from module.database import SQLITE_TIMEOUT_SECONDS
+from module.database import (
+    SQLITE_TIMEOUT_SECONDS,
+    SQLiteAttendanceRepository,
+    SQLiteGuildSettingsRepository,
+    SQLitePartyRepository,
+)
 
 DATABASES = {
     "attendance_data.db": {"users", "point_ledger", "ai_usage"},
     "party_data.db": {"parties", "participants"},
     "guild_settings.db": {"guild_settings"},
 }
+_SQLITE_REPOSITORIES = {
+    "attendance_data.db": SQLiteAttendanceRepository,
+    "party_data.db": SQLitePartyRepository,
+    "guild_settings.db": SQLiteGuildSettingsRepository,
+}
+_CURRENT_SCHEMA_VERSIONS = {
+    name: repository._SCHEMA_VERSION
+    for name, repository in _SQLITE_REPOSITORIES.items()
+}
+_LEGACY_ATTENDANCE_TABLES = {"users", "point_ledger"}
 
 
 @contextmanager
@@ -68,7 +83,13 @@ def _validate_backup_settings() -> None:
     _require_positive("BACKUP_RETENTION_DAYS", BACKUP_RETENTION_DAYS)
 
 
-def verify_database(path: Path, required_tables: set[str]) -> dict[str, int]:
+def verify_database(
+    path: Path,
+    required_tables: set[str],
+    *,
+    source_name: str,
+    allow_legacy: bool = False,
+) -> dict[str, int]:
     if not path.is_file():
         raise RuntimeError(f"DB 파일이 없습니다: {path}")
     try:
@@ -76,6 +97,24 @@ def verify_database(path: Path, required_tables: set[str]) -> dict[str, int]:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             if result != ("ok",):
                 raise RuntimeError(f"SQLite 무결성 검사 실패: {path}")
+            current_version = _CURRENT_SCHEMA_VERSIONS[source_name]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > current_version:
+                raise RuntimeError(
+                    f"{source_name} DB 버전 {version}은 지원 버전 "
+                    f"{current_version}보다 높습니다."
+                )
+            if version < current_version and not allow_legacy:
+                raise RuntimeError(
+                    f"{source_name} DB 버전 {version}은 현재 버전 "
+                    f"{current_version}이 아닙니다."
+                )
+            if (
+                allow_legacy
+                and source_name == "attendance_data.db"
+                and version in (0, 1)
+            ):
+                required_tables = _LEGACY_ATTENDANCE_TABLES
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -182,7 +221,11 @@ def _create_backup_set(now: datetime | None) -> Path:
             temporary = _temporary_path(f"{timestamp}-{source_name}")
             temporary_paths.append(temporary)
             _backup_one(source, temporary)
-            counts = verify_database(temporary, required_tables)
+            counts = verify_database(
+                temporary,
+                required_tables,
+                source_name=source_name,
+            )
             pending.append((temporary, final, source_name, counts))
 
         for temporary, _, _, _ in pending:
@@ -276,7 +319,12 @@ def verify_backup_set(manifest_path: Path) -> dict[str, dict[str, int]]:
             raise RuntimeError(f"백업 파일 크기가 일치하지 않습니다: {backup}")
         if checksum != item.get("sha256"):
             raise RuntimeError(f"백업 체크섬이 일치하지 않습니다: {backup}")
-        counts = verify_database(backup, DATABASES[source_name])
+        counts = verify_database(
+            backup,
+            DATABASES[source_name],
+            source_name=source_name,
+            allow_legacy=True,
+        )
         if counts != item.get("tables"):
             raise RuntimeError(f"백업 테이블 정보가 일치하지 않습니다: {backup}")
         verified[source_name] = counts
@@ -284,17 +332,30 @@ def verify_backup_set(manifest_path: Path) -> dict[str, dict[str, int]]:
     return verified
 
 
-def restore_test(manifest_path: Path) -> None:
+def stage_restore(manifest_path: Path, stage: Path) -> None:
     manifest_path = Path(manifest_path)
     manifest = _load_manifest(manifest_path)
     verify_backup_set(manifest_path)
+    stage = Path(stage)
+    destinations = [stage / item["source"] for item in manifest["databases"]]
+    if any(path.exists() for path in destinations):
+        raise RuntimeError(f"복구 stage에 DB 파일이 이미 있습니다: {stage}")
+    stage.mkdir(parents=True, exist_ok=True)
+    for item, restored in zip(manifest["databases"], destinations):
+        source_name = item["source"]
+        source = manifest_path.parent / item["backup"]
+        shutil.copy2(source, restored)
+        _SQLITE_REPOSITORIES[source_name](restored)
+        verify_database(
+            restored,
+            DATABASES[source_name],
+            source_name=source_name,
+        )
+
+
+def restore_test(manifest_path: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="hsr_restore_") as temp_dir:
-        temp_root = Path(temp_dir)
-        for item in manifest["databases"]:
-            source = manifest_path.parent / item["backup"]
-            restored = temp_root / item["source"]
-            shutil.copy2(source, restored)
-            verify_database(restored, DATABASES[item["source"]])
+        stage_restore(manifest_path, Path(temp_dir))
 
 
 def _under_data_dir(path: Path) -> bool:

@@ -56,12 +56,20 @@ def available_extensions() -> list[str]:
     return names
 
 
-def _verify_databases(existing_only: bool = False) -> None:
+def _verify_databases(
+    existing_only: bool = False,
+    allow_legacy: bool = False,
+) -> None:
     for filename, required_tables in DATABASES.items():
         path = DATA_DIR / filename
         if existing_only and not path.exists():
             continue
-        verify_database(path, required_tables)
+        verify_database(
+            path,
+            required_tables,
+            source_name=filename,
+            allow_legacy=allow_legacy,
+        )
 
 
 def acquire_instance_lock(path: Path) -> BinaryIO:
@@ -84,7 +92,7 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        _verify_databases(existing_only=True)
+        _verify_databases(existing_only=True, allow_legacy=True)
 
         for extension in available_extensions():
             await self.load_extension(extension)

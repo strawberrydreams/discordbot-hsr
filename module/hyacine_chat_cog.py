@@ -18,7 +18,7 @@ from module.config import (
     load_settings_json,
 )
 
-# 포인트 수입원은 /출석 하나뿐이다. 가격이 곧 하루 사용 빈도 상한이 된다.
+# 가격은 포인트로 감당할 수 있는 횟수를 제한하고, LIMIT_*는 일일 API 요청을 별도로 제한한다.
 LIGHT_COST = 200
 DEEP_COST = 2_000
 

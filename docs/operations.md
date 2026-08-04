@@ -55,9 +55,19 @@ print("잔액:", repo.get_points(GUILD_ID, USER_ID))'
 기존 금지어 파일이 있는 운영자만 봇을 중지한 뒤 목록을 한 번 복사합니다. 새 설치는 README의 복사 명령만 따릅니다.
 
 ```bash
+(
+set -euo pipefail
 legacy_file=runtime/data/"forbidden_words.json"
-cp "$legacy_file" settings/forbidden_words.json
-chmod 600 settings/forbidden_words.json
+target_file=settings/forbidden_words.json
+test -f "$legacy_file"
+if test -e "$target_file"; then
+  echo "대상 파일이 이미 있습니다. 내용을 확인한 뒤 수동으로 병합하세요: $target_file" >&2
+  exit 1
+fi
+cp -p "$legacy_file" "$target_file"
+cmp -s "$legacy_file" "$target_file"
+chmod 600 "$target_file"
+)
 ```
 
 ## 실행 방식 선택
@@ -159,7 +169,7 @@ DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도**
 
 ## 검증된 백업으로 실제 복구
 
-복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 각 DB 덮어쓰기를 승인합니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
+복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 각 DB 덮어쓰기를 승인합니다. 과거 attendance v0/v1 백업도 먼저 manifest·크기·체크섬·기본 테이블을 검증한 뒤 restore stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
 
 ```bash
 (
@@ -202,11 +212,10 @@ test -f "$MANIFEST"
 RESTORE_STAGE=$(mktemp -d runtime/restore-stage.XXXXXX)
 .venv/bin/python - "$MANIFEST" "$RESTORE_STAGE" <<'PY'
 import json
-import shutil
 import sys
 from pathlib import Path
 
-from module.backup import DATABASES, restore_test
+from module.backup import DATABASES, stage_restore
 
 manifest_path = Path(sys.argv[1])
 stage = Path(sys.argv[2])
@@ -233,14 +242,12 @@ for item in items:
         or backup in backup_names
     ):
         raise RuntimeError("안전하지 않거나 중복된 manifest DB 항목입니다.")
-    entries[source] = manifest_path.parent / backup
+    entries[source] = backup
     backup_names.add(backup)
 if set(entries) != expected:
     raise RuntimeError("manifest에 운영 DB가 정확히 한 번씩 있어야 합니다.")
 
-restore_test(manifest_path)
-for source, backup_path in entries.items():
-    shutil.copy2(backup_path, stage / source)
+stage_restore(manifest_path, stage)
 PY
 
 EMERGENCY_DIR=$(mktemp -d "runtime/emergency.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
@@ -257,7 +264,7 @@ for staged in "$RESTORE_STAGE"/*.db; do
   cmp -s "$staged" "runtime/data/$name"
 done
 
-.venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
+.venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables, source_name=name)) for name, tables in DATABASES.items()]'
 
 case "$DEPLOYMENT" in
   launchd)
@@ -276,7 +283,7 @@ esac
 
 ## 배포
 
-변경을 모아 한 번에 배포합니다. macOS는 **테스트 → 온라인 백업 생성 → 백업 검증 → 봇·백업 재시작**, Docker는 **테스트 → 이미지 빌드 → 온라인 백업 생성 → 백업 검증 → 봇·백업 재시작** 순서로 진행합니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
+변경을 모아 한 번에 배포합니다. 두 방식 모두 **현재 코드로 온라인 백업 생성·검증 → pull → 테스트·빌드 → 봇·백업 재시작** 순서로 진행합니다. 이렇게 해야 새 코드의 스키마 마이그레이션 전에 구버전 DB 백업이 남습니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
 macOS:
 
@@ -284,10 +291,10 @@ macOS:
 (
 set -euo pipefail
 git rev-parse HEAD
-git pull --ff-only
-.venv/bin/python -m test.console_tests
 .venv/bin/python -m module.backup create
 .venv/bin/python -m module.backup verify
+git pull --ff-only
+.venv/bin/python -m test.console_tests
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
 launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
 tail -n 100 runtime/logs/bot.log
@@ -300,13 +307,13 @@ Docker:
 (
 set -euo pipefail
 git rev-parse HEAD
+BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
+test -n "$BACKUP_MANIFEST"
+docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
 git pull --ff-only
 .venv/bin/python -m test.console_tests
 docker compose config --quiet
 docker compose build bot
-BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
-test -n "$BACKUP_MANIFEST"
-docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
 docker compose up -d --no-deps bot backup
 docker compose logs --tail=100 bot
 )

@@ -61,7 +61,7 @@ AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도
 새 설치에서만 빈 DB를 초기화합니다. 기존 운영 DB가 있다면 초기화하지 말고 [운영 가이드](docs/operations.md)의 복구 절차를 따르세요.
 
 ```bash
-.venv/bin/python -c 'from module.database import create_attendance_repository, create_party_repository, create_guild_settings_repository; from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; create_attendance_repository(); create_party_repository(); create_guild_settings_repository(); [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
+.venv/bin/python -c 'from module.database import create_attendance_repository, create_party_repository, create_guild_settings_repository; from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; create_attendance_repository(); create_party_repository(); create_guild_settings_repository(); [print(name, verify_database(DATA_DIR / name, tables, source_name=name)) for name, tables in DATABASES.items()]'
 .venv/bin/python -m module.backup create
 .venv/bin/python -m module.backup verify
 .venv/bin/python -m module.backup restore-test

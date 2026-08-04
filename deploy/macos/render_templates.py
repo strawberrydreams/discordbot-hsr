@@ -9,6 +9,7 @@ TEMPLATES = (
     ("com.discordbot.hsr-backup.plist.example", "com.discordbot.hsr-backup.plist"),
     ("com.discordbot.hsr.newsyslog.conf.example", "com.discordbot.hsr.conf"),
 )
+PLACEHOLDERS = ("__PROJECT_ROOT__", "__USER__", "__GROUP__")
 
 
 def _xml_escape(value: str) -> str:
@@ -17,6 +18,12 @@ def _xml_escape(value: str) -> str:
 
 def render_templates(project_root: Path, output_dir: Path, user: str, group: str) -> None:
     project_root_text = str(project_root)
+    if any(
+        placeholder in value
+        for value in (project_root_text, user, group)
+        for placeholder in PLACEHOLDERS
+    ):
+        raise RuntimeError("template values cannot contain reserved placeholder tokens")
     if any(character.isspace() for character in project_root_text):
         raise RuntimeError("project root cannot contain whitespace for newsyslog")
 

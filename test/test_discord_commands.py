@@ -1512,7 +1512,11 @@ class BackupConnectionTests(unittest.TestCase):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ResourceWarning)
                 backup._backup_one(source, temporary)
-                backup.verify_database(temporary, {"parties", "participants"})
+                backup.verify_database(
+                    temporary,
+                    {"parties", "participants"},
+                    source_name="party_data.db",
+                )
                 gc.collect()
 
         self.assertFalse(

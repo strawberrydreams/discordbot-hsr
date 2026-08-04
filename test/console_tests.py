@@ -66,6 +66,34 @@ def check(name: str, condition: bool, detail: str = ""):
         print(f"  ❌ {name} {detail}")
 
 
+def _create_legacy_attendance_db(path: pathlib.Path, version: int = 1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(f"""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                last_attendance_date TEXT,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE TABLE point_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            INSERT INTO point_ledger
+                (guild_id, user_id, delta, reason, created_at)
+                VALUES (7, 8, 9000, 'attendance', 1);
+            PRAGMA user_version = {version};
+        """)
+
+
 
 # ─────────── 길드 바인딩 어댑터 ─────────── #
 #
@@ -564,6 +592,24 @@ def test_macos_templates_render_portably():
             rejected and not any(output_dir.iterdir()),
         )
 
+    collision_cases = (
+        (pathlib.Path("/tmp/__USER__/discordbot-hsr"), "portable-user", "portable-group"),
+        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable__GROUP__", "portable-group"),
+        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable-user", "__PROJECT_ROOT__"),
+    )
+    for index, (root, user, group) in enumerate(collision_cases):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = pathlib.Path(directory)
+            try:
+                render_templates(root, output_dir, user, group)
+                rejected = False
+            except RuntimeError:
+                rejected = True
+            check(
+                f"reserved renderer token input {index + 1} rejected before output",
+                rejected and not any(output_dir.iterdir()),
+            )
+
 
 def test_deployment_contracts_skip_only_compose_when_cli_missing():
     output = StringIO()
@@ -669,7 +715,7 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
 
-    def fail_verify(path, tables):
+    def fail_verify(path, tables, **kwargs):
         events.append(f"verify:{path.name}")
         raise RuntimeError("missing production database")
 
@@ -681,6 +727,58 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
         except RuntimeError:
             check("사전 DB 검증 실패 전파", True)
     check("사전 DB 검증 실패 시 Cog와 sync 미실행", events == ["verify:attendance_data.db"], f"({events})")
+
+
+def test_startup_migrates_legacy_attendance_before_strict_verification():
+    import module.main as main
+
+    data_dir = _TMP_DIR / "legacy-startup-data"
+    attendance_path = data_dir / "attendance_data.db"
+    _create_legacy_attendance_db(attendance_path)
+    SQLitePartyRepository(data_dir / "party_data.db")
+    SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+    events = []
+
+    class FakeBot:
+        class tree:
+            @staticmethod
+            async def sync():
+                events.append("sync")
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+            if extension == "module.attendance_cog":
+                SQLiteAttendanceRepository(attendance_path)
+                events.append("migrate:attendance")
+
+    with patch.object(main, "DATA_DIR", data_dir):
+        try:
+            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            started = True
+        except RuntimeError:
+            started = False
+
+    with closing(sqlite3.connect(attendance_path)) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        points = conn.execute(
+            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        ).fetchone()
+    check("legacy attendance startup reaches repository migration", started)
+    check(
+        "startup migration precedes sync and preserves data",
+        version == 2
+        and "ai_usage" in tables
+        and points == (9000,)
+        and "migrate:attendance" in events
+        and events.index("migrate:attendance") < events.index("sync"),
+        f"(version={version}, events={events})",
+    )
 
 
 def test_startup_cog_failure_stops_postverification_and_sync():
@@ -700,7 +798,7 @@ def test_startup_cog_failure_stops_postverification_and_sync():
             if extension == main.EXTENSIONS[1][0]:
                 raise RuntimeError("broken cog")
 
-    def verify(path, tables):
+    def verify(path, tables, **kwargs):
         events.append(f"verify:{path.name}")
         return {}
 
@@ -1484,6 +1582,157 @@ def test_backup_round_trip():
     check("백업 복구 테스트", True)
 
 
+def test_legacy_backup_restore_and_prune():
+    import module.backup as backup
+
+    root = _TMP_DIR / "legacy-backup-lifecycle"
+    data_dir = root / "data"
+    backup_dir = root / "backups"
+    backup.DATA_DIR = data_dir
+    backup.BACKUP_DIR = backup_dir
+    backup.BACKUP_RETENTION_DAYS = 30
+    timestamp = "20260101T000000Z"
+    _create_legacy_attendance_db(data_dir / "attendance_data.db")
+    party_path = data_dir / "party_data.db"
+    settings_path = data_dir / "guild_settings.db"
+    SQLitePartyRepository(party_path).create_party(
+        _TEST_GUILD, "LOL", 2_000_000_000
+    )
+    SQLiteGuildSettingsRepository(settings_path)
+    for path in (party_path, settings_path):
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute("PRAGMA user_version = 0")
+    backup_dir.mkdir(parents=True)
+
+    items = []
+    for source_name, current_tables in backup.DATABASES.items():
+        source = data_dir / source_name
+        copied = backup_dir / f"{timestamp}-{source_name}"
+        backup._backup_one(source, copied)
+        tables = (
+            {"users", "point_ledger"}
+            if source_name == "attendance_data.db"
+            else current_tables
+        )
+        with closing(sqlite3.connect(copied)) as conn:
+            counts = {
+                table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                for table in sorted(tables)
+            }
+        items.append(
+            {
+                "source": source_name,
+                "backup": copied.name,
+                "size": copied.stat().st_size,
+                "sha256": backup._sha256(copied),
+                "tables": counts,
+            }
+        )
+
+    manifest = backup_dir / f"{timestamp}-manifest.json"
+    manifest.write_text(
+        json.dumps({"created_at": "2026-01-01T00:00:00+00:00", "databases": items}),
+        encoding="utf-8",
+    )
+    try:
+        verified = backup.verify_backup_set(manifest)
+    except RuntimeError:
+        verified = None
+    check(
+        "historical v1 attendance backup verifies with base tables",
+        verified is not None
+        and verified["attendance_data.db"] == {"point_ledger": 1, "users": 1},
+    )
+    legacy_v0 = root / "legacy-v0-attendance.db"
+    shutil.copy2(data_dir / "attendance_data.db", legacy_v0)
+    with closing(sqlite3.connect(legacy_v0)) as conn:
+        conn.execute("PRAGMA user_version = 0")
+    try:
+        v0_counts = backup.verify_database(
+            legacy_v0,
+            backup.DATABASES["attendance_data.db"],
+            source_name="attendance_data.db",
+            allow_legacy=True,
+        )
+    except RuntimeError:
+        v0_counts = None
+    check(
+        "historical v0 attendance accepts only its base-table contract",
+        v0_counts == {"point_ledger": 1, "users": 1},
+    )
+
+    stage_restore = getattr(backup, "stage_restore", None)
+    check("historical restore stages through migration API", stage_restore is not None)
+    if stage_restore is None:
+        return
+
+    invalid_document = json.loads(manifest.read_text(encoding="utf-8"))
+    invalid_document["databases"][0]["sha256"] = "0" * 64
+    invalid_manifest = backup_dir / "invalid-manifest.json"
+    invalid_manifest.write_text(json.dumps(invalid_document), encoding="utf-8")
+    invalid_stage = root / "invalid-stage"
+    try:
+        stage_restore(invalid_manifest, invalid_stage)
+        checksum_rejected = False
+    except RuntimeError:
+        checksum_rejected = True
+    check(
+        "checksum failure precedes any staged mutation",
+        checksum_rejected and not invalid_stage.exists(),
+    )
+
+    stage = root / "stage"
+    try:
+        stage_restore(manifest, stage)
+        staged = True
+    except RuntimeError:
+        staged = False
+    check("all staged legacy databases reach the current contract", staged)
+    if not staged:
+        return
+    staged_attendance = stage / "attendance_data.db"
+    with closing(sqlite3.connect(staged_attendance)) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        points = conn.execute(
+            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        ).fetchone()
+    check(
+        "staged historical attendance migrates before installation",
+        version == 2 and "ai_usage" in tables and points == (9000,),
+    )
+    future = root / "future-attendance.db"
+    shutil.copy2(staged_attendance, future)
+    with closing(sqlite3.connect(future)) as conn:
+        conn.execute("PRAGMA user_version = 999")
+    try:
+        backup.verify_database(
+            future,
+            backup.DATABASES["attendance_data.db"],
+            source_name="attendance_data.db",
+            allow_legacy=True,
+        )
+        future_rejected = False
+    except RuntimeError:
+        future_rejected = True
+    check("historical verification rejects future schemas", future_rejected)
+
+    deleted = backup.prune_backups(
+        datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+    )
+    check(
+        "expired valid historical backup is pruned",
+        deleted == 1
+        and not manifest.exists()
+        and all(not (backup_dir / item["backup"]).exists() for item in items),
+    )
+
+
 def test_invalid_backup_settings_prevent_creation():
     import module.backup as backup
 
@@ -2050,7 +2299,11 @@ def test_corrupt_backup_rejected():
     corrupt = _TMP_DIR / "corrupt.db"
     corrupt.write_bytes(b"not-a-sqlite-database")
     try:
-        backup.verify_database(corrupt, {"users"})
+        backup.verify_database(
+            corrupt,
+            {"users"},
+            source_name="attendance_data.db",
+        )
         check("손상 백업 거부", False)
     except RuntimeError:
         check("손상 백업 거부", True)
@@ -2115,6 +2368,7 @@ if __name__ == "__main__":
         test_forbidden_words_load_logs_to_stdout()
         test_startup_syncs_commands_globally()
         test_startup_preverification_failure_stops_cogs_and_sync()
+        test_startup_migrates_legacy_attendance_before_strict_verification()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
         test_instance_lock_closes_failed_handle()
@@ -2140,6 +2394,7 @@ if __name__ == "__main__":
         test_channel_sessions()
         test_imports()
         test_backup_round_trip()
+        test_legacy_backup_restore_and_prune()
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()
         test_invalid_interval_prevents_loop_entry()
