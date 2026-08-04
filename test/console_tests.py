@@ -333,6 +333,11 @@ def test_operations_document_contract():
     restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
     check("복구 DB 목록은 코드에서 가져옴", "expected = set(DATABASES)" in restore)
     check("복구가 stage의 모든 DB를 순회", 'for staged in "$RESTORE_STAGE"/*.db' in restore)
+    check(
+        "복구가 stage의 설정 파일을 설치",
+        'if test -d "$RESTORE_STAGE/settings"; then' in restore
+        and 'for staged in "$RESTORE_STAGE"/settings/*.json; do' in restore,
+    )
     check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
     check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
     check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
@@ -448,6 +453,15 @@ def test_deployment_contracts():
                 )
                 for service in (bot, backup)
                 for mount in service["volumes"]
+            ),
+        )
+        check(
+            "backup 설정 마운트는 읽기 전용",
+            any(
+                str(mount.get("source", "")).endswith("settings")
+                and mount.get("target") == "/app/settings"
+                and mount.get("read_only", False)
+                for mount in backup["volumes"]
             ),
         )
         check(
@@ -1567,6 +1581,7 @@ def test_backup_round_trip():
 
     backup.DATA_DIR = _TMP_DIR
     backup.BACKUP_DIR = _TMP_DIR / "backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(_TEST_GUILD, 77, 1234)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
@@ -1580,6 +1595,178 @@ def test_backup_round_trip():
     check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
     backup.restore_test(manifest)
     check("백업 복구 테스트", True)
+
+
+def test_settings_backup_round_trip():
+    import module.backup as backup
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        data_dir = root / "data"
+        backup_dir = root / "backups"
+        settings_dir = root / "settings"
+        stage = root / "stage"
+        data_dir.mkdir()
+        settings_dir.mkdir()
+        SQLiteAttendanceRepository(data_dir / "attendance_data.db")
+        SQLitePartyRepository(data_dir / "party_data.db")
+        SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+        expected = {
+            "persona.json": b'{"system_prompt":"p","greeting":"g"}\n',
+            "forbidden_words.json": b'["x"]\n',
+            "games.json": b'{"Game":{"max_players":2,"roles":[]}}\n',
+        }
+        for name, content in expected.items():
+            (settings_dir / name).write_bytes(content)
+
+        with (
+            patch.object(backup, "DATA_DIR", data_dir),
+            patch.object(backup, "BACKUP_DIR", backup_dir),
+            patch.object(backup, "SETTINGS_DIR", settings_dir),
+            patch.object(backup, "BACKUP_INTERVAL_SECONDS", 21600),
+            patch.object(backup, "BACKUP_RETENTION_DAYS", 30),
+        ):
+            manifest = backup.create_backup_set(
+                datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+            )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            backup.stage_restore(manifest, stage)
+
+            empty_settings = root / "empty-settings"
+            empty_settings.mkdir()
+            with patch.object(backup, "SETTINGS_DIR", empty_settings):
+                missing_manifest = backup.create_backup_set(
+                    datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
+                )
+            missing_document = json.loads(
+                missing_manifest.read_text(encoding="utf-8")
+            )
+
+            historical_document = json.loads(manifest.read_text(encoding="utf-8"))
+            historical_document.pop("settings")
+            historical_manifest = backup_dir / "historical-db-only-manifest.json"
+            historical_manifest.write_text(
+                json.dumps(historical_document), encoding="utf-8"
+            )
+            historical_stage = root / "historical-stage"
+            try:
+                historical_verified = backup.verify_backup_set(historical_manifest)
+                backup.stage_restore(historical_manifest, historical_stage)
+                historical_ok = bool(historical_verified) and not (
+                    historical_stage / "settings"
+                ).exists()
+            except RuntimeError:
+                historical_ok = False
+
+            corruption_results = []
+            for field, value in (
+                ("size", document["settings"][0]["size"] + 1),
+                ("sha256", "0" * 64),
+            ):
+                invalid_document = json.loads(json.dumps(document))
+                invalid_document["settings"][0][field] = value
+                invalid_manifest = backup_dir / f"invalid-settings-{field}.json"
+                invalid_manifest.write_text(
+                    json.dumps(invalid_document), encoding="utf-8"
+                )
+                invalid_stage = root / f"invalid-settings-{field}"
+                try:
+                    backup.stage_restore(invalid_manifest, invalid_stage)
+                    rejected = False
+                except RuntimeError:
+                    rejected = True
+                corruption_results.append(rejected and not invalid_stage.exists())
+
+            invalid_settings = (
+                ("설정 상위 경로 거부", "../persona.json"),
+                ("설정 source 중복 거부", document["settings"][0]["source"]),
+                ("허용되지 않은 설정 거부", "secret.json"),
+            )
+            invalid_results = []
+            for index, (_, source) in enumerate(invalid_settings):
+                invalid_document = json.loads(json.dumps(document))
+                invalid_document["settings"].append(
+                    {
+                        "source": source,
+                        "backup": document["settings"][1]["backup"],
+                        "size": document["settings"][1]["size"],
+                        "sha256": document["settings"][1]["sha256"],
+                    }
+                )
+                invalid_manifest = backup_dir / f"invalid-setting-source-{index}.json"
+                invalid_manifest.write_text(
+                    json.dumps(invalid_document), encoding="utf-8"
+                )
+                try:
+                    backup.verify_backup_set(invalid_manifest)
+                    invalid_results.append(False)
+                except RuntimeError:
+                    invalid_results.append(True)
+
+            symlink_settings = root / "symlink-settings"
+            symlink_settings.mkdir()
+            target = root / "settings-target.json"
+            target.write_bytes(expected["persona.json"])
+            (symlink_settings / "persona.json").symlink_to(target)
+            with patch.object(backup, "SETTINGS_DIR", symlink_settings):
+                try:
+                    backup.create_backup_set(
+                        datetime.datetime(2026, 8, 7, tzinfo=datetime.timezone.utc)
+                    )
+                    symlink_rejected = False
+                except RuntimeError:
+                    symlink_rejected = True
+
+            directory_settings = root / "directory-settings"
+            directory_settings.mkdir()
+            (directory_settings / "persona.json").mkdir()
+            with patch.object(backup, "SETTINGS_DIR", directory_settings):
+                try:
+                    backup.create_backup_set(
+                        datetime.datetime(2026, 8, 8, tzinfo=datetime.timezone.utc)
+                    )
+                    directory_rejected = False
+                except RuntimeError:
+                    directory_rejected = True
+
+            expired_manifest = backup.create_backup_set(
+                datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+            )
+            expired_document = json.loads(expired_manifest.read_text(encoding="utf-8"))
+            deleted = backup.prune_backups(
+                datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+            )
+
+        check("설정 백업 대상 목록", backup.SETTINGS_FILES == tuple(expected))
+        check(
+            "manifest 설정 3개",
+            {item["source"] for item in document["settings"]} == set(expected),
+        )
+        check(
+            "설정 stage byte 보존",
+            all(
+                (stage / "settings" / name).read_bytes() == content
+                for name, content in expected.items()
+            ),
+        )
+        check(
+            "설정 파일이 없어도 빈 manifest 백업 성공",
+            missing_document["settings"] == [],
+        )
+        check("DB-only historical manifest 복구", historical_ok)
+        check("설정 크기와 checksum은 stage 전 거부", all(corruption_results))
+        check("안전하지 않거나 중복된 설정 manifest 거부", all(invalid_results))
+        check("설정 symlink 백업 거부", symlink_rejected)
+        check("설정 디렉터리 백업 거부", directory_rejected)
+        check(
+            "설정 포함 만료 backup set 정리",
+            deleted == 1
+            and not expired_manifest.exists()
+            and all(
+                not (backup_dir / item["backup"]).exists()
+                for item in expired_document["settings"]
+            ),
+        )
 
 
 def test_legacy_backup_restore_and_prune():
@@ -1769,6 +1956,7 @@ def test_invalid_retention_prevents_pruning():
     for value in (0, -1):
         backup.DATA_DIR = _TMP_DIR / f"invalid-prune-data-{value}"
         backup.BACKUP_DIR = _TMP_DIR / f"invalid-prune-backups-{value}"
+        backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
         backup.BACKUP_INTERVAL_SECONDS = 21600
         backup.BACKUP_RETENTION_DAYS = 30
         SQLiteAttendanceRepository(
@@ -2168,6 +2356,7 @@ def test_backup_same_timestamp_rejected():
 
     backup.DATA_DIR = _TMP_DIR / "collision_data"
     backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     attendance = SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     )
@@ -2195,6 +2384,7 @@ def test_prune_requires_timestamp_bound_filenames():
 
     backup.DATA_DIR = _TMP_DIR / "retention_data"
     backup.BACKUP_DIR = _TMP_DIR / "retention_backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     backup.BACKUP_RETENTION_DAYS = 30
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
@@ -2225,6 +2415,7 @@ def test_backup_publication_is_synced():
 
     backup.DATA_DIR = _TMP_DIR / "durability_data"
     backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     ).add_points(_TEST_GUILD, 1, 100)
@@ -2394,6 +2585,7 @@ if __name__ == "__main__":
         test_channel_sessions()
         test_imports()
         test_backup_round_trip()
+        test_settings_backup_round_trip()
         test_legacy_backup_restore_and_prune()
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()

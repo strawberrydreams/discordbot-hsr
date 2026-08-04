@@ -30,6 +30,7 @@ services:
       # 백업 코드는 온라인 backup API로 읽기만 한다.
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
+      - ./settings:/app/settings:ro
     logging:
       driver: json-file
       options:

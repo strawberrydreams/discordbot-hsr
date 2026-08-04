@@ -264,6 +264,14 @@ for staged in "$RESTORE_STAGE"/*.db; do
   cmp -s "$staged" "runtime/data/$name"
 done
 
+if test -d "$RESTORE_STAGE/settings"; then
+  for staged in "$RESTORE_STAGE"/settings/*.json; do
+    name=${staged##*/}
+    cp -ip "$staged" "settings/$name"
+    cmp -s "$staged" "settings/$name"
+  done
+fi
+
 .venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables, source_name=name)) for name, tables in DATABASES.items()]'
 
 case "$DEPLOYMENT" in

@@ -19,6 +19,8 @@ from module.config import (
     BACKUP_INTERVAL_SECONDS,
     BACKUP_RETENTION_DAYS,
     DATA_DIR,
+    SETTINGS_DIR,
+    SETTINGS_FILES,
 )
 from module.database import (
     SQLITE_TIMEOUT_SECONDS,
@@ -207,12 +209,14 @@ def _create_backup_set(now: datetime | None) -> Path:
     timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
     destinations = [
         *(BACKUP_DIR / f"{timestamp}-{source}" for source in DATABASES),
+        *(BACKUP_DIR / f"{timestamp}-setting-{source}" for source in SETTINGS_FILES),
         BACKUP_DIR / f"{timestamp}-manifest.json",
     ]
     if any(path.exists() for path in destinations):
         raise RuntimeError(f"같은 시각의 백업이 이미 있습니다: {timestamp}")
     temporary_paths: list[Path] = []
     pending: list[tuple[Path, Path, str, dict[str, int]]] = []
+    pending_settings: list[tuple[Path, Path, str]] = []
 
     try:
         for source_name, required_tables in DATABASES.items():
@@ -228,9 +232,27 @@ def _create_backup_set(now: datetime | None) -> Path:
             )
             pending.append((temporary, final, source_name, counts))
 
+        for source_name in SETTINGS_FILES:
+            source = SETTINGS_DIR / source_name
+            if source.is_symlink():
+                raise RuntimeError(f"설정 파일 symlink는 백업하지 않습니다: {source}")
+            if source.exists() and not source.is_file():
+                raise RuntimeError(f"설정 경로가 일반 파일이 아닙니다: {source}")
+            if not source.exists():
+                continue
+            final = BACKUP_DIR / f"{timestamp}-setting-{source_name}"
+            temporary = _temporary_path(f"{timestamp}-setting-{source_name}")
+            temporary_paths.append(temporary)
+            shutil.copy2(source, temporary)
+            pending_settings.append((temporary, final, source_name))
+
         for temporary, _, _, _ in pending:
             _fsync_file(temporary)
+        for temporary, _, _ in pending_settings:
+            _fsync_file(temporary)
         for temporary, final, _, _ in pending:
+            os.replace(temporary, final)
+        for temporary, final, _ in pending_settings:
             os.replace(temporary, final)
         _fsync_directory(BACKUP_DIR)
 
@@ -245,6 +267,15 @@ def _create_backup_set(now: datetime | None) -> Path:
                     "tables": counts,
                 }
                 for _, final, source_name, counts in pending
+            ],
+            "settings": [
+                {
+                    "source": source_name,
+                    "backup": final.name,
+                    "size": final.stat().st_size,
+                    "sha256": _sha256(final),
+                }
+                for _, final, source_name in pending_settings
             ],
         }
         manifest_path = BACKUP_DIR / f"{timestamp}-manifest.json"
@@ -269,10 +300,11 @@ def _load_manifest(manifest_path: Path) -> dict:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         items = manifest["databases"]
+        settings = manifest.get("settings", [])
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RuntimeError(f"백업 manifest를 읽을 수 없습니다: {manifest_path}") from exc
 
-    if not isinstance(items, list):
+    if not isinstance(items, list) or not isinstance(settings, list):
         raise RuntimeError(f"잘못된 백업 manifest입니다: {manifest_path}")
 
     sources: set[str] = set()
@@ -299,6 +331,28 @@ def _load_manifest(manifest_path: Path) -> dict:
 
     if sources != set(DATABASES):
         raise RuntimeError(f"완전하지 않은 백업 manifest입니다: {manifest_path}")
+    setting_sources: set[str] = set()
+    for item in settings:
+        if not isinstance(item, dict):
+            raise RuntimeError(f"잘못된 백업 manifest입니다: {manifest_path}")
+        source = item.get("source")
+        backup = item.get("backup")
+        if (
+            not isinstance(source, str)
+            or source not in SETTINGS_FILES
+            or Path(source).name != source
+            or source in setting_sources
+        ):
+            raise RuntimeError(f"잘못된 백업 설정 항목입니다: {source}")
+        if (
+            not isinstance(backup, str)
+            or Path(backup).name != backup
+            or backup in backups
+        ):
+            raise RuntimeError(f"잘못된 백업 파일 경로입니다: {backup}")
+        setting_sources.add(source)
+        backups.add(backup)
+    manifest["settings"] = settings
     return manifest
 
 
@@ -329,6 +383,18 @@ def verify_backup_set(manifest_path: Path) -> dict[str, dict[str, int]]:
             raise RuntimeError(f"백업 테이블 정보가 일치하지 않습니다: {backup}")
         verified[source_name] = counts
 
+    for item in manifest["settings"]:
+        backup = manifest_path.parent / item["backup"]
+        try:
+            size = backup.stat().st_size
+            checksum = _sha256(backup)
+        except OSError as exc:
+            raise RuntimeError(f"백업 파일을 읽을 수 없습니다: {backup}") from exc
+        if size != item.get("size"):
+            raise RuntimeError(f"백업 파일 크기가 일치하지 않습니다: {backup}")
+        if checksum != item.get("sha256"):
+            raise RuntimeError(f"백업 체크섬이 일치하지 않습니다: {backup}")
+
     return verified
 
 
@@ -338,8 +404,13 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
     verify_backup_set(manifest_path)
     stage = Path(stage)
     destinations = [stage / item["source"] for item in manifest["databases"]]
+    setting_destinations = [
+        stage / "settings" / item["source"] for item in manifest["settings"]
+    ]
     if any(path.exists() for path in destinations):
         raise RuntimeError(f"복구 stage에 DB 파일이 이미 있습니다: {stage}")
+    if any(path.exists() for path in setting_destinations):
+        raise RuntimeError(f"복구 stage에 설정 파일이 이미 있습니다: {stage}")
     stage.mkdir(parents=True, exist_ok=True)
     for item, restored in zip(manifest["databases"], destinations):
         source_name = item["source"]
@@ -351,6 +422,11 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
             DATABASES[source_name],
             source_name=source_name,
         )
+    if setting_destinations:
+        settings_stage = stage / "settings"
+        settings_stage.mkdir(parents=True, exist_ok=True)
+        for item, restored in zip(manifest["settings"], setting_destinations):
+            shutil.copy2(manifest_path.parent / item["backup"], restored)
 
 
 def restore_test(manifest_path: Path) -> None:
@@ -388,6 +464,9 @@ def prune_backups(now: datetime | None = None) -> int:
             if any(
                 item["backup"] != f"{timestamp}-{item['source']}"
                 for item in manifest["databases"]
+            ) or any(
+                item["backup"] != f"{timestamp}-setting-{item['source']}"
+                for item in manifest["settings"]
             ):
                 continue
             verify_backup_set(manifest_path)
@@ -395,6 +474,10 @@ def prune_backups(now: datetime | None = None) -> int:
                 manifest_path.parent / item["backup"]
                 for item in manifest["databases"]
             ]
+            files.extend(
+                manifest_path.parent / item["backup"]
+                for item in manifest["settings"]
+            )
         except RuntimeError:
             continue
         if any(_under_data_dir(path) for path in files):

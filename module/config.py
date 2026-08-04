@@ -39,6 +39,11 @@ def _int_from_env(name: str, default: int | None = None) -> int:
 DATA_DIR = _path_from_env("DATA_DIR", "runtime/data")
 BACKUP_DIR = _path_from_env("BACKUP_DIR", "runtime/backups")
 SETTINGS_DIR = _path_from_env("SETTINGS_DIR", "settings")
+SETTINGS_FILES: tuple[str, ...] = (
+    "persona.json",
+    "forbidden_words.json",
+    "games.json",
+)
 
 
 def load_settings_json(*names: str, default):
