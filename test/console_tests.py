@@ -1271,10 +1271,70 @@ def test_schema_versions():
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
+            guild_columns = tuple(
+                row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
+            )
+            panel_info = list(conn.execute("PRAGMA table_info(party_panels)"))
+            panel_columns = tuple(row[1] for row in panel_info)
+            panel_primary_key = tuple(
+                row[1] for row in sorted(panel_info, key=lambda row: row[5]) if row[5]
+            )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         check(f"settings v{legacy_version} recruit 보존", row == (700, None, None, 0))
         check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
+        check(
+            f"settings v{legacy_version} 정확한 패널 스키마",
+            guild_columns == (
+                "guild_id",
+                "party_channel_id",
+                "music_channel_id",
+                "music_panel_msg_id",
+                "allow_host_announce",
+            )
+            and panel_columns == ("guild_id", "game", "message_id")
+            and panel_primary_key == ("guild_id", "game"),
+        )
         check(f"settings v{legacy_version} 버전", version == 2)
+
+    malformed_schemas = {
+        "extra guild_settings column": """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                obsolete INTEGER
+            )
+        """,
+        "wrong party_panels primary key": """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, message_id)
+            )
+        """,
+    }
+    malformed_rejected = []
+    for label, schema in malformed_schemas.items():
+        malformed_path = _TMP_DIR / f"settings_{label.replace(' ', '_')}.db"
+        with sqlite3.connect(malformed_path) as conn:
+            conn.executescript(schema)
+        try:
+            SQLiteGuildSettingsRepository(malformed_path)
+        except RuntimeError:
+            malformed_rejected.append(True)
+        else:
+            malformed_rejected.append(False)
+    check("잘못된 현재 settings 스키마 거부", all(malformed_rejected))
 
     settings = SQLiteGuildSettingsRepository(_TMP_DIR / "settings_repository.db")
     settings.set_party_panel(7, "LOL", 70)
@@ -1290,6 +1350,10 @@ def test_schema_versions():
     settings.clear_channel(7, 701)
     check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
     check("삭제된 음악 채널은 패널 메시지도 해제", settings.get_party_channel(7) == 700 and settings.get_music_channel(7) is None and settings.get_music_panel_msg(7) is None)
+    settings.set_music_channel(7, 701)
+    settings.set_music_panel_msg(7, 702)
+    settings.clear_channel(7, 700)
+    check("삭제된 파티 채널은 음악 설정을 보존하고 해제", settings.get_party_channel(7) is None and settings.get_music_channel(7) == 701 and settings.get_music_panel_msg(7) == 702)
     check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
     settings.delete_guild(7)
     check("길드 삭제는 설정과 party panel 정리", settings.get_party_panels(7) == {} and settings.get_party_channel(7) is None)

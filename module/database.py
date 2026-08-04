@@ -692,6 +692,14 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         _ALLOW_HOST_ANNOUNCE,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
+    _GUILD_SETTINGS_COLUMN_ORDER = (
+        "guild_id",
+        _PARTY_CHANNEL,
+        _MUSIC_CHANNEL,
+        _MUSIC_PANEL_MESSAGE,
+        _ALLOW_HOST_ANNOUNCE,
+    )
+    _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -708,6 +716,8 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 )
             }
             if "guild_settings" not in tables:
+                if version:
+                    raise RuntimeError("지원하지 않는 guild_settings 스키마입니다.")
                 with conn:
                     self._create_current_tables(conn)
                     _set_schema_version(conn, self._SCHEMA_VERSION)
@@ -728,6 +738,7 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                         """
                     )
                     conn.execute("DROP TABLE guild_settings_v1")
+                    self._require_current_contract(conn)
                     _set_schema_version(conn, self._SCHEMA_VERSION)
                 except Exception:
                     conn.rollback()
@@ -736,10 +747,40 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                     conn.commit()
                 return
 
-            _require_columns(conn, "guild_settings", self._CURRENT_COLUMNS)
             with conn:
                 self._create_party_panels_table(conn)
+                self._require_current_contract(conn)
                 _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    @classmethod
+    def _require_current_contract(cls, conn: sqlite3.Connection) -> None:
+        cls._require_table_contract(
+            conn,
+            "guild_settings",
+            cls._GUILD_SETTINGS_COLUMN_ORDER,
+            ("guild_id",),
+        )
+        cls._require_table_contract(
+            conn,
+            "party_panels",
+            cls._PARTY_PANELS_COLUMN_ORDER,
+            ("guild_id", "game"),
+        )
+
+    @staticmethod
+    def _require_table_contract(
+        conn: sqlite3.Connection,
+        table: str,
+        columns: tuple[str, ...],
+        primary_key: tuple[str, ...],
+    ) -> None:
+        actual = list(conn.execute(f'PRAGMA table_info("{table}")'))
+        actual_columns = tuple(row[1] for row in actual)
+        actual_primary_key = tuple(
+            row[1] for row in sorted(actual, key=lambda row: row[5]) if row[5]
+        )
+        if actual_columns != columns or actual_primary_key != primary_key:
+            raise RuntimeError(f"지원하지 않는 {table} 스키마입니다.")
 
     @staticmethod
     def _create_current_tables(conn: sqlite3.Connection) -> None:
