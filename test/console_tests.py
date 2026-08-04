@@ -77,10 +77,16 @@ _TEST_GUILD = 1
 
 
 class _GuildBound:
-    """모든 리포지토리 호출에 고정 guild_id를 앞에 끼워 넣는다."""
+    """길드 단위 리포지토리 호출에 고정 guild_id를 앞에 끼워 넣는다."""
 
     # 길드 인자를 받지 않는 메서드(전 길드 대상 또는 길드 자체가 인자).
-    _UNBOUND = {"delete_expired_parties", "delete_guild"}
+    _UNBOUND = {
+        "consume_ai_usage",
+        "delete_expired_parties",
+        "delete_guild",
+        "get_ai_usage",
+        "release_ai_usage",
+    }
 
     def __init__(self, repo, guild_id=_TEST_GUILD):
         self._repo = repo
@@ -268,6 +274,10 @@ def test_operations_document_contract():
     check("복구가 stage의 모든 DB를 순회", 'for staged in "$RESTORE_STAGE"/*.db' in restore)
     check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
     check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
+    check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
+    check("AI 한도는 KST 자정 리셋", "매일 KST 자정에 리셋" in operations)
+    check("AI 한도는 포인트와 별도", "포인트와 별도로 적용" in operations)
+    check("provider 계정 예산 안전망 유지", "OpenAI 계정 예산 한도" in operations)
 
 
 def test_deployment_contracts():
@@ -926,6 +936,8 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
     with closing(sqlite3.connect(db_path)) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         pk = [row[1] for row in conn.execute("PRAGMA table_info(users)") if row[5]]
+        ai_cols = {row[1] for row in conn.execute("PRAGMA table_info(ai_usage)")}
+        ai_pk = [row[1] for row in conn.execute("PRAGMA table_info(ai_usage)") if row[5]]
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
@@ -934,6 +946,9 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
                                      "last_attendance_date", "forbidden_count"}, f"({cols})")
     check("복합 기본키 (guild_id, user_id)", pk == ["guild_id", "user_id"], f"({pk})")
     check("원장 테이블 생성", "point_ledger" in tables)
+    check("AI 사용량 테이블 생성", "ai_usage" in tables)
+    check("AI 사용량은 guild_id 없이 전역", ai_cols == {"user_id", "usage_date", "command", "count"})
+    check("AI 사용량 복합 기본키", ai_pk == ["user_id", "usage_date", "command"])
     check("폐기된 luckybox 컬럼 없음", not {"luckybox_count", "last_luckybox_date"} & cols)
 
     # 중복 실행해도 에러가 없어야 함 (멱등성)
@@ -956,7 +971,7 @@ def test_schema_versions():
     SQLitePartyRepository(party_path)
     SQLiteGuildSettingsRepository(settings_path)
 
-    check("attendance 스키마 버전", _user_version(attendance_path) == 1)
+    check("attendance 스키마 버전", _user_version(attendance_path) == 2)
     check("party 스키마 버전", _user_version(party_path) == 1)
     check("settings 스키마 버전", _user_version(settings_path) == 1)
 
@@ -984,6 +999,32 @@ def test_schema_versions():
         "무버전 attendance 데이터 보존",
         SQLiteAttendanceRepository(attendance_path).get_points(1, 2) == 3,
     )
+
+    version_one_path = _TMP_DIR / "attendance_version_one.db"
+    with sqlite3.connect(version_one_path) as conn:
+        conn.executescript("""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                last_attendance_date TEXT,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE TABLE point_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            PRAGMA user_version = 1;
+        """)
+    migrated = SQLiteAttendanceRepository(version_one_path)
+    check("attendance v1에서 v2로 마이그레이션", _user_version(version_one_path) == 2)
+    check("attendance v1 포인트 보존", migrated.get_points(7, 8) == 9_000)
 
     with sqlite3.connect(party_path) as conn:
         conn.execute("PRAGMA user_version = 0")
@@ -1032,6 +1073,40 @@ def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
     final = repo.get_points(user)
     check("동시 차감: 성공 횟수가 잔액과 정확히 일치 (7회)", successes == 7, f"(성공 {successes}회)")
     check("동시 차감: 최종 잔액 0, 음수 아님", final == 0, f"(잔액 {final})")
+
+
+def test_ai_usage_atomicity():
+    print("\n[2] AI 일일 사용량 원자성")
+    repo = SQLiteAttendanceRepository(_TMP_DIR / "ai_usage_atomicity.db")
+    user_id = 200
+    usage_date = "2026-08-04"
+    results = []
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            result = repo.consume_ai_usage(user_id, usage_date, "light", 3)
+            with lock:
+                results.append(result)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    check("AI 사용량 20개 호출 모두 정상 완료", len(results) == 20 and not errors)
+    check("limit=3은 정확히 3번만 성공", sum(result is not None for result in results) == 3)
+    check("light 사용량은 3", repo.get_ai_usage(user_id, usage_date, "light") == 3)
+    check("deep은 light와 분리", repo.consume_ai_usage(user_id, usage_date, "deep", 3) == 1)
+    check("다음 날은 새 한도", repo.consume_ai_usage(user_id, "2026-08-05", "light", 3) == 1)
+    check("예약 반환 3회 성공", all(repo.release_ai_usage(user_id, usage_date, "light") for _ in range(3)))
+    check("0에서 추가 반환 거부", repo.release_ai_usage(user_id, usage_date, "light") is False)
+    check("사용량은 0 아래로 내려가지 않음", repo.get_ai_usage(user_id, usage_date, "light") == 0)
 
 
 def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
@@ -1211,12 +1286,20 @@ def test_cog_facade():
     asyncio.run(cog.increment_forbidden_count(G, 42))
     asyncio.run(cog.increment_forbidden_count(G, 42))
     check("forbidden_count 위임", asyncio.run(cog.get_forbidden_count(G, 42)) == 2)
+    kst_now = datetime.datetime(2026, 8, 4, 23, 59, tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+    with patch("module.attendance_cog.datetime") as mocked_datetime:
+        mocked_datetime.now.return_value = kst_now
+        reservation = asyncio.run(cog.reserve_ai_usage(42, "light", 3))
+        check("KST 날짜로 AI 사용량 예약", reservation == ("2026-08-04", 1))
+        check("AI 사용량 조회 위임", asyncio.run(cog.get_ai_usage(42, "light")) == 1)
+        check("AI 사용량 반환 위임", asyncio.run(cog.release_ai_usage(42, "2026-08-04", "light")) is True)
     check(
         "파사드 전체가 코루틴",
         all(
             inspect.iscoroutinefunction(getattr(AttendanceCog, name))
             for name in ("get_points", "add_points", "deduct_points",
-                         "get_ledger", "increment_forbidden_count", "get_forbidden_count")
+                         "get_ledger", "reserve_ai_usage", "release_ai_usage",
+                         "get_ai_usage", "increment_forbidden_count", "get_forbidden_count")
         ),
     )
 
@@ -1939,6 +2022,7 @@ if __name__ == "__main__":
         repo = test_schema_initialization()
         test_schema_versions()
         test_deduct_points_atomicity(repo)
+        test_ai_usage_atomicity()
         test_attendance_atomicity(repo)
         test_party_repository()
         test_party_capacity_constraint()

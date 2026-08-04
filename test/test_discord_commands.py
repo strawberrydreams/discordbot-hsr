@@ -61,6 +61,7 @@ class MinimalConfigTest(unittest.TestCase):
         self.assertTrue(config.CHAT_MODEL_LIGHT)
         self.assertTrue(config.IMAGE_MODEL)
         self.assertGreater(config.LIMIT_LIGHT, 0)
+        self.assertGreater(config.LIMIT_DEEP, 0)
         self.assertGreater(config.LIMIT_IMAGE, 0)
 
 
@@ -302,17 +303,33 @@ class FinanceTimeoutAndCacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RecordingAttendance:
-    def __init__(self, refund_error=None):
+    def __init__(self, refund_error=None, reserve_result=("2026-08-04", 1), deduct_result=True, usage=None):
         self.deductions = []
         self.refunds = []
         self.refund_attempts = []
         self.reasons = []
+        self.reservations = []
+        self.releases = []
         self.refund_error = refund_error
+        self.reserve_result = reserve_result
+        self.deduct_result = deduct_result
+        self.usage = usage or {}
+
+    async def reserve_ai_usage(self, user_id, command, limit):
+        self.reservations.append((user_id, command, limit))
+        return self.reserve_result
+
+    async def release_ai_usage(self, user_id, usage_date, command):
+        self.releases.append((user_id, usage_date, command))
+        return True
+
+    async def get_ai_usage(self, user_id, command):
+        return self.usage.get(command, 0)
 
     async def deduct_points(self, guild_id, user_id, amount, reason="unspecified"):
         self.deductions.append((user_id, amount))
         self.reasons.append(reason)
-        return True
+        return self.deduct_result
 
     async def get_points(self, guild_id, user_id):
         return 0
@@ -330,6 +347,54 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.google_key = patch("module.hyacine_image_cog.GOOGLE_API_KEY", "test-dummy")
         self.google_key.start()
         self.addCleanup(self.google_key.stop)
+
+    async def test_daily_limit_stops_before_points_and_provider(self):
+        attendance = RecordingAttendance(reserve_result=None)
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        provider_calls = []
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **kwargs: provider_calls.append(kwargs)
+            )
+        )
+
+        await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(
+            attendance.reservations,
+            [(123, "image", config.LIMIT_IMAGE)],
+        )
+        self.assertEqual(attendance.deductions, [])
+        self.assertEqual(provider_calls, [])
+        self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
+
+    async def test_insufficient_points_releases_reserved_slot(self):
+        attendance = RecordingAttendance(deduct_result=False)
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+
+        await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
+        self.assertIn("포인트가 부족", interaction.response.messages[-1][0][0])
+
+    async def test_defer_failure_refunds_points_and_releases_slot(self):
+        attendance = RecordingAttendance()
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+
+        async def fail_defer():
+            raise RuntimeError("defer transport failed")
+
+        interaction.response.defer = fail_defer
+        with patch("module.hyacine_image_cog.print"), patch(
+            "module.hyacine_image_cog.traceback.print_exc"
+        ):
+            await HyacineImageCog._image.callback(cog, interaction, "test")
+
+        self.assertEqual(attendance.refunds, [(123, 30_000)])
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
 
     async def test_defer_and_refund_failures_request_manual_reconciliation_once(self):
         attendance = RecordingAttendance(
@@ -353,6 +418,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(escaped)
         self.assertEqual(attendance.refund_attempts, [(123, 30_000)])
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
         messages = interaction.response.messages + interaction.followup.messages
         self.assertTrue(messages)
         message = messages[-1][0][0]
@@ -379,6 +445,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
             await HyacineImageCog._image.callback(cog, interaction, "test")
 
         self.assertEqual(attendance.refunds, [(123, 30_000)])
+        self.assertEqual(attendance.releases, [])
 
     async def test_empty_image_response_refunds_only_once_when_error_message_fails(self):
         attendance = RecordingAttendance()
@@ -495,7 +562,10 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
-        self.cog = HyacineChatCog(bot=None)
+        self.attendance = RecordingAttendance()
+        self.cog = HyacineChatCog(
+            bot=SimpleNamespace(get_cog=lambda _: self.attendance)
+        )
 
     def test_chat_command_set_replaces_switching_commands(self):
         names = {command.name for command in self.cog.get_app_commands()}
@@ -519,13 +589,18 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
-                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 200),
-                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000),
+                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 200, "light", config.LIMIT_LIGHT),
+                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000, "deep", config.LIMIT_DEEP),
             ],
         )
 
     async def test_status_lists_both_models_and_last_usage(self):
         interaction = FakeInteraction(channel_id=1)
+        self.attendance.usage = {
+            "light": 3,
+            "deep": config.LIMIT_DEEP + 5,
+            "image": 1,
+        }
         self.cog.get_session(1).last_usage = {
             "model": "gpt-5.6-sol",
             "input_tokens": 12,
@@ -538,6 +613,62 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         message = interaction.response.messages[-1][0][0]
         for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
             self.assertIn(text, message)
+        for text in (
+            f"{max(0, config.LIMIT_LIGHT - 3)}/{config.LIMIT_LIGHT}회",
+            f"0/{config.LIMIT_DEEP}회",
+            f"{config.LIMIT_IMAGE - 1}/{config.LIMIT_IMAGE}회",
+        ):
+            self.assertIn(text, message)
+
+    async def test_status_preserves_models_when_attendance_is_unavailable(self):
+        self.cog.bot = None
+        interaction = FakeInteraction(channel_id=1)
+        self.cog.get_session(1).last_usage = {
+            "model": "gpt-5.6-sol",
+            "total_tokens": 46,
+        }
+
+        await HyacineChatCog._status.callback(self.cog, interaction)
+
+        message = interaction.response.messages[-1][0][0]
+        self.assertIn("gpt-5.6-terra", message)
+        self.assertIn("gpt-5.6-sol", message)
+        self.assertIn("46", message)
+        self.assertIn("확인할 수 없어요", message)
+
+    async def test_daily_limit_stops_before_points_and_provider(self):
+        attendance = RecordingAttendance(reserve_result=None)
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
+        interaction = FakeInteraction(channel_id=1)
+        provider_calls = []
+
+        async def provider(**kwargs):
+            provider_calls.append(kwargs)
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=provider)
+        )
+
+        await self.cog._run_talk(
+            interaction, "test", None, "gpt-5.6-terra", "none", 200,
+            "light", config.LIMIT_LIGHT,
+        )
+
+        self.assertEqual(attendance.deductions, [])
+        self.assertEqual(provider_calls, [])
+        self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
+
+    async def test_insufficient_points_releases_reserved_slot(self):
+        attendance = RecordingAttendance(deduct_result=False)
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
+        interaction = FakeInteraction(channel_id=1)
+
+        await self.cog._run_talk(
+            interaction, "test", None, "gpt-5.6-terra", "none", 200,
+            "light", config.LIMIT_LIGHT,
+        )
+
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "light")])
 
     async def test_image_url_is_sent_once_but_not_saved_in_history(self):
         interaction = FakeInteraction(channel_id=1)
@@ -560,7 +691,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             responses=SimpleNamespace(create=response)
         )
         await self.cog._run_talk(
-            interaction, "", attachment, "gpt-5.6-terra", "none", 0
+            interaction, "", attachment, "gpt-5.6-terra", "none", 0,
+            "light", config.LIMIT_LIGHT,
         )
 
         self.assertIn(attachment.url, repr(captured["input"]))
@@ -583,12 +715,14 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
             await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
+                "deep", config.LIMIT_DEEP,
             )
 
         self.assertEqual(attendance.deductions, [(123, 2_000)])
         self.assertEqual(attendance.refunds, [(123, 2_000)])
         self.assertEqual(bot.calls, 1)
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
         self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
 
     async def test_empty_response_refunds_charged_points(self):
@@ -605,7 +739,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("module.hyacine_chat_cog.traceback.print_exc"):
             await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
+                "deep", config.LIMIT_DEEP,
             )
 
         self.assertEqual(attendance.refunds, [(123, 2_000)])
@@ -627,7 +762,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
             await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
+                "deep", config.LIMIT_DEEP,
             )
 
         self.assertNotIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
@@ -646,10 +782,12 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
             await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
+                "deep", config.LIMIT_DEEP,
             )
 
         self.assertEqual(attendance.refunds, [(123, 2_000)])
+        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
         self.assertEqual(interaction.followup.messages, [])
         self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
 
@@ -661,7 +799,8 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.openai_key.stop)
 
     async def test_same_channel_calls_do_not_interleave_history(self):
-        cog = HyacineChatCog(bot=None)
+        attendance = RecordingAttendance()
+        cog = HyacineChatCog(bot=SimpleNamespace(get_cog=lambda _: attendance))
         # 첫 호출의 응답이 두 번째보다 늦게 끝나도록 지연시킨다.
         delays = {"first": 0.05, "second": 0.0}
 
@@ -677,8 +816,8 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(responses=SimpleNamespace(create=delayed))
 
         await asyncio.gather(
-            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", 0),
-            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", 0),
+            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
+            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
         )
 
         roles = [m["role"] for m in cog.get_session(1).history if m["role"] != "system"]
@@ -774,13 +913,15 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
             await cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000
+                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
+                "deep", config.LIMIT_DEEP,
             )
 
         message = interaction.followup.messages[-1][0][0]
         self.assertIn("요청이 몰려", message)
         self.assertIn("포인트 환불됨", message)
         self.assertEqual(attendance.refunds, [(123, 2_000)])
+        self.assertEqual(attendance.releases, [])
 
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
@@ -1551,7 +1692,10 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                cog = HyacineChatCog(bot=None)
+                attendance = RecordingAttendance()
+                cog = HyacineChatCog(
+                    bot=SimpleNamespace(get_cog=lambda _: attendance)
+                )
                 old_session = cog.get_session(1)
                 persona_path.write_text(
                     json.dumps({"system_prompt": "new prompt", "greeting": "new greeting"}),
@@ -1576,10 +1720,12 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     responses=SimpleNamespace(create=response)
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=1), "old", None, "test-model", "none", 0
+                    FakeInteraction(channel_id=1), "old", None, "test-model", "none", 0,
+                    "light", config.LIMIT_LIGHT,
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=2), "new", None, "test-model", "none", 0
+                    FakeInteraction(channel_id=2), "new", None, "test-model", "none", 0,
+                    "light", config.LIMIT_LIGHT,
                 )
                 old_hello = FakeInteraction(channel_id=1)
                 new_hello = FakeInteraction(channel_id=2)

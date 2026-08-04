@@ -10,9 +10,8 @@
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
 # ── 멀티 길드 ──
-# 봇은 여러 서버(길드)에 동시에 설치될 수 있다. 포인트·파티·설정은 모두 길드별로
-# 격리되며, 그 격리는 애플리케이션이 아니라 스키마가 보장한다. 모든 테이블의
-# 기본키에 guild_id가 포함되므로 guild_id를 빠뜨린 쿼리는 성립하지 않는다.
+# 포인트·출석·금지어·파티·설정은 스키마의 guild_id로 길드별 격리된다.
+# AI 일일 사용량은 하나의 인스턴스 안에서 유저별 전역이므로 guild_id를 저장하지 않는다.
 #
 # ── 동시성 ──
 # 리포지토리 메서드는 모두 동기(blocking)다. discord.py의 이벤트 루프에서 직접
@@ -99,7 +98,7 @@ def _record_ledger(
 # ─────────── 인터페이스 ─────────── #
 
 class AttendanceRepository(ABC):
-    """포인트·출석·금지어 카운트 데이터 접근 인터페이스. 모두 길드 단위로 격리된다."""
+    """길드별 출석/포인트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
 
     @abstractmethod
     def get_points(self, guild_id: int, user_id: int) -> int:
@@ -146,6 +145,20 @@ class AttendanceRepository(ABC):
     @abstractmethod
     def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
         """해당 길드의 포인트 상위 유저 [(user_id, points), ...]."""
+
+    @abstractmethod
+    def consume_ai_usage(
+        self, user_id: int, usage_date: str, command: str, limit: int
+    ) -> Optional[int]:
+        """인스턴스 전역 일일 사용량을 원자적으로 예약하고 새 count를 반환한다."""
+
+    @abstractmethod
+    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+        """예약한 일일 사용량을 0 아래로 내리지 않고 반환한다."""
+
+    @abstractmethod
+    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+        """인스턴스 전역 일일 사용량을 반환한다."""
 
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
@@ -227,7 +240,7 @@ class GuildSettingsRepository(ABC):
 # ─────────── SQLite 구현 ─────────── #
 
 class SQLiteAttendanceRepository(AttendanceRepository):
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -265,6 +278,15 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 "CREATE INDEX IF NOT EXISTS idx_ledger_user "
                 "ON point_ledger (guild_id, user_id, id DESC)"
             )
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ai_usage (
+                    user_id INTEGER NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    count INTEGER NOT NULL CHECK (count >= 0),
+                    PRIMARY KEY (user_id, usage_date, command)
+                )
+            """)
             _require_columns(
                 conn,
                 "users",
@@ -274,6 +296,11 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 conn,
                 "point_ledger",
                 {"id", "guild_id", "user_id", "delta", "reason", "created_at"},
+            )
+            _require_columns(
+                conn,
+                "ai_usage",
+                {"user_id", "usage_date", "command", "count"},
             )
             _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
@@ -287,6 +314,45 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             )
             result = c.fetchone()
             return result[0] if result else 0
+
+    def consume_ai_usage(
+        self, user_id: int, usage_date: str, command: str, limit: int
+    ) -> Optional[int]:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ai_usage (user_id, usage_date, command, count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_id, usage_date, command) DO UPDATE SET count = count + 1
+                WHERE count < ?
+                RETURNING count
+                """,
+                (user_id, usage_date, command, limit),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            return row[0] if row else None
+
+    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                "UPDATE ai_usage SET count = count - 1 "
+                "WHERE user_id = ? AND usage_date = ? AND command = ? AND count > 0",
+                (user_id, usage_date, command),
+            )
+            released = cursor.rowcount > 0
+            conn.commit()
+            return released
+
+    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT count FROM ai_usage "
+                "WHERE user_id = ? AND usage_date = ? AND command = ?",
+                (user_id, usage_date, command),
+            ).fetchone()
+            conn.commit()
+            return row[0] if row else 0
 
     def add_points(
         self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"

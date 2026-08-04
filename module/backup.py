@@ -23,7 +23,7 @@ from module.config import (
 from module.database import SQLITE_TIMEOUT_SECONDS
 
 DATABASES = {
-    "attendance_data.db": {"users", "point_ledger"},
+    "attendance_data.db": {"users", "point_ledger", "ai_usage"},
     "party_data.db": {"parties", "participants"},
     "guild_settings.db": {"guild_settings"},
 }
