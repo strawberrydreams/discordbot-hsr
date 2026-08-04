@@ -38,11 +38,12 @@
 .venv/bin/python -c '
 from module.database import create_attendance_repository
 import datetime
+GUILD_ID = 000000000000000000  # 대상 서버 ID로 교체
 USER_ID = 000000000000000000  # 대상 사용자 ID로 교체
 repo = create_attendance_repository()
-for delta, reason, at in repo.get_ledger(USER_ID, limit=50):
+for delta, reason, at in repo.get_ledger(GUILD_ID, USER_ID, limit=50):
     print(datetime.datetime.fromtimestamp(at), f"{delta:+,}", reason)
-print("잔액:", repo.get_points(USER_ID))'
+print("잔액:", repo.get_points(GUILD_ID, USER_ID))'
 ```
 
 `chat:<model>` / `image` 차감에 짝이 되는 `chat_refund:<model>` / `image_refund` 행이 없으면 환불이 누락된 것입니다. 원장 합계는 항상 현재 잔액과 일치해야 합니다.
@@ -161,7 +162,7 @@ DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도**
 
 ## 검증된 백업으로 실제 복구
 
-복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 두 덮어쓰기를 각각 승인합니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
+복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 각 DB 덮어쓰기를 승인합니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
 
 ```bash
 (
@@ -208,13 +209,13 @@ import shutil
 import sys
 from pathlib import Path
 
-from module.backup import restore_test
+from module.backup import DATABASES, restore_test
 
 manifest_path = Path(sys.argv[1])
 stage = Path(sys.argv[2])
 document = json.loads(manifest_path.read_text(encoding="utf-8"))
 items = document.get("databases")
-expected = {"attendance_data.db", "party_data.db"}
+expected = set(DATABASES)
 entries = {}
 backup_names = set()
 
@@ -238,7 +239,7 @@ for item in items:
     entries[source] = manifest_path.parent / backup
     backup_names.add(backup)
 if set(entries) != expected:
-    raise RuntimeError("manifest에 두 운영 DB가 정확히 한 번씩 있어야 합니다.")
+    raise RuntimeError("manifest에 운영 DB가 정확히 한 번씩 있어야 합니다.")
 
 restore_test(manifest_path)
 for source, backup_path in entries.items():
@@ -246,15 +247,18 @@ for source, backup_path in entries.items():
 PY
 
 EMERGENCY_DIR=$(mktemp -d "runtime/emergency.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
-cp -p runtime/data/attendance_data.db runtime/data/party_data.db "$EMERGENCY_DIR"/
-cmp -s runtime/data/attendance_data.db "$EMERGENCY_DIR/attendance_data.db"
-cmp -s runtime/data/party_data.db "$EMERGENCY_DIR/party_data.db"
+for staged in "$RESTORE_STAGE"/*.db; do
+  name=${staged##*/}
+  cp -p "runtime/data/$name" "$EMERGENCY_DIR/$name"
+  cmp -s "runtime/data/$name" "$EMERGENCY_DIR/$name"
+done
 ls -l "$EMERGENCY_DIR" "$RESTORE_STAGE"
 
-cp -ip "$RESTORE_STAGE/attendance_data.db" runtime/data/attendance_data.db
-cp -ip "$RESTORE_STAGE/party_data.db" runtime/data/party_data.db
-cmp -s "$RESTORE_STAGE/attendance_data.db" runtime/data/attendance_data.db
-cmp -s "$RESTORE_STAGE/party_data.db" runtime/data/party_data.db
+for staged in "$RESTORE_STAGE"/*.db; do
+  name=${staged##*/}
+  cp -ip "$staged" "runtime/data/$name"
+  cmp -s "$staged" "runtime/data/$name"
+done
 
 .venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables)) for name, tables in DATABASES.items()]'
 

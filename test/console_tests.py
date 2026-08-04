@@ -246,6 +246,17 @@ def test_public_env_contract():
         ).returncode
         == 0,
     )
+
+
+def test_operations_document_contract():
+    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    check("복구 DB 목록은 코드에서 가져옴", "expected = set(DATABASES)" in restore)
+    check("복구가 stage의 모든 DB를 순회", 'for staged in "$RESTORE_STAGE"/*.db' in restore)
+    check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
+    check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
+
+
 def test_deployment_contracts():
     import plistlib
 
@@ -1831,6 +1842,7 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
+        test_operations_document_contract()
         test_deployment_contracts()
         test_deployment_contracts_skip_only_compose_when_cli_missing()
         test_forbidden_words_degrade_gracefully()
