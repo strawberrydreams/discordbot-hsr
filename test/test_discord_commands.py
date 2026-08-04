@@ -8,7 +8,7 @@ import unittest
 import warnings
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import discord
 import httpx
@@ -16,7 +16,7 @@ import openai
 
 import module.config as config
 import module.main as bot_main
-from module.attendance_cog import AttendanceCog
+from module.attendance_cog import AttendanceCog, KST
 from module.database import SQLiteAttendanceRepository, SQLitePartyRepository
 from module.eventnotice_cog import EventNoticeCog
 from module.finance_cog import FinanceCog
@@ -595,12 +595,23 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_status_lists_both_models_and_last_usage(self):
+        class RecordingUsageRepository:
+            def __init__(self):
+                self.calls = []
+                self.counts = {
+                    "light": 3,
+                    "deep": config.LIMIT_DEEP + 5,
+                    "image": 1,
+                }
+
+            def get_ai_usage(self, user_id, usage_date, command):
+                self.calls.append((user_id, usage_date, command))
+                return self.counts[command]
+
+        repository = RecordingUsageRepository()
+        attendance = AttendanceCog(bot=None, repository=repository)
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
-        self.attendance.usage = {
-            "light": 3,
-            "deep": config.LIMIT_DEEP + 5,
-            "image": 1,
-        }
         self.cog.get_session(1).last_usage = {
             "model": "gpt-5.6-sol",
             "input_tokens": 12,
@@ -608,17 +619,32 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 46,
         }
 
-        await HyacineChatCog._status.callback(self.cog, interaction)
+        with patch("module.attendance_cog.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 8, 5, 0, 1, tzinfo=KST)
+            await HyacineChatCog._status.callback(self.cog, interaction)
 
         message = interaction.response.messages[-1][0][0]
         for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
             self.assertIn(text, message)
-        for text in (
-            f"{max(0, config.LIMIT_LIGHT - 3)}/{config.LIMIT_LIGHT}회",
-            f"0/{config.LIMIT_DEEP}회",
-            f"{config.LIMIT_IMAGE - 1}/{config.LIMIT_IMAGE}회",
-        ):
-            self.assertIn(text, message)
+        lines = message.splitlines()
+        self.assertIn(
+            f"- `/기본대화`: {max(0, config.LIMIT_LIGHT - 3)}/{config.LIMIT_LIGHT}회",
+            lines,
+        )
+        self.assertIn(f"- `/고급대화`: 0/{config.LIMIT_DEEP}회", lines)
+        self.assertIn(
+            f"- `/이미지`: {config.LIMIT_IMAGE - 1}/{config.LIMIT_IMAGE}회",
+            lines,
+        )
+        self.assertEqual(
+            repository.calls,
+            [
+                (123, "2026-08-05", "light"),
+                (123, "2026-08-05", "deep"),
+                (123, "2026-08-05", "image"),
+            ],
+        )
+        self.assertEqual(mocked_datetime.now.call_args_list, [call(KST)] * 3)
 
     async def test_status_preserves_models_when_attendance_is_unavailable(self):
         self.cog.bot = None
