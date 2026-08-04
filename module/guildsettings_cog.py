@@ -41,7 +41,7 @@ class SetupView(discord.ui.View):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         party, music = await self.cog._ensure_bot_channels(guild)
         await interaction.followup.send(
             f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}",

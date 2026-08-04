@@ -1403,8 +1403,8 @@ class _DeferredSetupResponse:
     def __init__(self, events):
         self.events = events
 
-    async def defer(self, *, ephemeral):
-        self.events.append(("defer", {"ephemeral": ephemeral}))
+    async def defer(self, **kwargs):
+        self.events.append(("defer", kwargs))
 
     async def send_message(self, *args, **kwargs):
         self.events.append(("response", args, kwargs))
@@ -1540,7 +1540,9 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
             )
             await GuildSettingsCog._start.callback(cog, slash)
 
-        self.assertEqual(button_events[0], ("defer", {"ephemeral": True}))
+        self.assertEqual(
+            button_events[0], ("defer", {"ephemeral": True, "thinking": True})
+        )
         self.assertEqual(button_events[1][0], "followup")
         self.assertTrue(button_events[1][2]["ephemeral"])
         self.assertEqual(slash_events[0], ("defer", {"ephemeral": True}))
