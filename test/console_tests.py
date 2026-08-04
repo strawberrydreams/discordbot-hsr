@@ -267,6 +267,36 @@ def test_forbidden_word_document_path():
     check("폐기된 금지어 env 없음", "FORBIDDEN_WORDS_FILE" not in public_docs)
 
 
+def test_readme_public_distribution_contract():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    required = (
+        "자가 호스팅 커뮤니티 유틸리티 봇",
+        "자신의 Discord Application과 봇 토큰",
+        "Guild Install만",
+        "`bot`, `applications.commands`",
+        "`View Channel`",
+        "`Send Messages`",
+        "`Read Message History`",
+        "`Embed Links`",
+        "`Attach Files`",
+        "`Message Content`와 `Server Members`",
+        "`Public Bot`을 끄세요",
+        "Portal 설정을 변경하지는 않습니다",
+        "settings/forbidden_words.json",
+        "사용자별 KST 일일 AI 한도",
+        "`LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`",
+        "provider 계정에도 예산 상한",
+        "Docker Compose를 권장",
+        "launchd 선택 사항",
+    )
+    check("README 공개 배포 계약", all(term in readme for term in required))
+    check(
+        "README는 Hyacine 팬 프로젝트 고지 유지",
+        "Hyacine" in readme and "비공식 팬 프로젝트" in readme and "HoYoverse" in readme,
+    )
+    check("README는 타인 호스팅을 약속하지 않음", "다른 사람에게 봇을 호스팅" in readme)
+
+
 def test_operations_document_contract():
     operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
     restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
@@ -2072,6 +2102,8 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
+        test_forbidden_word_document_path()
+        test_readme_public_distribution_contract()
         test_operations_document_contract()
         test_deployment_contracts()
         test_macos_templates_render_portably()
