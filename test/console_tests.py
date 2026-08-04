@@ -113,6 +113,7 @@ class _GuildBound:
         "delete_expired_parties",
         "delete_guild",
         "get_ai_usage",
+        "list_expired_parties",
         "release_ai_usage",
     }
 
@@ -1215,7 +1216,7 @@ def test_schema_versions():
     SQLiteGuildSettingsRepository(settings_path)
 
     check("attendance 스키마 버전", _user_version(attendance_path) == 2)
-    check("party 스키마 버전", _user_version(party_path) == 1)
+    check("party 스키마 버전", _user_version(party_path) == 2)
     check("settings 스키마 버전", _user_version(settings_path) == 2)
 
     for label, repository in (
@@ -1271,12 +1272,53 @@ def test_schema_versions():
 
     with sqlite3.connect(party_path) as conn:
         conn.execute("PRAGMA user_version = 0")
-        conn.execute("INSERT INTO parties VALUES (1, 'LOL', 3)")
+        conn.execute(
+            "INSERT INTO parties (guild_id, game, created_at) VALUES (1, 'LOL', 3)"
+        )
     SQLitePartyRepository(party_path)
     check(
         "무버전 party 데이터 보존",
         SQLitePartyRepository(party_path).get_party(1, "LOL") == (3,),
     )
+
+    for legacy_version in (0, 1):
+        legacy_party_path = _TMP_DIR / f"party_v{legacy_version}_to_v2.db"
+        with sqlite3.connect(legacy_party_path) as conn:
+            conn.executescript(f"""
+                CREATE TABLE parties (
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, game)
+                );
+                CREATE TABLE participants (
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    role TEXT,
+                    PRIMARY KEY (guild_id, game, user_id)
+                );
+                INSERT INTO parties VALUES (1, 'A', 10), (1, 'B', 20);
+                INSERT INTO participants VALUES
+                    (1, 'B', 7, 'B-role'),
+                    (1, 'A', 7, 'A-role'),
+                    (1, 'A', 8, NULL);
+                PRAGMA user_version = {legacy_version};
+            """)
+        party_v2 = SQLitePartyRepository(legacy_party_path)
+        check(
+            f"party v{legacy_version}에서 v2로 마이그레이션",
+            _user_version(legacy_party_path) == 2,
+        )
+        check(
+            f"party v{legacy_version} 중복 참가를 game 이름 순으로 정리",
+            party_v2.get_user_party(1, 7) == "A"
+            and party_v2.get_participants(1, "B") == {},
+        )
+        check(
+            f"party v{legacy_version} 방장 결정",
+            party_v2.get_party_host(1, "A") == 7,
+        )
 
     for legacy_version in (0, 1):
         legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v2.db"
@@ -1563,13 +1605,16 @@ def test_party_cog_uses_epoch_seconds():
         created_at = None
         cutoff = None
 
-        def create_party(self, guild_id, game, created_at):
+        def create_party(self, guild_id, game, created_at, host_id=None):
             self.created_at = created_at
             return True
 
-        def delete_expired_parties(self, cutoff):
+        def list_expired_parties(self, cutoff):
             self.cutoff = cutoff
             return []
+
+        def delete_party_if_expired(self, guild_id, game, cutoff):
+            return False
 
     repository = RecordingRepository()
     cog = object.__new__(PlayWithCog)

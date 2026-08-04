@@ -1,5 +1,6 @@
 """Persistent per-game party panels."""
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -29,45 +30,65 @@ def _game_key(game: str) -> str:
     return hashlib.sha256(game.encode("utf-8")).hexdigest()[:16]
 
 
+def _role_key(role: str) -> str:
+    return hashlib.sha256(role.encode("utf-8")).hexdigest()[:16]
+
+
 def _bounded(value: str, limit: int = EMBED_FIELD_VALUE_LIMIT) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
 class PartyPanelButton(discord.ui.Button):
-    def __init__(self, cog: "PlayWithCog", game: str, role: Optional[str], index: int):
-        kind = "toggle" if role is None else "role"
-        label = "모집 / 역할 미정" if role is None else role[:80]
+    def __init__(
+        self,
+        cog: "PlayWithCog",
+        game: str,
+        action: str,
+        role: Optional[str] = None,
+        *,
+        disabled: bool = False,
+    ):
+        labels = {"inactive": "모집 시작", "toggle": "참가 / 나가기"}
+        suffix = _role_key(role) if role is not None else action
         super().__init__(
-            label=label,
+            label=role[:80] if role is not None else labels[action],
             style=(
                 discord.ButtonStyle.success
-                if role is None
+                if action != "role"
                 else discord.ButtonStyle.primary
             ),
-            custom_id=f"party:{kind}:{_game_key(game)}:{index}",
+            custom_id=f"party:{action}:{_game_key(game)}:{suffix}",
+            disabled=disabled,
         )
         self.cog = cog
         self.game = game
+        self.action = action
         self.role = role
 
     async def callback(self, interaction: discord.Interaction):
-        await self.cog.handle_panel_click(interaction, self.game, self.role)
+        await self.cog.handle_panel_click(
+            interaction, self.game, self.action, self.role
+        )
 
 
 class PartyPanelView(discord.ui.View):
     """One persistent view per game; IDs never contain the raw game name."""
 
-    def __init__(self, cog: "PlayWithCog", game: str):
+    def __init__(self, cog: "PlayWithCog", game: str, *, active: bool = False):
         super().__init__(timeout=None)
         roles = GAMES[game]["roles"]
         if len(roles) + 1 > MAX_COMPONENTS:
             return
         if not roles:
-            self.add_item(PartyPanelButton(cog, game, None, 0))
+            self.add_item(PartyPanelButton(cog, game, "toggle"))
             return
-        self.add_item(PartyPanelButton(cog, game, None, 0))
-        for index, role in enumerate(roles, start=1):
-            self.add_item(PartyPanelButton(cog, game, role, index))
+        self.add_item(
+            PartyPanelButton(cog, game, "inactive", disabled=active)
+        )
+        for role in roles:
+            self.add_item(
+                PartyPanelButton(cog, game, "role", role, disabled=not active)
+            )
 
 
 class PlayWithCog(commands.Cog):
@@ -82,6 +103,7 @@ class PlayWithCog(commands.Cog):
         self.settings = settings or create_guild_settings_repository()
         self.views = {game: PartyPanelView(self, game) for game in GAMES}
         self._panels_restored = False
+        self._restore_lock = asyncio.Lock()
         if bot is not None:
             for view in self.views.values():
                 if view.children:
@@ -94,8 +116,13 @@ class PlayWithCog(commands.Cog):
     async def get_active_party(self, guild_id: int, game: str):
         return await run_db(self.db.get_party, guild_id, game)
 
-    async def create_party(self, guild_id: int, game: str):
-        return await run_db(self.db.create_party, guild_id, game, int(time.time()))
+    async def create_party(self, guild_id: int, game: str, host_id: Optional[int] = None):
+        return await run_db(
+            self.db.create_party, guild_id, game, int(time.time()), host_id
+        )
+
+    async def get_party_host(self, guild_id: int, game: str):
+        return await run_db(self.db.get_party_host, guild_id, game)
 
     async def delete_party(self, guild_id: int, game: str):
         await run_db(self.db.delete_party, guild_id, game)
@@ -116,14 +143,12 @@ class PlayWithCog(commands.Cog):
         )
 
     async def remove_participant(self, guild_id: int, game: str, user_id: int):
-        await run_db(self.db.remove_participant, guild_id, game, user_id)
+        return await run_db(self.db.remove_participant, guild_id, game, user_id)
 
     async def get_user_party(self, guild_id: int, user_id: int):
         return await run_db(self.db.get_user_party, guild_id, user_id)
 
-    async def _reject_invalid_interaction(
-        self, interaction: discord.Interaction, game: str
-    ) -> bool:
+    async def _reject_invalid_interaction(self, interaction: discord.Interaction) -> bool:
         guild = interaction.guild
         guild_id = interaction.guild_id
         if guild is None or guild_id is None:
@@ -137,51 +162,77 @@ class PlayWithCog(commands.Cog):
             )
             return True
 
-        panels = await run_db(self.settings.get_party_panels, guild_id)
-        message = getattr(interaction, "message", None)
-        if message is None or panels.get(game) != message.id:
-            await interaction.response.send_message(
-                "❌ 현재 서버의 최신 파티 패널이 아닙니다.", ephemeral=True
-            )
-            return True
         return False
 
+    async def _is_current_panel(self, interaction: discord.Interaction, game: str) -> bool:
+        panels = await run_db(self.settings.get_party_panels, interaction.guild_id)
+        message = getattr(interaction, "message", None)
+        return message is not None and panels.get(game) == message.id
+
     async def handle_panel_click(
-        self, interaction: discord.Interaction, game: str, role: Optional[str]
+        self,
+        interaction: discord.Interaction,
+        game: str,
+        action: str,
+        role: Optional[str] = None,
     ) -> None:
-        if await self._reject_invalid_interaction(interaction, game):
+        if await self._reject_invalid_interaction(interaction):
             return
 
         guild_id = interaction.guild_id
         user_id = interaction.user.id
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with panel_lock(guild_id, f"party:{game}"):
-            current_game = await self.get_user_party(guild_id, user_id)
+            if not await self._is_current_panel(interaction, game):
+                await interaction.followup.send(
+                    "❌ 현재 서버의 최신 파티 패널이 아닙니다.", ephemeral=True
+                )
+                return
+
             party = await self.get_active_party(guild_id, game)
             participants = await self.get_participants(guild_id, game) if party else {}
+            current_game = await self.get_user_party(guild_id, user_id)
 
-            if current_game and current_game != game:
-                result = f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
-            elif current_game == game and participants.get(user_id) == role:
-                await self.remove_participant(guild_id, game, user_id)
-                participants = await self.get_participants(guild_id, game)
-                if not participants:
-                    await self.delete_party(guild_id, game)
-                result = f"👋 `{game}` 파티에서 나갔습니다."
-            else:
-                created = False
-                if party is None:
-                    created = await self.create_party(guild_id, game)
-                if await self.add_participant(guild_id, game, user_id, role):
+            if action == "inactive":
+                if party is not None:
+                    result = "⚠️ 이미 활성 모집이 있습니다. 역할 버튼을 사용하세요."
+                elif await self.create_party(guild_id, game, user_id):
                     result = (
-                        f"✅ `{game}` 모집을 시작했습니다. 방장은 {interaction.user.mention}입니다."
-                        if created
-                        else f"✅ `{game}` 파티 역할을 `{role or '미정'}`(으)로 정했습니다."
+                        f"✅ `{game}` 모집을 시작했습니다. "
+                        f"방장은 {interaction.user.mention}입니다."
                     )
                 else:
-                    if created:
-                        await self.delete_party(guild_id, game)
-                    result = "⚠️ 파티가 가득 찼거나 선택한 역할이 이미 찼습니다."
+                    current_game = await self.get_user_party(guild_id, user_id)
+                    result = (
+                        f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+                        if current_game
+                        else "⚠️ 다른 사용자가 먼저 모집을 시작했습니다."
+                    )
+            elif action == "role" and party is None:
+                result = "⚠️ 먼저 모집 시작 버튼을 눌러 주세요."
+            elif current_game and current_game != game:
+                result = f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+            elif party is None:
+                if await self.create_party(guild_id, game, user_id):
+                    result = (
+                        f"✅ `{game}` 모집을 시작했습니다. "
+                        f"방장은 {interaction.user.mention}입니다."
+                    )
+                else:
+                    result = "⚠️ 모집을 시작하지 못했습니다. 다시 시도해 주세요."
+            elif current_game == game and participants.get(user_id) == role:
+                await self.remove_participant(guild_id, game, user_id)
+                result = f"👋 `{game}` 파티에서 나갔습니다."
+            else:
+                if await self.add_participant(guild_id, game, user_id, role):
+                    result = f"✅ `{game}` 파티 역할을 `{role or '참가'}`(으)로 정했습니다."
+                else:
+                    current_game = await self.get_user_party(guild_id, user_id)
+                    result = (
+                        f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+                        if current_game and current_game != game
+                        else "⚠️ 파티가 가득 찼거나 선택한 역할이 이미 찼습니다."
+                    )
 
             await self.render_game_panel(guild_id, game)
         await interaction.followup.send(result, ephemeral=True)
@@ -207,11 +258,11 @@ class PlayWithCog(commands.Cog):
                     description="현재 모집이 없습니다. 아래 버튼을 눌러 모집을 시작하세요.",
                     color=discord.Color.dark_grey(),
                 ),
-                self.views[game],
+                PartyPanelView(self, game),
             )
 
         created_at = int(party[0])
-        host_id = next(iter(participants), None)
+        host_id = await self.get_party_host(guild.id, game)
         host = guild.get_member(host_id) if host_id is not None else None
         host_text = host.mention if host else (f"<@{host_id}>" if host_id else "없음")
         embed = discord.Embed(
@@ -233,7 +284,7 @@ class PlayWithCog(commands.Cog):
             if unassigned:
                 lines.append("역할 미정: " + ", ".join(unassigned))
             embed.add_field(name="역할별 자리", value=_bounded("\n".join(lines)), inline=False)
-        return embed, self.views[game]
+        return embed, PartyPanelView(self, game, active=True)
 
     async def render_game_panel(self, guild_id: int, game: str) -> None:
         if game not in GAMES or self.bot is None:
@@ -268,17 +319,27 @@ class PlayWithCog(commands.Cog):
         for game, message_id in stored.items():
             if game in GAMES:
                 continue
-            try:
-                message = await channel.fetch_message(message_id)
-                bot_user = getattr(self.bot, "user", None)
-                if bot_user is not None and message.author.id == bot_user.id:
-                    await message.delete()
-            except discord.NotFound:
-                pass
-            except (discord.Forbidden, discord.HTTPException):
-                logger.warning("오래된 파티 패널을 정리하지 못했습니다: guild=%s game=%s", guild.id, game)
-                continue
-            await run_db(self.settings.delete_party_panel, guild.id, game)
+            async with panel_lock(guild.id, f"party:{game}"):
+                latest = await run_db(self.settings.get_party_panels, guild.id)
+                if latest.get(game) != message_id:
+                    continue
+                try:
+                    message = await channel.fetch_message(message_id)
+                    bot_user = getattr(self.bot, "user", None)
+                    if bot_user is not None and message.author.id == bot_user.id:
+                        await message.delete()
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.warning(
+                        "오래된 파티 패널을 정리하지 못했습니다: guild=%s game=%s",
+                        guild.id,
+                        game,
+                    )
+                    continue
+                latest = await run_db(self.settings.get_party_panels, guild.id)
+                if latest.get(game) == message_id:
+                    await run_db(self.settings.delete_party_panel, guild.id, game)
 
         for game in GAMES:
             async with panel_lock(guild.id, f"party:{game}"):
@@ -288,9 +349,17 @@ class PlayWithCog(commands.Cog):
     async def on_ready(self):
         if self._panels_restored or self.bot is None:
             return
-        self._panels_restored = True
-        for guild in self.bot.guilds:
-            await self.ensure_panels(guild)
+        async with self._restore_lock:
+            if self._panels_restored:
+                return
+            failed = False
+            for guild in self.bot.guilds:
+                try:
+                    await self.ensure_panels(guild)
+                except Exception:
+                    failed = True
+                    logger.exception("파티 패널 startup 복구 실패: guild=%s", guild.id)
+            self._panels_restored = not failed
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -300,8 +369,6 @@ class PlayWithCog(commands.Cog):
             return
         async with panel_lock(guild_id, f"party:{game}"):
             await self.remove_participant(guild_id, game, member.id)
-            if not await self.get_participants(guild_id, game):
-                await self.delete_party(guild_id, game)
             await self.render_game_panel(guild_id, game)
 
     @commands.Cog.listener()
@@ -311,10 +378,16 @@ class PlayWithCog(commands.Cog):
     @tasks.loop(minutes=10)
     async def cleanup_parties(self):
         cutoff = int(time.time()) - PARTY_LIFETIME_SECONDS
-        expired = await run_db(self.db.delete_expired_parties, cutoff)
-        for guild_id, game in expired:
+        candidates = await run_db(self.db.list_expired_parties, cutoff)
+        expired = []
+        for guild_id, game in candidates:
             async with panel_lock(guild_id, f"party:{game}"):
-                await self.render_game_panel(guild_id, game)
+                deleted = await run_db(
+                    self.db.delete_party_if_expired, guild_id, game, cutoff
+                )
+                if deleted:
+                    expired.append((guild_id, game))
+                    await self.render_game_panel(guild_id, game)
         if expired:
             print(f"Deleted expired parties: {expired}")
 

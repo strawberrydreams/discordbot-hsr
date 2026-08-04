@@ -141,9 +141,6 @@ def load_games() -> dict:
                 f"아닙니다: {name}"
             )
             continue
-        if len(games) == 25:
-            print("⚠️ games.json의 게임 수가 Discord 선택 메뉴 한도(25개)를 넘습니다.")
-            break
         games[name] = {"max_players": max_players, "roles": roles}
     return games
 

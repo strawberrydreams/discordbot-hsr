@@ -46,6 +46,7 @@ _CURRENT_SCHEMA_VERSIONS = {
     for name, repository in _SQLITE_REPOSITORIES.items()
 }
 _LEGACY_ATTENDANCE_TABLES = {"users", "point_ledger"}
+_LEGACY_PARTY_TABLES = {"parties", "participants"}
 _LEGACY_GUILD_SETTINGS_TABLES = {"guild_settings"}
 
 
@@ -126,6 +127,12 @@ def verify_database(
                 and version in (0, 1)
             ):
                 required_tables = _LEGACY_GUILD_SETTINGS_TABLES
+            if (
+                allow_legacy
+                and source_name == "party_data.db"
+                and version in (0, 1)
+            ):
+                required_tables = _LEGACY_PARTY_TABLES
             tables = {
                 row[0]
                 for row in conn.execute(

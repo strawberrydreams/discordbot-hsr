@@ -173,8 +173,18 @@ class PartyRepository(ABC):
         """파티가 존재하면 (created_at,)을, 없으면 None을 반환한다."""
 
     @abstractmethod
-    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
-        """파티를 생성한다. 새로 만들었으면 True, 이미 있으면 False."""
+    def create_party(
+        self,
+        guild_id: int,
+        game: str,
+        created_at: int,
+        host_id: Optional[int] = None,
+    ) -> bool:
+        """파티를 생성한다. host_id가 있으면 방장 참가까지 한 트랜잭션에서 처리한다."""
+
+    @abstractmethod
+    def get_party_host(self, guild_id: int, game: str) -> Optional[int]:
+        """저장된 방장 ID를 반환한다. legacy 빈 파티는 None일 수 있다."""
 
     @abstractmethod
     def delete_party(self, guild_id: int, game: str) -> None:
@@ -194,11 +204,11 @@ class PartyRepository(ABC):
         max_players: Optional[int] = None,
     ) -> bool:
         """존재하는 파티에만 참가자를 추가하거나 역할을 갱신한다.
-        정원 초과와 역할 중복은 DB가 거부하며, 그 경우 행을 남기지 않는다."""
+        길드 내 단일 파티, 정원, 역할 중복은 DB가 원자적으로 거부한다."""
 
     @abstractmethod
-    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
-        """참가자를 제거한다."""
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> bool:
+        """참가자를 제거하고 방장 이탈 시 최소 user_id로 이전한다. 파티가 남으면 True."""
 
     @abstractmethod
     def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
@@ -207,6 +217,14 @@ class PartyRepository(ABC):
     @abstractmethod
     def delete_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
         """cutoff보다 오래된 파티를 전 길드에서 삭제하고 [(guild_id, game), ...]를 반환한다."""
+
+    @abstractmethod
+    def list_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
+        """삭제하지 않고 만료 후보를 반환한다."""
+
+    @abstractmethod
+    def delete_party_if_expired(self, guild_id: int, game: str, cutoff: int) -> bool:
+        """현재 incarnation이 여전히 만료됐을 때만 원자적으로 삭제한다."""
 
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
@@ -507,7 +525,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
 
 class SQLitePartyRepository(PartyRepository):
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -516,7 +534,7 @@ class SQLitePartyRepository(PartyRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
-            _prepare_schema(conn, self._SCHEMA_VERSION, "party")
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "party")
             cursor = conn.cursor()
             # 길드당 게임별로 파티 하나.
             cursor.execute("""
@@ -524,6 +542,7 @@ class SQLitePartyRepository(PartyRepository):
                     guild_id INTEGER NOT NULL,
                     game TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
+                    host_id INTEGER,
                     PRIMARY KEY (guild_id, game)
                 )
             """)
@@ -536,12 +555,44 @@ class SQLitePartyRepository(PartyRepository):
                     PRIMARY KEY (guild_id, game, user_id)
                 )
             """)
-            # 역할 중복은 DB가 거부한다. guild_id를 포함해야 서버 간 간섭이 없다.
+            if version < 2 and "host_id" not in {
+                row[1] for row in cursor.execute("PRAGMA table_info(parties)")
+            }:
+                cursor.execute("ALTER TABLE parties ADD COLUMN host_id INTEGER")
+
+            # v1은 한 유저가 여러 게임에 들어갈 수 있었다. game 이름 순으로 하나만 보존한다.
+            if version < 2:
+                cursor.execute("""
+                    DELETE FROM participants
+                    WHERE game != (
+                        SELECT MIN(other.game)
+                        FROM participants AS other
+                        WHERE other.guild_id = participants.guild_id
+                          AND other.user_id = participants.user_id
+                    )
+                """)
+                cursor.execute("""
+                    UPDATE parties
+                    SET host_id = (
+                        SELECT MIN(user_id)
+                        FROM participants
+                        WHERE participants.guild_id = parties.guild_id
+                          AND participants.game = parties.game
+                    )
+                """)
+
+            # 역할과 길드 내 단일 활성 파티는 DB가 최종 판정한다.
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_role
                 ON participants (guild_id, game, role) WHERE role IS NOT NULL
             """)
-            _require_columns(conn, "parties", {"guild_id", "game", "created_at"})
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_user
+                ON participants (guild_id, user_id)
+            """)
+            _require_columns(
+                conn, "parties", {"guild_id", "game", "created_at", "host_id"}
+            )
             _require_columns(conn, "participants", {"guild_id", "game", "user_id", "role"})
             _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
@@ -555,15 +606,47 @@ class SQLitePartyRepository(PartyRepository):
             )
             return cursor.fetchone()
 
-    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
-        with closing(_connect(self.db_path)) as conn:
+    def create_party(
+        self,
+        guild_id: int,
+        game: str,
+        created_at: int,
+        host_id: Optional[int] = None,
+    ) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                "INSERT OR IGNORE INTO parties (guild_id, game, created_at) VALUES (?, ?, ?)",
-                (guild_id, game, created_at),
+                "INSERT OR IGNORE INTO parties (guild_id, game, created_at, host_id) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, game, created_at, host_id),
             )
+            created = cursor.rowcount > 0
+            if created and host_id is not None:
+                cursor.execute(
+                    "INSERT INTO participants (guild_id, game, user_id, role) "
+                    "VALUES (?, ?, ?, NULL)",
+                    (guild_id, game, host_id),
+                )
             conn.commit()
-            return cursor.rowcount > 0
+            return created
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_party_host(self, guild_id: int, game: str) -> Optional[int]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT host_id FROM parties WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            ).fetchone()
+            return row[0] if row else None
 
     def delete_party(self, guild_id: int, game: str) -> None:
         with closing(_connect(self.db_path)) as conn:
@@ -623,6 +706,11 @@ class SQLitePartyRepository(PartyRepository):
                 "INSERT INTO participants (guild_id, game, user_id, role) VALUES (?, ?, ?, ?)",
                 (guild_id, game, user_id, role),
             )
+            cursor.execute(
+                "UPDATE parties SET host_id = COALESCE(host_id, ?) "
+                "WHERE guild_id = ? AND game = ?",
+                (user_id, guild_id, game),
+            )
             conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -634,14 +722,37 @@ class SQLitePartyRepository(PartyRepository):
         finally:
             conn.close()
 
-    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
-        with closing(_connect(self.db_path)) as conn:
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 "DELETE FROM participants WHERE guild_id = ? AND game = ? AND user_id = ?",
                 (guild_id, game, user_id),
             )
+            next_host = cursor.execute(
+                "SELECT MIN(user_id) FROM participants WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            ).fetchone()[0]
+            if next_host is None:
+                cursor.execute(
+                    "DELETE FROM parties WHERE guild_id = ? AND game = ?",
+                    (guild_id, game),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE parties SET host_id = ? "
+                    "WHERE guild_id = ? AND game = ? AND host_id = ?",
+                    (next_host, guild_id, game, user_id),
+                )
             conn.commit()
+            return next_host is not None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
         with closing(_connect(self.db_path)) as conn:
@@ -654,20 +765,49 @@ class SQLitePartyRepository(PartyRepository):
             return row[0] if row else None
 
     def delete_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
-        with closing(_connect(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT guild_id, game FROM parties WHERE created_at < ?", (cutoff,)
-            )
-            expired = [(row[0], row[1]) for row in cursor.fetchall()]
+        return [
+            key
+            for key in self.list_expired_parties(cutoff)
+            if self.delete_party_if_expired(key[0], key[1], cutoff)
+        ]
 
-            if expired:
-                cursor.executemany(
-                    "DELETE FROM participants WHERE guild_id = ? AND game = ?", expired
+    def list_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
+        with closing(_connect(self.db_path)) as conn:
+            return [
+                (guild_id, game)
+                for guild_id, game in conn.execute(
+                    "SELECT guild_id, game FROM parties WHERE created_at < ?", (cutoff,)
                 )
-                cursor.execute("DELETE FROM parties WHERE created_at < ?", (cutoff,))
-                conn.commit()
-            return expired
+            ]
+
+    def delete_party_if_expired(self, guild_id: int, game: str, cutoff: int) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            expired = cursor.execute(
+                "SELECT 1 FROM parties "
+                "WHERE guild_id = ? AND game = ? AND created_at < ?",
+                (guild_id, game, cutoff),
+            ).fetchone()
+            if not expired:
+                conn.rollback()
+                return False
+            cursor.execute(
+                "DELETE FROM participants WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
+            cursor.execute(
+                "DELETE FROM parties WHERE guild_id = ? AND game = ? AND created_at < ?",
+                (guild_id, game, cutoff),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:

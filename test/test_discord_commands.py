@@ -1004,12 +1004,14 @@ class _PartyMessage:
         self.author = SimpleNamespace(id=author_id)
         self.edits = []
         self.deleted = False
+        self.delete_calls = 0
 
     async def edit(self, **kwargs):
         self.edits.append(kwargs)
 
     async def delete(self):
         self.deleted = True
+        self.delete_calls += 1
 
 
 class _PartyChannel:
@@ -1092,6 +1094,41 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             expected_count = len(playwith_cog.GAMES[game]["roles"]) + 1
             self.assertEqual(len(view.children), expected_count if expected_count > 1 else 1)
 
+    def test_role_ids_survive_reordering_and_change_on_rename(self):
+        original = {"Game": {"max_players": 2, "roles": ["A", "B"]}}
+        reordered = {"Game": {"max_players": 2, "roles": ["B", "A"]}}
+        renamed = {"Game": {"max_players": 2, "roles": ["A", "C"]}}
+        dummy = object()
+
+        def role_ids(games):
+            with patch.object(playwith_cog, "GAMES", games):
+                view = playwith_cog.PartyPanelView(dummy, "Game")
+            return {button.role: button.custom_id for button in view.children[1:]}
+
+        first = role_ids(original)
+        second = role_ids(reordered)
+        third = role_ids(renamed)
+        self.assertEqual(first["A"], second["A"])
+        self.assertEqual(first["B"], second["B"])
+        self.assertNotIn(first["B"], third.values())
+
+    async def test_every_configured_game_gets_its_own_panel(self):
+        games = {
+            f"Game {index}": {"max_players": 2, "roles": []}
+            for index in range(30)
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, _, settings, bot = self._make_cog(
+                pathlib.Path(directory), guild, games
+            )
+            await cog.ensure_panels(guild)
+            panel_count = len(settings.get_party_panels(guild.id))
+
+        self.assertEqual(len(cog.views), 30)
+        self.assertEqual(len(bot.registered), 30)
+        self.assertEqual(panel_count, 30)
+
     async def test_over_limit_game_is_disabled_without_stopping_other_panels(self):
         games = {
             "Too Many": {"max_players": 25, "roles": [f"r{i}" for i in range(25)]},
@@ -1110,15 +1147,26 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_role_and_no_role_buttons_cover_create_change_leave_and_toggle(self):
         with tempfile.TemporaryDirectory() as directory:
-            guild = _PartyGuild()
+            second_user = SimpleNamespace(id=456, mention="<@456>")
+            guild = _PartyGuild(members={FakeUser.id: FakeUser(), 456: second_user})
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
 
             game = "League of Legends"
             panel_id = settings.get_party_panels(guild.id)[game]
             inactive, top = cog.views[game].children[:2]
+            premature = FakeInteraction(50, guild, message_id=panel_id)
+            await top.callback(premature)
+            self.assertIsNone(party.get_party(guild.id, game))
+            self.assertIn("모집 시작", premature.followup.messages[0][0][0])
+
             await inactive.callback(FakeInteraction(50, guild, message_id=panel_id))
             self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: None})
+            status_click = FakeInteraction(
+                50, guild, message_id=panel_id, user=second_user
+            )
+            await inactive.callback(status_click)
+            self.assertNotIn(456, party.get_participants(guild.id, game))
             await top.callback(FakeInteraction(50, guild, message_id=panel_id))
             self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: "탑"})
             await top.callback(FakeInteraction(50, guild, message_id=panel_id))
@@ -1145,7 +1193,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
                 party.add_participant(guild.id, game, uid, role, 5)
 
             full = FakeInteraction(50, guild, message_id=panel_id, user=users[6])
-            await cog.views[game].children[0].callback(full)
+            await cog.views[game].children[1].callback(full)
             self.assertIn("가득", full.followup.messages[0][0][0])
             self.assertIsNone(party.get_user_party(guild.id, 6))
 
@@ -1159,6 +1207,97 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(party.get_participants(guild.id, game)[7], "서포터")
             self.assertTrue(first.followup.messages and second.followup.messages)
+
+    async def test_host_persists_across_role_changes_and_transfers_on_departure(self):
+        host = SimpleNamespace(id=1, mention="<@1>")
+        successor = SimpleNamespace(id=2, mention="<@2>")
+        guild = _PartyGuild(members={1: host, 2: successor})
+        with tempfile.TemporaryDirectory() as directory:
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            game = "League of Legends"
+            panel_id = settings.get_party_panels(guild.id)[game]
+            buttons = cog.views[game].children
+
+            await buttons[0].callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=host)
+            )
+            await buttons[1].callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=host)
+            )
+            await buttons[2].callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=successor)
+            )
+            await buttons[3].callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=host)
+            )
+            self.assertEqual(party.get_party_host(guild.id, game), 1)
+
+            await buttons[3].callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=host)
+            )
+            transferred_host = party.get_party_host(guild.id, game)
+            embed = guild.channel.messages[panel_id].edits[-1]["embed"]
+
+        self.assertEqual(transferred_host, 2)
+        self.assertIn("방장: <@2>", embed.description)
+
+    async def test_cross_game_clicks_keep_one_membership_and_no_empty_loser_party(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            lol = FakeInteraction(
+                50,
+                guild,
+                message_id=settings.get_party_panels(guild.id)["League of Legends"],
+            )
+            pubg = FakeInteraction(
+                50,
+                guild,
+                message_id=settings.get_party_panels(guild.id)["PUBG"],
+            )
+            await asyncio.gather(
+                cog.views["League of Legends"].children[0].callback(lol),
+                cog.views["PUBG"].children[0].callback(pubg),
+            )
+            joined = party.get_user_party(guild.id, FakeUser.id)
+            active = [
+                game for game in ("League of Legends", "PUBG")
+                if party.get_party(guild.id, game) is not None
+            ]
+
+        self.assertIn(joined, active)
+        self.assertEqual(len(active), 1)
+        self.assertTrue(lol.followup.messages and pubg.followup.messages)
+
+    async def test_panel_id_is_rechecked_after_waiting_for_game_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            game = "PUBG"
+            panel_id = settings.get_party_panels(guild.id)[game]
+            interaction = FakeInteraction(50, guild, message_id=panel_id)
+            deferred = asyncio.Event()
+            original_defer = interaction.response.defer
+
+            async def recording_defer(**kwargs):
+                await original_defer(**kwargs)
+                deferred.set()
+
+            interaction.response.defer = recording_defer
+            lock = panel_lock(guild.id, f"party:{game}")
+            await lock.acquire()
+            task = asyncio.create_task(cog.views[game].children[0].callback(interaction))
+            await deferred.wait()
+            settings.set_party_panel(guild.id, game, panel_id + 1)
+            lock.release()
+            await task
+            current_party = party.get_party(guild.id, game)
+
+        self.assertIsNone(current_party)
+        self.assertIn("최신", interaction.followup.messages[0][0][0])
 
     async def test_dm_cross_guild_stale_panel_and_deleted_member_do_not_mutate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1178,9 +1317,11 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             guild.members.clear()
             deleted = FakeInteraction(50, guild, message_id=panel_id)
             await button.callback(deleted)
+            user_party = party.get_user_party(guild.id, FakeUser.id)
 
-        self.assertIsNone(party.get_user_party(guild.id, FakeUser.id))
-        self.assertTrue(all(item.response.messages for item in (dm, wrong, stale, deleted)))
+        self.assertIsNone(user_party)
+        self.assertTrue(dm.response.messages and wrong.response.messages and deleted.response.messages)
+        self.assertTrue(stale.followup.messages)
 
     async def test_ensure_panels_edits_recreates_and_cleans_only_bot_stale_messages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1202,6 +1343,24 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             guild.channel.messages.pop(old_id)
             await cog.ensure_panels(guild)
             self.assertNotEqual(settings.get_party_panels(guild.id)[missing_game], old_id)
+
+    async def test_concurrent_stale_cleanup_deletes_once_and_preserves_nonbot_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, _, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            bot_message = _PartyMessage(20)
+            user_message = _PartyMessage(21, author_id=1234)
+            guild.channel.messages.update({20: bot_message, 21: user_message})
+            settings.set_party_panel(guild.id, "Removed Bot", 20)
+            settings.set_party_panel(guild.id, "Removed User", 21)
+
+            await asyncio.gather(cog.ensure_panels(guild), cog.ensure_panels(guild))
+            remaining = settings.get_party_panels(guild.id)
+
+        self.assertEqual(bot_message.delete_calls, 1)
+        self.assertFalse(user_message.deleted)
+        self.assertNotIn("Removed Bot", remaining)
+        self.assertNotIn("Removed User", remaining)
 
     async def test_transport_error_preserves_panel_row_and_renderer_reads_latest_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1242,11 +1401,69 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
                 render.assert_awaited_once_with(guild.id, "PUBG")
 
             party.create_party(guild.id, "Overwatch", 1_000)
+            expiry_lock_states = []
+            delete_if_expired = party.delete_party_if_expired
+
+            def recording_delete(guild_id, game, cutoff):
+                expiry_lock_states.append(
+                    panel_lock(guild_id, f"party:{game}").locked()
+                )
+                return delete_if_expired(guild_id, game, cutoff)
+
             with patch("module.playwith_cog.time.time", return_value=100_000), patch.object(
-                cog, "render_game_panel"
-            ) as render:
+                party, "delete_party_if_expired", side_effect=recording_delete
+            ), patch.object(cog, "render_game_panel") as render:
                 await PlayWithCog.cleanup_parties.coro(cog)
                 render.assert_awaited_once_with(guild.id, "Overwatch")
+                self.assertEqual(expiry_lock_states, [True])
+
+    async def test_startup_isolates_guild_failure_and_retries_next_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _PartyGuild(TEST_GUILD_ID)
+            second = _PartyGuild(TEST_GUILD_ID + 1)
+            cog, _, _, bot = self._make_cog(pathlib.Path(directory), first)
+            bot.guilds.append(second)
+            attempts = []
+            failed_once = False
+
+            async def restore(guild):
+                nonlocal failed_once
+                attempts.append(guild.id)
+                if guild is first and not failed_once:
+                    failed_once = True
+                    raise RuntimeError("temporary DB failure")
+
+            with patch.object(cog, "ensure_panels", side_effect=restore), patch.object(
+                playwith_cog.logger, "exception"
+            ):
+                await cog.on_ready()
+                self.assertFalse(cog._panels_restored)
+                await cog.on_ready()
+
+        self.assertEqual(
+            attempts,
+            [first.id, second.id, first.id, second.id],
+        )
+        self.assertTrue(cog._panels_restored)
+
+    def test_conditional_expiry_does_not_delete_a_new_party_incarnation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            party = SQLitePartyRepository(pathlib.Path(directory) / "party.db")
+            party.create_party(TEST_GUILD_ID, "PUBG", 1_000, 1)
+            candidates = party.list_expired_parties(2_000)
+            party.delete_party(TEST_GUILD_ID, "PUBG")
+            party.create_party(TEST_GUILD_ID, "PUBG", 3_000, 2)
+
+            deleted = party.delete_party_if_expired(
+                TEST_GUILD_ID, "PUBG", 2_000
+            )
+            host = party.get_party_host(TEST_GUILD_ID, "PUBG")
+            participants = party.get_participants(TEST_GUILD_ID, "PUBG")
+
+        self.assertEqual(candidates, [(TEST_GUILD_ID, "PUBG")])
+        self.assertFalse(deleted)
+        self.assertEqual(host, 2)
+        self.assertEqual(participants, {2: None})
 
 
 class FakeMessage:
@@ -1914,7 +2131,7 @@ class GamesExternalizationTest(unittest.TestCase):
                 games = config.load_games()
 
         self.assertEqual(
-            list(games), ["G" * 89, *(f"Game {index}" for index in range(24))]
+            list(games), ["G" * 89, *(f"Game {index}" for index in range(25))]
         )
 
     def test_boolean_max_players_is_dropped(self):
