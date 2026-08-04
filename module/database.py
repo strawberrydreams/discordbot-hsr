@@ -52,6 +52,30 @@ def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection
     return conn
 
 
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _prepare_schema(conn: sqlite3.Connection, current: int, label: str) -> int:
+    version = _schema_version(conn)
+    if version > current:
+        raise RuntimeError(
+            f"{label} DB 버전 {version}은 이 코드가 지원하는 {current}보다 높습니다."
+        )
+    return version
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(f"PRAGMA user_version = {version}")
+
+
+def _require_columns(conn: sqlite3.Connection, table: str, expected: set[str]) -> None:
+    actual = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+    if not expected <= actual:
+        missing = ", ".join(sorted(expected - actual))
+        raise RuntimeError(f"지원하지 않는 {table} 스키마입니다. 누락 컬럼: {missing}")
+
+
 async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     """동기 리포지토리 호출을 스레드로 넘겨 이벤트 루프가 막히지 않게 한다.
 
@@ -203,6 +227,8 @@ class GuildSettingsRepository(ABC):
 # ─────────── SQLite 구현 ─────────── #
 
 class SQLiteAttendanceRepository(AttendanceRepository):
+    _SCHEMA_VERSION = 1
+
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +236,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "attendance")
             c = conn.cursor()
             # (guild_id, user_id)가 기본키다. 같은 사람이 서버마다 별도 잔액을 갖는다.
             c.execute("""
@@ -238,6 +265,17 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 "CREATE INDEX IF NOT EXISTS idx_ledger_user "
                 "ON point_ledger (guild_id, user_id, id DESC)"
             )
+            _require_columns(
+                conn,
+                "users",
+                {"guild_id", "user_id", "points", "last_attendance_date", "forbidden_count"},
+            )
+            _require_columns(
+                conn,
+                "point_ledger",
+                {"id", "guild_id", "user_id", "delta", "reason", "created_at"},
+            )
+            _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
 
     def get_points(self, guild_id: int, user_id: int) -> int:
@@ -367,6 +405,8 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
 
 class SQLitePartyRepository(PartyRepository):
+    _SCHEMA_VERSION = 1
+
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +414,7 @@ class SQLitePartyRepository(PartyRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "party")
             cursor = conn.cursor()
             # 길드당 게임별로 파티 하나.
             cursor.execute("""
@@ -398,6 +439,9 @@ class SQLitePartyRepository(PartyRepository):
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_role
                 ON participants (guild_id, game, role) WHERE role IS NOT NULL
             """)
+            _require_columns(conn, "parties", {"guild_id", "game", "created_at"})
+            _require_columns(conn, "participants", {"guild_id", "game", "user_id", "role"})
+            _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
 
     def get_party(self, guild_id: int, game: str) -> Optional[Tuple[int]]:
@@ -535,6 +579,7 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 두 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _RECRUIT = "recruit_channel_id"
     _EVENT = "event_channel_id"
+    _SCHEMA_VERSION = 1
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -543,6 +588,7 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "settings")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id INTEGER PRIMARY KEY,
@@ -550,6 +596,12 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                     event_channel_id INTEGER
                 )
             """)
+            _require_columns(
+                conn,
+                "guild_settings",
+                {"guild_id", "recruit_channel_id", "event_channel_id"},
+            )
+            _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
 
     def _get_column(self, guild_id: int, column: str) -> Optional[int]:

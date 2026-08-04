@@ -942,6 +942,68 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
     return _bind(repo)
 
 
+def _user_version(path):
+    with sqlite3.connect(path) as conn:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def test_schema_versions():
+    print("\n[1] SQLite 스키마 버전")
+    attendance_path = _TMP_DIR / "attendance_version.db"
+    party_path = _TMP_DIR / "party_version.db"
+    settings_path = _TMP_DIR / "settings_version.db"
+    SQLiteAttendanceRepository(attendance_path)
+    SQLitePartyRepository(party_path)
+    SQLiteGuildSettingsRepository(settings_path)
+
+    check("attendance 스키마 버전", _user_version(attendance_path) == 1)
+    check("party 스키마 버전", _user_version(party_path) == 1)
+    check("settings 스키마 버전", _user_version(settings_path) == 1)
+
+    for label, repository in (
+        ("attendance", SQLiteAttendanceRepository),
+        ("party", SQLitePartyRepository),
+        ("settings", SQLiteGuildSettingsRepository),
+    ):
+        path = _TMP_DIR / f"future_{label}.db"
+        with sqlite3.connect(path) as conn:
+            conn.execute("PRAGMA user_version = 999")
+        try:
+            repository(path)
+        except RuntimeError:
+            rejected = True
+        else:
+            rejected = False
+        check(f"미래 {label} DB 버전 거부", rejected)
+
+    with sqlite3.connect(attendance_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+        conn.execute("INSERT INTO users VALUES (1, 2, 3, NULL, 0)")
+    SQLiteAttendanceRepository(attendance_path)
+    check(
+        "무버전 attendance 데이터 보존",
+        SQLiteAttendanceRepository(attendance_path).get_points(1, 2) == 3,
+    )
+
+    with sqlite3.connect(party_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+        conn.execute("INSERT INTO parties VALUES (1, 'LOL', 3)")
+    SQLitePartyRepository(party_path)
+    check(
+        "무버전 party 데이터 보존",
+        SQLitePartyRepository(party_path).get_party(1, "LOL") == (3,),
+    )
+
+    with sqlite3.connect(settings_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+        conn.execute("INSERT INTO guild_settings VALUES (1, 2, 3)")
+    SQLiteGuildSettingsRepository(settings_path)
+    check(
+        "무버전 settings 데이터 보존",
+        SQLiteGuildSettingsRepository(settings_path).get_recruit_channel(1) == 2,
+    )
+
+
 def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
     print("\n[2] deduct_points 원자성")
     user = 100
@@ -1875,6 +1937,7 @@ if __name__ == "__main__":
         test_guild_isolation()
         test_temp_image_lifecycle()
         repo = test_schema_initialization()
+        test_schema_versions()
         test_deduct_points_atomicity(repo)
         test_attendance_atomicity(repo)
         test_party_repository()
