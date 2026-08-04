@@ -1365,8 +1365,8 @@ class _SetupChannel:
 
 
 class _SetupGuild:
-    def __init__(self):
-        self.id = 999
+    def __init__(self, guild_id=999):
+        self.id = guild_id
         self.default_role = object()
         self.me = object()
         self.categories = []
@@ -1399,6 +1399,25 @@ class _SetupBot:
         self.views.append(view)
 
 
+class _DeferredSetupResponse:
+    def __init__(self, events):
+        self.events = events
+
+    async def defer(self, *, ephemeral):
+        self.events.append(("defer", {"ephemeral": ephemeral}))
+
+    async def send_message(self, *args, **kwargs):
+        self.events.append(("response", args, kwargs))
+
+
+class _DeferredSetupFollowup:
+    def __init__(self, events):
+        self.events = events
+
+    async def send(self, *args, **kwargs):
+        self.events.append(("followup", args, kwargs))
+
+
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_creates_private_channels_once_and_reuses_them(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1409,6 +1428,11 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
             first = await cog.ensure_bot_channels(guild)
             second = await cog.ensure_bot_channels(guild)
+            concurrent_guild = _SetupGuild(1_000)
+            concurrent = await asyncio.gather(
+                cog._ensure_bot_channels(concurrent_guild),
+                cog._ensure_bot_channels(concurrent_guild),
+            )
 
         self.assertEqual([category.name for category in guild.created_categories], ["🤖 봇"])
         self.assertEqual(
@@ -1427,6 +1451,27 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(bot.views[0], SetupView)
         self.assertTrue(bot.views[0].is_persistent())
         self.assertEqual(bot.views[0].children[0].custom_id, "setup:start")
+        self.assertEqual(len(concurrent_guild.created_categories), 1)
+        self.assertEqual(len(concurrent_guild.created_channels), 2)
+        self.assertEqual(concurrent[0], concurrent[1])
+
+    async def test_setup_reuses_stored_live_channels_without_renaming_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            party = _SetupChannel(30, "party-custom-name")
+            music = _SetupChannel(31, "music-custom-name")
+            guild.channels = {party.id: party, music.id: music}
+            settings.set_party_channel(guild.id, party.id)
+            settings.set_music_channel(guild.id, music.id)
+
+            result = await cog.ensure_bot_channels(guild)
+
+        self.assertEqual(result, (party, music))
+        self.assertEqual((party.name, music.name), ("party-custom-name", "music-custom-name"))
+        self.assertEqual(guild.created_categories, [])
+        self.assertEqual(guild.created_channels, [])
 
     async def test_join_notice_requires_a_sendable_system_channel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1470,6 +1515,37 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
         self.assertIn("관리 권한", interaction.response.messages[0][0][0])
+
+    async def test_authorized_setup_defers_then_uses_followup_for_button_and_slash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cog = GuildSettingsCog(
+                _SetupBot(), SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            )
+            guild = _SetupGuild()
+            manager = SimpleNamespace(guild_permissions=SimpleNamespace(manage_guild=True))
+            button_events = []
+            button = SimpleNamespace(
+                guild=guild,
+                user=manager,
+                response=_DeferredSetupResponse(button_events),
+                followup=_DeferredSetupFollowup(button_events),
+            )
+            await cog.setup_view.children[0].callback(button)
+
+            slash_events = []
+            slash = SimpleNamespace(
+                guild=guild,
+                response=_DeferredSetupResponse(slash_events),
+                followup=_DeferredSetupFollowup(slash_events),
+            )
+            await GuildSettingsCog._start.callback(cog, slash)
+
+        self.assertEqual(button_events[0], ("defer", {"ephemeral": True}))
+        self.assertEqual(button_events[1][0], "followup")
+        self.assertTrue(button_events[1][2]["ephemeral"])
+        self.assertEqual(slash_events[0], ("defer", {"ephemeral": True}))
+        self.assertEqual(slash_events[1][0], "followup")
+        self.assertTrue(slash_events[1][2]["ephemeral"])
 
 
 

@@ -41,8 +41,9 @@ class SetupView(discord.ui.View):
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
         party, music = await self.cog._ensure_bot_channels(guild)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}",
             ephemeral=True,
         )
@@ -125,8 +126,9 @@ class GuildSettingsCog(commands.Cog):
 
     @설정.command(name="시작", description="봇 전용 파티·음악 채널을 만듭니다.")
     async def _start(self, inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True)
         party, music = await self._ensure_bot_channels(inter.guild)
-        await inter.response.send_message(
+        await inter.followup.send(
             f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}",
             ephemeral=True,
         )
