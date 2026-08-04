@@ -288,6 +288,9 @@ def test_readme_public_distribution_contract():
         "provider 계정에도 예산 상한",
         "Docker Compose를 권장",
         "launchd 선택 사항",
+        "포인트·출석·금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`",
+        "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
+        "`Manage Guild` 권한",
     )
     check("README 공개 배포 계약", all(term in readme for term in required))
     check(
