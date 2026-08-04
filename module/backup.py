@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -153,6 +155,26 @@ def _backup_one(source: Path, temporary: Path) -> None:
             target_conn.commit()
 
 
+def _copy_setting(source: Path, temporary: Path) -> bool:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise RuntimeError("설정 파일 안전 복사를 지원하지 않는 운영체제입니다.")
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | no_follow)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(f"설정 파일 symlink는 백업하지 않습니다: {source}") from exc
+        raise RuntimeError(f"설정 파일을 열 수 없습니다: {source}") from exc
+    with os.fdopen(descriptor, "rb") as input_file:
+        if not stat.S_ISREG(os.fstat(input_file.fileno()).st_mode):
+            raise RuntimeError(f"설정 경로가 일반 파일이 아닙니다: {source}")
+        with temporary.open("wb") as output_file:
+            shutil.copyfileobj(input_file, output_file)
+    return True
+
+
 def _utc(now: datetime | None) -> datetime:
     value = now or datetime.now(timezone.utc)
     if value.tzinfo is None:
@@ -234,16 +256,11 @@ def _create_backup_set(now: datetime | None) -> Path:
 
         for source_name in SETTINGS_FILES:
             source = SETTINGS_DIR / source_name
-            if source.is_symlink():
-                raise RuntimeError(f"설정 파일 symlink는 백업하지 않습니다: {source}")
-            if source.exists() and not source.is_file():
-                raise RuntimeError(f"설정 경로가 일반 파일이 아닙니다: {source}")
-            if not source.exists():
-                continue
             final = BACKUP_DIR / f"{timestamp}-setting-{source_name}"
             temporary = _temporary_path(f"{timestamp}-setting-{source_name}")
             temporary_paths.append(temporary)
-            shutil.copy2(source, temporary)
+            if not _copy_setting(source, temporary):
+                continue
             pending_settings.append((temporary, final, source_name))
 
         for temporary, _, _, _ in pending:
@@ -331,6 +348,7 @@ def _load_manifest(manifest_path: Path) -> dict:
 
     if sources != set(DATABASES):
         raise RuntimeError(f"완전하지 않은 백업 manifest입니다: {manifest_path}")
+    timestamp = manifest_path.name.removesuffix("-manifest.json")
     setting_sources: set[str] = set()
     for item in settings:
         if not isinstance(item, dict):
@@ -347,6 +365,7 @@ def _load_manifest(manifest_path: Path) -> dict:
         if (
             not isinstance(backup, str)
             or Path(backup).name != backup
+            or backup != f"{timestamp}-setting-{source}"
             or backup in backups
         ):
             raise RuntimeError(f"잘못된 백업 파일 경로입니다: {backup}")
@@ -407,6 +426,12 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
     setting_destinations = [
         stage / "settings" / item["source"] for item in manifest["settings"]
     ]
+    settings_stage = stage / "settings"
+    if setting_destinations and (
+        settings_stage.is_symlink()
+        or (settings_stage.exists() and not settings_stage.is_dir())
+    ):
+        raise RuntimeError(f"복구 stage 설정 경로가 안전하지 않습니다: {settings_stage}")
     if any(path.exists() for path in destinations):
         raise RuntimeError(f"복구 stage에 DB 파일이 이미 있습니다: {stage}")
     if any(path.exists() for path in setting_destinations):
@@ -423,8 +448,9 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
             source_name=source_name,
         )
     if setting_destinations:
-        settings_stage = stage / "settings"
         settings_stage.mkdir(parents=True, exist_ok=True)
+        if settings_stage.is_symlink() or not settings_stage.is_dir():
+            raise RuntimeError(f"복구 stage 설정 경로가 안전하지 않습니다: {settings_stage}")
         for item, restored in zip(manifest["settings"], setting_destinations):
             shutil.copy2(manifest_path.parent / item["backup"], restored)
 

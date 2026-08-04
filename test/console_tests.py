@@ -1703,6 +1703,61 @@ def test_settings_backup_round_trip():
                 except RuntimeError:
                     invalid_results.append(True)
 
+            unrelated_backup = backup_dir / "unrelated-settings-backup.json"
+            unrelated_backup.write_bytes(b"unrelated")
+            unrelated_document = json.loads(json.dumps(document))
+            unrelated_document["settings"] = [
+                {
+                    "source": "persona.json",
+                    "backup": unrelated_backup.name,
+                    "size": unrelated_backup.stat().st_size,
+                    "sha256": backup._sha256(unrelated_backup),
+                }
+            ]
+            unrelated_manifest = backup_dir / "20260809T000000Z-manifest.json"
+            unrelated_manifest.write_text(
+                json.dumps(unrelated_document), encoding="utf-8"
+            )
+            try:
+                backup.verify_backup_set(unrelated_manifest)
+                unrelated_backup_rejected = False
+            except RuntimeError:
+                unrelated_backup_rejected = True
+
+            symlink_stage = root / "symlink-stage"
+            outside_settings = root / "outside-settings"
+            symlink_stage.mkdir()
+            outside_settings.mkdir()
+            (symlink_stage / "settings").symlink_to(
+                outside_settings, target_is_directory=True
+            )
+            try:
+                backup.stage_restore(manifest, symlink_stage)
+                stage_symlink_rejected = False
+            except RuntimeError:
+                stage_symlink_rejected = True
+
+            race_source = root / "race-source.json"
+            race_original = root / "race-original.json"
+            race_target = root / "race-target.json"
+            race_copy = root / "race-copy.json"
+            race_source.write_bytes(b"regular")
+            race_target.write_bytes(b"outside")
+            real_open = backup.os.open
+
+            def replace_source_before_open(path, *args, **kwargs):
+                if pathlib.Path(path) == race_source:
+                    race_source.replace(race_original)
+                    race_source.symlink_to(race_target)
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(backup.os, "open", side_effect=replace_source_before_open):
+                try:
+                    backup._copy_setting(race_source, race_copy)
+                    race_rejected = False
+                except RuntimeError:
+                    race_rejected = True
+
             symlink_settings = root / "symlink-settings"
             symlink_settings.mkdir()
             target = root / "settings-target.json"
@@ -1756,6 +1811,17 @@ def test_settings_backup_round_trip():
         check("DB-only historical manifest 복구", historical_ok)
         check("설정 크기와 checksum은 stage 전 거부", all(corruption_results))
         check("안전하지 않거나 중복된 설정 manifest 거부", all(invalid_results))
+        check("설정 backup은 source별 canonical 이름만 허용", unrelated_backup_rejected)
+        check(
+            "symlink 설정 stage는 stage 밖에 쓰지 않고 거부",
+            stage_symlink_rejected and not (outside_settings / "persona.json").exists(),
+        )
+        check(
+            "설정 source 교체 symlink race 거부",
+            race_rejected
+            and not race_copy.exists()
+            and race_target.read_bytes() == b"outside",
+        )
         check("설정 symlink 백업 거부", symlink_rejected)
         check("설정 디렉터리 백업 거부", directory_rejected)
         check(
