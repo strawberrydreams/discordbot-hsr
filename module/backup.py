@@ -175,6 +175,35 @@ def _copy_setting(source: Path, temporary: Path) -> bool:
     return True
 
 
+def _open_settings_stage(path: Path) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise RuntimeError("안전한 복구 stage를 지원하지 않는 운영체제입니다.")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | directory | no_follow)
+    except OSError as exc:
+        raise RuntimeError(f"복구 stage 설정 경로가 안전하지 않습니다: {path}") from exc
+    if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        return descriptor
+    os.close(descriptor)
+    raise RuntimeError(f"복구 stage 설정 경로가 안전하지 않습니다: {path}")
+
+
+def _copy_staged_setting(source: Path, name: str, directory_descriptor: int) -> None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"복구 stage 설정 파일을 만들 수 없습니다: {name}") from exc
+    with source.open("rb") as input_file, os.fdopen(descriptor, "wb") as output_file:
+        shutil.copyfileobj(input_file, output_file)
+
+
 def _utc(now: datetime | None) -> datetime:
     value = now or datetime.now(timezone.utc)
     if value.tzinfo is None:
@@ -437,22 +466,31 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
     if any(path.exists() for path in setting_destinations):
         raise RuntimeError(f"복구 stage에 설정 파일이 이미 있습니다: {stage}")
     stage.mkdir(parents=True, exist_ok=True)
-    for item, restored in zip(manifest["databases"], destinations):
-        source_name = item["source"]
-        source = manifest_path.parent / item["backup"]
-        shutil.copy2(source, restored)
-        _SQLITE_REPOSITORIES[source_name](restored)
-        verify_database(
-            restored,
-            DATABASES[source_name],
-            source_name=source_name,
-        )
+    settings_descriptor = None
     if setting_destinations:
         settings_stage.mkdir(parents=True, exist_ok=True)
-        if settings_stage.is_symlink() or not settings_stage.is_dir():
-            raise RuntimeError(f"복구 stage 설정 경로가 안전하지 않습니다: {settings_stage}")
-        for item, restored in zip(manifest["settings"], setting_destinations):
-            shutil.copy2(manifest_path.parent / item["backup"], restored)
+        settings_descriptor = _open_settings_stage(settings_stage)
+    try:
+        for item, restored in zip(manifest["databases"], destinations):
+            source_name = item["source"]
+            source = manifest_path.parent / item["backup"]
+            shutil.copy2(source, restored)
+            _SQLITE_REPOSITORIES[source_name](restored)
+            verify_database(
+                restored,
+                DATABASES[source_name],
+                source_name=source_name,
+            )
+        if settings_descriptor is not None:
+            for item in manifest["settings"]:
+                _copy_staged_setting(
+                    manifest_path.parent / item["backup"],
+                    item["source"],
+                    settings_descriptor,
+                )
+    finally:
+        if settings_descriptor is not None:
+            os.close(settings_descriptor)
 
 
 def restore_test(manifest_path: Path) -> None:

@@ -1737,6 +1737,42 @@ def test_settings_backup_round_trip():
             except RuntimeError:
                 stage_symlink_rejected = True
 
+            stage_race = root / "stage-directory-race"
+            stage_race_outside = root / "stage-race-outside"
+            detached_settings = root / "detached-settings"
+            stage_race_outside.mkdir()
+            real_open = backup.os.open
+            swapped_stage = False
+
+            def swap_stage_before_destination(path, *args, **kwargs):
+                nonlocal swapped_stage
+                if (
+                    not swapped_stage
+                    and kwargs.get("dir_fd") is not None
+                    and path == "persona.json"
+                ):
+                    settings_path = stage_race / "settings"
+                    settings_path.rename(detached_settings)
+                    settings_path.symlink_to(
+                        stage_race_outside, target_is_directory=True
+                    )
+                    swapped_stage = True
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(backup.os, "open", side_effect=swap_stage_before_destination):
+                try:
+                    backup.stage_restore(manifest, stage_race)
+                    stage_race_safe = (
+                        swapped_stage
+                        and not (stage_race_outside / "persona.json").exists()
+                        and all(
+                            (detached_settings / name).read_bytes() == content
+                            for name, content in expected.items()
+                        )
+                    )
+                except RuntimeError:
+                    stage_race_safe = False
+
             race_source = root / "race-source.json"
             race_original = root / "race-original.json"
             race_target = root / "race-target.json"
@@ -1816,6 +1852,7 @@ def test_settings_backup_round_trip():
             "symlink 설정 stage는 stage 밖에 쓰지 않고 거부",
             stage_symlink_rejected and not (outside_settings / "persona.json").exists(),
         )
+        check("설정 stage 교체 race는 stage 밖에 쓰지 않음", stage_race_safe)
         check(
             "설정 source 교체 symlink race 거부",
             race_rejected
