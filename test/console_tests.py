@@ -482,7 +482,7 @@ def test_macos_templates_render_portably():
         ),
     )
 
-    project_root = pathlib.Path("/tmp/portable-clone/discordbot-hsr")
+    project_root = pathlib.Path("/tmp/portable&<clone>#/discordbot-hsr")
     with tempfile.TemporaryDirectory() as directory:
         output_dir = pathlib.Path(directory)
         render_templates(project_root, output_dir, "portable-user", "portable-group")
@@ -507,13 +507,29 @@ def test_macos_templates_render_portably():
     )
     check(
         "rendered newsyslog uses clone user and group",
-        project_root.as_posix() in newsyslog
+        "/tmp/portable&<clone>\\#/discordbot-hsr" in newsyslog
         and "portable-user:portable-group" in newsyslog
         and not any(
             placeholder in newsyslog
             for placeholder in ("__PROJECT_ROOT__", "__USER__", "__GROUP__")
         ),
     )
+    with tempfile.TemporaryDirectory() as directory:
+        output_dir = pathlib.Path(directory)
+        try:
+            render_templates(
+                pathlib.Path("/tmp/portable clone/discordbot-hsr"),
+                output_dir,
+                "portable-user",
+                "portable-group",
+            )
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check(
+            "newsyslog-incompatible whitespace path rejected before output",
+            rejected and not any(output_dir.iterdir()),
+        )
 
 
 def test_deployment_contracts_skip_only_compose_when_cli_missing():
