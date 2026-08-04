@@ -1093,14 +1093,14 @@ def test_guild_isolation():
     check("참가 조회는 서버별", parties.get_user_party(A, 1) == "PUBG" and parties.get_user_party(B, 1) is None)
 
     # 설정도 서버별.
-    settings.set_recruit_channel(A, 333)
-    check("설정 분리", settings.get_recruit_channel(A) == 333 and settings.get_recruit_channel(B) is None)
+    settings.set_party_channel(A, 333)
+    check("설정 분리", settings.get_party_channel(A) == 333 and settings.get_party_channel(B) is None)
 
     # 봇이 서버에서 제거되면 그 서버 것만 지운다.
     for repo in (points, parties, settings):
         repo.delete_guild(A)
     check("제거된 서버 데이터 삭제", points.get_points(A, USER) == 0 and parties.get_party(A, "PUBG") is None
-          and settings.get_recruit_channel(A) is None)
+          and settings.get_party_channel(A) is None)
     check("다른 서버는 보존", points.get_points(B, USER) == 910 and parties.get_party(B, "PUBG") is not None)
 
     # 스키마가 경계를 강제하는지 — 모든 기본키에 guild_id가 있어야 한다.
@@ -1190,7 +1190,7 @@ def test_schema_versions():
 
     check("attendance 스키마 버전", _user_version(attendance_path) == 2)
     check("party 스키마 버전", _user_version(party_path) == 1)
-    check("settings 스키마 버전", _user_version(settings_path) == 1)
+    check("settings 스키마 버전", _user_version(settings_path) == 2)
 
     for label, repository in (
         ("attendance", SQLiteAttendanceRepository),
@@ -1252,14 +1252,47 @@ def test_schema_versions():
         SQLitePartyRepository(party_path).get_party(1, "LOL") == (3,),
     )
 
-    with sqlite3.connect(settings_path) as conn:
-        conn.execute("PRAGMA user_version = 0")
-        conn.execute("INSERT INTO guild_settings VALUES (1, 2, 3)")
-    SQLiteGuildSettingsRepository(settings_path)
-    check(
-        "무버전 settings 데이터 보존",
-        SQLiteGuildSettingsRepository(settings_path).get_recruit_channel(1) == 2,
-    )
+    for legacy_version in (0, 1):
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v2.db"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute(
+                "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
+            )
+            conn.execute("INSERT INTO guild_settings VALUES (7, 700, 701)")
+            conn.execute(f"PRAGMA user_version = {legacy_version}")
+        SQLiteGuildSettingsRepository(legacy_path)
+        with sqlite3.connect(legacy_path) as conn:
+            row = conn.execute(
+                "SELECT party_channel_id, music_channel_id, music_panel_msg_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+            ).fetchone()
+            tables = {
+                item[0]
+                for item in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        check(f"settings v{legacy_version} recruit 보존", row == (700, None, None, 0))
+        check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
+        check(f"settings v{legacy_version} 버전", version == 2)
+
+    settings = SQLiteGuildSettingsRepository(_TMP_DIR / "settings_repository.db")
+    settings.set_party_panel(7, "LOL", 70)
+    settings.set_party_panel(7, "LOL", 71)
+    settings.set_party_panel(7, "PUBG", 72)
+    panels_after_upsert = settings.get_party_panels(7)
+    settings.delete_party_panel(7, "LOL")
+    settings.set_party_channel(7, 700)
+    settings.set_music_channel(7, 701)
+    settings.set_music_panel_msg(7, 702)
+    settings.set_allow_host_announce(7, True)
+    settings.set_allow_host_announce(8, True)
+    settings.clear_channel(7, 701)
+    check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
+    check("삭제된 음악 채널은 패널 메시지도 해제", settings.get_party_channel(7) == 700 and settings.get_music_channel(7) is None and settings.get_music_panel_msg(7) is None)
+    check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
+    settings.delete_guild(7)
+    check("길드 삭제는 설정과 party panel 정리", settings.get_party_panels(7) == {} and settings.get_party_channel(7) is None)
 
 
 def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
@@ -1888,10 +1921,14 @@ def test_legacy_backup_restore_and_prune():
     SQLitePartyRepository(party_path).create_party(
         _TEST_GUILD, "LOL", 2_000_000_000
     )
-    SQLiteGuildSettingsRepository(settings_path)
-    for path in (party_path, settings_path):
-        with closing(sqlite3.connect(path)) as conn:
-            conn.execute("PRAGMA user_version = 0")
+    with closing(sqlite3.connect(settings_path)) as conn:
+        conn.execute(
+            "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
+        )
+        conn.execute("INSERT INTO guild_settings VALUES (7, 700, 701)")
+        conn.execute("PRAGMA user_version = 1")
+    with closing(sqlite3.connect(party_path)) as conn:
+        conn.execute("PRAGMA user_version = 0")
     backup_dir.mkdir(parents=True)
 
     items = []
@@ -1902,6 +1939,8 @@ def test_legacy_backup_restore_and_prune():
         tables = (
             {"users", "point_ledger"}
             if source_name == "attendance_data.db"
+            else {"guild_settings"}
+            if source_name == "guild_settings.db"
             else current_tables
         )
         with closing(sqlite3.connect(copied)) as conn:
@@ -1995,6 +2034,24 @@ def test_legacy_backup_restore_and_prune():
     check(
         "staged historical attendance migrates before installation",
         version == 2 and "ai_usage" in tables and points == (9000,),
+    )
+    staged_settings = stage / "guild_settings.db"
+    with closing(sqlite3.connect(staged_settings)) as conn:
+        settings_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        settings_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        party_channel = conn.execute(
+            "SELECT party_channel_id FROM guild_settings WHERE guild_id = 7"
+        ).fetchone()
+    check(
+        "staged historical settings migrates to the panel contract",
+        settings_version == 2
+        and "party_panels" in settings_tables
+        and party_channel == (700,),
     )
     future = root / "future-attendance.db"
     shutil.copy2(staged_attendance, future)

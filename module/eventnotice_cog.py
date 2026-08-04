@@ -3,18 +3,10 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
 from typing import Optional
-from module.database import (
-    GuildSettingsRepository,
-    create_guild_settings_repository,
-    run_db,
-)
 
 class EventNoticeCog(commands.Cog):
-    def __init__(
-        self, bot: commands.Bot, settings: Optional[GuildSettingsRepository] = None
-    ):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.settings = settings or create_guild_settings_repository()
 
     @staticmethod
     def _valid_events(events, now):
@@ -29,22 +21,6 @@ class EventNoticeCog(commands.Cog):
     async def show_specific_event(
         self, interaction: discord.Interaction, index: Optional[int] = None
     ):
-        # 채널 확인은 defer 전에 수행해야 ephemeral 응답이 가능함
-        # (공개 defer 이후의 followup은 ephemeral=True가 무시됨)
-        configured = await run_db(self.settings.get_event_channel, interaction.guild_id)
-        if configured is None:
-            await interaction.response.send_message(
-                "⚙️ 이벤트 채널이 아직 지정되지 않았습니다.\n"
-                "서버 관리자가 `/설정 이벤트채널`로 먼저 지정해 주세요.",
-                ephemeral=True,
-            )
-            return
-        if interaction.channel_id != configured:
-            await interaction.response.send_message(
-                f"❌ 이 명령어는 <#{configured}> 에서만 사용할 수 있습니다.", ephemeral=True
-            )
-            return
-
         # 응답을 예약 (타임아웃 방지)
         await interaction.response.defer()
 

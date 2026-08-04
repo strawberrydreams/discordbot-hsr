@@ -36,42 +36,58 @@ class GuildSettingsCog(commands.Cog):
         """봇이 서버에서 제거되면 그 서버의 설정을 남기지 않는다."""
         await run_db(self.settings.delete_guild, guild.id)
 
-    @설정.command(name="모집채널", description="파티 모집 명령을 사용할 채널을 지정합니다.")
+    @설정.command(name="파티채널", description="파티 패널을 표시할 채널을 지정합니다.")
     @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _recruit(
+    async def _party_channel(
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
-        await run_db(self.settings.set_recruit_channel, inter.guild_id, target.id)
+        await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
         await inter.response.send_message(
-            f"✅ 파티 모집 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+            f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
 
-    @설정.command(name="이벤트채널", description="이벤트 조회 명령을 사용할 채널을 지정합니다.")
+    @설정.command(name="음악채널", description="음악 패널을 표시할 채널을 지정합니다.")
     @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _event(
+    async def _music_channel(
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
-        await run_db(self.settings.set_event_channel, inter.guild_id, target.id)
+        await run_db(self.settings.set_music_channel, inter.guild_id, target.id)
         await inter.response.send_message(
-            f"✅ 이벤트 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+            f"✅ 음악 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+        )
+
+    @설정.command(name="공지허용", description="파티 호스트 공지를 허용하거나 차단합니다.")
+    @app_commands.describe(허용="허용하면 호스트 공지를 받습니다.")
+    async def _allow_host_announce(self, inter: discord.Interaction, 허용: bool):
+        await run_db(self.settings.set_allow_host_announce, inter.guild_id, 허용)
+        await inter.response.send_message(
+            f"✅ 파티 호스트 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
         )
 
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show(self, inter: discord.Interaction):
-        recruit = await run_db(self.settings.get_recruit_channel, inter.guild_id)
-        event = await run_db(self.settings.get_event_channel, inter.guild_id)
+        party = await run_db(self.settings.get_party_channel, inter.guild_id)
+        music = await run_db(self.settings.get_music_channel, inter.guild_id)
+        allow_host_announce = await run_db(
+            self.settings.get_allow_host_announce, inter.guild_id
+        )
 
         embed = discord.Embed(title="⚙️ 이 서버의 봇 설정", color=discord.Color.blurple())
         embed.add_field(
-            name="파티 모집 채널",
-            value=f"<#{recruit}>" if recruit else "미지정 — `/설정 모집채널`",
+            name="파티 패널 채널",
+            value=f"<#{party}>" if party else "미지정 — `/설정 파티채널`",
             inline=False,
         )
         embed.add_field(
-            name="이벤트 채널",
-            value=f"<#{event}>" if event else "미지정 — `/설정 이벤트채널`",
+            name="음악 패널 채널",
+            value=f"<#{music}>" if music else "미지정 — `/설정 음악채널`",
+            inline=False,
+        )
+        embed.add_field(
+            name="파티 호스트 공지",
+            value="허용" if allow_host_announce else "차단",
             inline=False,
         )
         await inter.response.send_message(embed=embed, ephemeral=True)

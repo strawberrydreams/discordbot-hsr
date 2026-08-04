@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import gc
 import json
 import pathlib
@@ -88,49 +87,6 @@ class ConditionalExtensionTest(unittest.TestCase):
             "module.attendance_cog",
         ):
             self.assertIn(required, names)
-
-
-class _StubSettings:
-    """길드별 채널 설정 스텁. 실제 리포지토리 대신 주입한다."""
-
-    def __init__(self, recruit=None, event=None):
-        self._recruit = recruit
-        self._event = event
-
-    def get_recruit_channel(self, guild_id):
-        return self._recruit
-
-    def get_event_channel(self, guild_id):
-        return self._event
-
-    def set_recruit_channel(self, guild_id, channel_id):
-        self._recruit = channel_id
-
-    def set_event_channel(self, guild_id, channel_id):
-        self._event = channel_id
-
-    def delete_guild(self, guild_id):
-        self._recruit = self._event = None
-
-
-@contextlib.contextmanager
-def _recruit_channel(cog, channel_id):
-    previous = getattr(cog, "settings", None)
-    cog.settings = _StubSettings(recruit=channel_id)
-    try:
-        yield
-    finally:
-        cog.settings = previous
-
-
-@contextlib.contextmanager
-def _event_channel(cog, channel_id):
-    previous = getattr(cog, "settings", None)
-    cog.settings = _StubSettings(event=channel_id)
-    try:
-        yield
-    finally:
-        cog.settings = previous
 
 
 class RecordingResponse:
@@ -998,30 +954,31 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
 
     async def test_recruit_selector_and_no_available_games_are_ephemeral(self):
-        with _recruit_channel(self.play, 1):
-            selector_interaction = FakeInteraction(channel_id=1)
-            await PlayWithCog.모집.callback(self.play, selector_interaction)
-            self.assertIs(
-                selector_interaction.response.messages[-1][1].get("ephemeral"), True
-            )
+        selector_interaction = FakeInteraction(channel_id=1)
+        await PlayWithCog.모집.callback(self.play, selector_interaction)
+        self.assertIs(
+            selector_interaction.response.messages[-1][1].get("ephemeral"), True
+        )
 
-            for game in playwith_cog.GAMES:
-                self.party_repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
-            full_interaction = FakeInteraction(channel_id=1)
-            await PlayWithCog.모집.callback(self.play, full_interaction)
-            self.assertIs(full_interaction.response.messages[-1][1].get("ephemeral"), True)
+        for game in playwith_cog.GAMES:
+            self.party_repository.create_party(TEST_GUILD_ID, game, datetime.now().isoformat())
+        full_interaction = FakeInteraction(channel_id=1)
+        await PlayWithCog.모집.callback(self.play, full_interaction)
+        self.assertIs(full_interaction.response.messages[-1][1].get("ephemeral"), True)
 
-    async def test_event_command_rejects_other_channels_before_fetching(self):
+    async def test_party_and_event_commands_reach_their_backends_from_any_channel(self):
+        self.assertNotIn("ensure_recruit_channel", PlayWithCog.__dict__)
+        self.assertNotIn("settings", EventNoticeCog.__init__.__code__.co_varnames)
+
+        party_interaction = FakeInteraction(channel_id=-1)
+        await PlayWithCog.모집.callback(self.play, party_interaction)
+        self.assertIn("view", party_interaction.response.messages[-1][1])
+
         guild = FakeGuild()
         interaction = FakeInteraction(channel_id=-1, guild=guild)
-        event_cog = EventNoticeCog(bot=None)
-        with _event_channel(event_cog, 1):
-            await EventNoticeCog.show_specific_event.callback(
-                EventNoticeCog(bot=None), interaction, 1
-            )
+        await EventNoticeCog.show_specific_event.callback(EventNoticeCog(bot=None), interaction, 1)
 
-        self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
-        self.assertEqual(guild.fetch_scheduled_events_calls, 0)
+        self.assertEqual(guild.fetch_scheduled_events_calls, 1)
 
     async def test_event_list_and_detail_use_start_time_then_id_order(self):
         later = datetime(2026, 8, 2, tzinfo=timezone.utc)
@@ -1037,9 +994,8 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         listing = FakeInteraction(channel_id=1, guild=guild)
         detail = FakeInteraction(channel_id=1, guild=guild)
-        with _event_channel(cog, 1):
-            await EventNoticeCog.show_specific_event.callback(cog, listing, None)
-            await EventNoticeCog.show_specific_event.callback(cog, detail, 1)
+        await EventNoticeCog.show_specific_event.callback(cog, listing, None)
+        await EventNoticeCog.show_specific_event.callback(cog, detail, 1)
 
         list_text = listing.followup.messages[0][1]["embed"].description
         self.assertLess(list_text.index("같은 시각 앞"), list_text.index("같은 시각 뒤"))
@@ -1072,8 +1028,7 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
 
-            with _recruit_channel(cog, 1):
-                await PlayWithCog.파티.callback(cog, interaction)
+            await PlayWithCog.파티.callback(cog, interaction)
 
             self.assertIsNotNone(repository.get_party(TEST_GUILD_ID, game))
             self.assertEqual(
@@ -1124,8 +1079,7 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
 
-            with _recruit_channel(cog, 1):
-                await PlayWithCog.파티.callback(cog, interaction)
+            await PlayWithCog.파티.callback(cog, interaction)
 
         self.assertEqual(len(interaction.response.messages), 1)
         self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 2)
@@ -1145,8 +1099,7 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=FakeGuild())
 
-            with _recruit_channel(cog, 1):
-                await PlayWithCog.파티.callback(cog, interaction)
+            await PlayWithCog.파티.callback(cog, interaction)
 
         self.assertEqual(len(interaction.response.messages[0][1]["embeds"]), 10)
         self.assertEqual(len(interaction.followup.messages), 1)
@@ -1171,8 +1124,7 @@ class PartyInteractionTests(unittest.IsolatedAsyncioTestCase):
                 cog = PlayWithCog(bot=None, repository=repository)
             interaction = FakeInteraction(channel_id=1, guild=MentionGuild())
 
-            with _recruit_channel(cog, 1):
-                await PlayWithCog.파티.callback(cog, interaction)
+            await PlayWithCog.파티.callback(cog, interaction)
 
         fields = interaction.response.messages[0][1]["embeds"][0].fields
         self.assertEqual([len(field.value) for field in fields], [1_024, 1_024])
@@ -1495,8 +1447,7 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
                     return FakeUser() if user_id == 1 else None
 
             interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
-            with _recruit_channel(cog, 1):
-                await PlayWithCog.파티.callback(cog, interaction)
+            await PlayWithCog.파티.callback(cog, interaction)
 
             description = interaction.response.messages[0][1]["embeds"][0].description
             self.assertIn("현재 인원: 1 /", description)

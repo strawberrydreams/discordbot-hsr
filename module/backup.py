@@ -34,7 +34,7 @@ from module.database import (
 DATABASES = {
     "attendance_data.db": {"users", "point_ledger", "ai_usage"},
     "party_data.db": {"parties", "participants"},
-    "guild_settings.db": {"guild_settings"},
+    "guild_settings.db": {"guild_settings", "party_panels"},
 }
 _SQLITE_REPOSITORIES = {
     "attendance_data.db": SQLiteAttendanceRepository,
@@ -46,6 +46,7 @@ _CURRENT_SCHEMA_VERSIONS = {
     for name, repository in _SQLITE_REPOSITORIES.items()
 }
 _LEGACY_ATTENDANCE_TABLES = {"users", "point_ledger"}
+_LEGACY_GUILD_SETTINGS_TABLES = {"guild_settings"}
 
 
 @contextmanager
@@ -119,6 +120,12 @@ def verify_database(
                 and version in (0, 1)
             ):
                 required_tables = _LEGACY_ATTENDANCE_TABLES
+            if (
+                allow_legacy
+                and source_name == "guild_settings.db"
+                and version in (0, 1)
+            ):
+                required_tables = _LEGACY_GUILD_SETTINGS_TABLES
             tables = {
                 row[0]
                 for row in conn.execute(

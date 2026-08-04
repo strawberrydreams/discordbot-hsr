@@ -6,9 +6,7 @@ from discord.ext import commands, tasks
 from discord.ui import View, Select, Button
 from module.config import GAMES
 from module.database import (
-    GuildSettingsRepository,
     PartyRepository,
-    create_guild_settings_repository,
     create_party_repository,
     run_db,
 )
@@ -31,12 +29,10 @@ class PlayWithCog(commands.Cog):
         self,
         bot: commands.Bot,
         repository: Optional[PartyRepository] = None,
-        settings: Optional[GuildSettingsRepository] = None,
     ):
         self.bot = bot
         # DB 접근은 Repository에 위임 (기본: DB_BACKEND 환경 변수에 따라 생성, 테스트 시 주입 가능)
         self.db = repository or create_party_repository()
-        self.settings = settings or create_guild_settings_repository()
         self.cleanup_parties.start()
         # 영속 View는 봇 전체에서 공유된다. 길드 구분은 상호작용의 guild_id로 한다.
         self.shared_views = {}
@@ -107,33 +103,9 @@ class PlayWithCog(commands.Cog):
     async def get_user_party(self, guild_id, user_id):
         return await run_db(self.db.get_user_party, guild_id, user_id)
 
-    async def ensure_recruit_channel(self, interaction) -> bool:
-        """모집 채널이 지정돼 있고 현재 채널이 그 채널인지 확인한다.
-
-        미설정 서버에서는 기능을 막고 /설정 안내를 띄운다. 아무 채널에서나
-        열어주면 서버마다 다른 규칙을 강제할 수 없다.
-        """
-        configured = await run_db(self.settings.get_recruit_channel, interaction.guild_id)
-        if configured is None:
-            await interaction.response.send_message(
-                "⚙️ 모집 채널이 아직 지정되지 않았습니다.\n"
-                "서버 관리자가 `/설정 모집채널`로 먼저 지정해 주세요.",
-                ephemeral=True,
-            )
-            return False
-        if interaction.channel_id != configured:
-            await interaction.response.send_message(
-                f"❌ 이 명령어는 <#{configured}> 에서만 사용할 수 있습니다.", ephemeral=True
-            )
-            return False
-        return True
-
     @app_commands.command(name="모집", description="게임별 파티 모집 메시지를 생성합니다.")
     @app_commands.guild_only()
     async def 모집(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
         # Find games that don't have an active party
         available_games = []
         for game in GAMES:
@@ -158,9 +130,6 @@ class PlayWithCog(commands.Cog):
     @app_commands.command(name="나가기", description="현재 참가 중인 파티에서 나갑니다.")
     @app_commands.guild_only()
     async def 나가기(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
         guild_id = interaction.guild_id
         user_id = interaction.user.id
         game = await self.get_user_party(guild_id, user_id)
@@ -182,9 +151,6 @@ class PlayWithCog(commands.Cog):
     @app_commands.command(name="파티", description="현재 모집 중인 파티 현황 확인")
     @app_commands.guild_only()
     async def 파티(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
         guild_id = interaction.guild_id
         embeds = []
 
@@ -253,9 +219,6 @@ class PlayWithCog(commands.Cog):
     @app_commands.command(name="변경", description="현재 참가 중인 파티에서 역할을 변경합니다.")
     @app_commands.guild_only()
     async def 변경(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
         user_id = interaction.user.id
         game = await self.get_user_party(interaction.guild_id, user_id)
 

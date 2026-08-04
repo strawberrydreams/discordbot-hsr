@@ -214,23 +214,59 @@ class PartyRepository(ABC):
 
 
 class GuildSettingsRepository(ABC):
-    """길드별 봇 설정. 채널 ID를 환경변수에 박으면 공개 배포가 불가능하므로 DB에 둔다."""
+    """길드별 봇 설정과 영속 패널 정보."""
 
     @abstractmethod
-    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
-        """파티 모집 채널 ID. 미설정이면 None."""
+    def get_party_channel(self, guild_id: int) -> Optional[int]:
+        """파티 패널 채널 ID. 미설정이면 None."""
 
     @abstractmethod
-    def get_event_channel(self, guild_id: int) -> Optional[int]:
-        """이벤트 채널 ID. 미설정이면 None."""
+    def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """파티 패널 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
-    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """파티 모집 채널을 지정한다. None이면 해제."""
+    def get_music_channel(self, guild_id: int) -> Optional[int]:
+        """음악 패널 채널 ID. 미설정이면 None."""
 
     @abstractmethod
-    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """이벤트 채널을 지정한다. None이면 해제."""
+    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """음악 패널 채널을 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
+        """음악 패널 메시지 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
+        """음악 패널 메시지 ID를 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def get_allow_host_announce(self, guild_id: int) -> bool:
+        """파티 호스트 공지를 허용하는지 반환한다."""
+
+    @abstractmethod
+    def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
+        """파티 호스트 공지 허용 여부를 지정한다."""
+
+    @abstractmethod
+    def get_party_panels(self, guild_id: int) -> Dict[str, int]:
+        """게임별 영속 파티 패널 메시지 ID를 반환한다."""
+
+    @abstractmethod
+    def set_party_panel(self, guild_id: int, game: str, message_id: int) -> None:
+        """게임의 영속 파티 패널 메시지 ID를 저장한다."""
+
+    @abstractmethod
+    def delete_party_panel(self, guild_id: int, game: str) -> None:
+        """게임의 영속 파티 패널 정보를 지운다."""
+
+    @abstractmethod
+    def clear_channel(self, guild_id: int, channel_id: int) -> None:
+        """삭제된 채널을 가리키는 설정을 해제한다."""
+
+    @abstractmethod
+    def list_announcement_guild_ids(self) -> List[int]:
+        """호스트 공지를 허용한 길드 ID를 반환한다."""
 
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
@@ -642,10 +678,20 @@ class SQLitePartyRepository(PartyRepository):
 
 
 class SQLiteGuildSettingsRepository(GuildSettingsRepository):
-    # 컬럼명은 아래 두 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
-    _RECRUIT = "recruit_channel_id"
-    _EVENT = "event_channel_id"
-    _SCHEMA_VERSION = 1
+    # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
+    _PARTY_CHANNEL = "party_channel_id"
+    _MUSIC_CHANNEL = "music_channel_id"
+    _MUSIC_PANEL_MESSAGE = "music_panel_msg_id"
+    _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
+    _SCHEMA_VERSION = 2
+    _CURRENT_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        _MUSIC_CHANNEL,
+        _MUSIC_PANEL_MESSAGE,
+        _ALLOW_HOST_ANNOUNCE,
+    }
+    _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -654,21 +700,71 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
-            _prepare_schema(conn, self._SCHEMA_VERSION, "settings")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id INTEGER PRIMARY KEY,
-                    recruit_channel_id INTEGER,
-                    event_channel_id INTEGER
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "settings")
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
-            """)
-            _require_columns(
-                conn,
-                "guild_settings",
-                {"guild_id", "recruit_channel_id", "event_channel_id"},
+            }
+            if "guild_settings" not in tables:
+                with conn:
+                    self._create_current_tables(conn)
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                return
+
+            columns = {
+                row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
+            }
+            if version < self._SCHEMA_VERSION and self._LEGACY_COLUMNS <= columns:
+                conn.execute("BEGIN")
+                try:
+                    conn.execute("ALTER TABLE guild_settings RENAME TO guild_settings_v1")
+                    self._create_current_tables(conn)
+                    conn.execute(
+                        """
+                        INSERT INTO guild_settings (guild_id, party_channel_id)
+                        SELECT guild_id, recruit_channel_id FROM guild_settings_v1
+                        """
+                    )
+                    conn.execute("DROP TABLE guild_settings_v1")
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                except Exception:
+                    conn.rollback()
+                    raise
+                else:
+                    conn.commit()
+                return
+
+            _require_columns(conn, "guild_settings", self._CURRENT_COLUMNS)
+            with conn:
+                self._create_party_panels_table(conn)
+                _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    @staticmethod
+    def _create_current_tables(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+                    CHECK (allow_host_announce IN (0, 1))
             )
-            _set_schema_version(conn, self._SCHEMA_VERSION)
-            conn.commit()
+        """)
+        SQLiteGuildSettingsRepository._create_party_panels_table(conn)
+
+    @staticmethod
+    def _create_party_panels_table(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            )
+        """)
 
     def _get_column(self, guild_id: int, column: str) -> Optional[int]:
         with closing(_connect(self.db_path)) as conn:
@@ -688,20 +784,85 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             )
             conn.commit()
 
-    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._RECRUIT)
+    def get_party_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._PARTY_CHANNEL)
 
-    def get_event_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._EVENT)
+    def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._PARTY_CHANNEL, channel_id)
 
-    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._RECRUIT, channel_id)
+    def get_music_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._MUSIC_CHANNEL)
 
-    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._EVENT, channel_id)
+    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._MUSIC_CHANNEL, channel_id)
+
+    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._MUSIC_PANEL_MESSAGE)
+
+    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._MUSIC_PANEL_MESSAGE, message_id)
+
+    def get_allow_host_announce(self, guild_id: int) -> bool:
+        return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
+
+    def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
+        self._set_column(guild_id, self._ALLOW_HOST_ANNOUNCE, int(allowed))
+
+    def get_party_panels(self, guild_id: int) -> Dict[str, int]:
+        with closing(_connect(self.db_path)) as conn:
+            return {
+                game: message_id
+                for game, message_id in conn.execute(
+                    "SELECT game, message_id FROM party_panels WHERE guild_id = ?",
+                    (guild_id,),
+                )
+            }
+
+    def set_party_panel(self, guild_id: int, game: str, message_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO party_panels (guild_id, game, message_id) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, game) DO UPDATE SET message_id = excluded.message_id
+                """,
+                (guild_id, game, message_id),
+            )
+            conn.commit()
+
+    def delete_party_panel(self, guild_id: int, game: str) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                "DELETE FROM party_panels WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
+            conn.commit()
+
+    def clear_channel(self, guild_id: int, channel_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE guild_settings
+                SET party_channel_id = CASE WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
+                    music_panel_msg_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_panel_msg_id END,
+                    music_channel_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_channel_id END
+                WHERE guild_id = ? AND (party_channel_id = ? OR music_channel_id = ?)
+                """,
+                (channel_id, channel_id, channel_id, guild_id, channel_id, channel_id),
+            )
+            conn.commit()
+
+    def list_announcement_guild_ids(self) -> List[int]:
+        with closing(_connect(self.db_path)) as conn:
+            return [
+                guild_id
+                for (guild_id,) in conn.execute(
+                    "SELECT guild_id FROM guild_settings WHERE allow_host_announce = 1"
+                )
+            ]
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM party_panels WHERE guild_id = ?", (guild_id,))
             conn.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
             conn.commit()
 
