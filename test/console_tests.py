@@ -10,6 +10,7 @@
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
 #   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
+#   9. 음악 core 계약 (선택 의존성 skip, 최소 재생 엔진, ffmpeg 컨테이너)
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
@@ -1748,6 +1749,7 @@ def test_imports():
         "module.config",
         "module.database",
         "module.main",
+        "module.music_cog",
         "module.panel",
         "module.guildsettings_cog",
         "module.attendance_cog",
@@ -1764,6 +1766,100 @@ def test_imports():
             check(f"import {m}", True)
         except Exception as e:
             check(f"import {m}", False, f"({e})")
+
+
+def test_music_core_contract():
+    print("\n[9] 음악 core (선택 의존성·최소 재생 엔진)")
+    import module.main as bot_main
+    import module.music_cog as music_cog
+
+    declared = [
+        line.split("#")[0].strip()
+        for line in (PROJECT_ROOT / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    declared = [line for line in declared if line]
+    check("PyNaCl은 1.5 이상 2 미만으로 고정", "PyNaCl>=1.5,<2" in declared)
+    check(
+        # 외부 사이트가 바뀌면 즉시 최신 yt-dlp로 올라갈 수 있어야 한다.
+        "yt-dlp는 상한도 exact pin도 없음",
+        [line for line in declared if line.lower().startswith("yt-dlp")] == ["yt-dlp"],
+    )
+
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    apt_packages = [
+        token
+        for token in dockerfile.split("apt-get install")[-1].split("&&")[0].split()
+        if not token.startswith("-") and token != "\\"
+    ]
+    check("Dockerfile은 distro 패키지로 ffmpeg만 설치", apt_packages == ["ffmpeg"])
+    check(
+        "apt cache를 이미지에 남기지 않음",
+        "rm -rf /var/lib/apt/lists/*" in dockerfile,
+    )
+
+    source = inspect.getsource(music_cog)
+    check(
+        "yt-dlp/PyNaCl은 지연 import (미설치 환경에서도 import 가능)",
+        "\nimport yt_dlp" not in source and "\nimport nacl" not in source,
+    )
+    check(
+        "extension 항목은 (모듈, env 이름, 의존성 검사) 3-tuple",
+        all(
+            len(entry) == 3 and (entry[2] is None or callable(entry[2]))
+            for entry in bot_main.EXTENSIONS
+        ),
+    )
+    check(
+        "의존성 검사를 가진 확장은 음악뿐",
+        [name for name, _, dep in bot_main.EXTENSIONS if dep is not None]
+        == ["module.music_cog"],
+    )
+
+    with patch.object(music_cog, "find_spec", lambda name, *a, **k: None):
+        reason = music_cog.music_dependency_error()
+    check(
+        "skip 사유에 빠진 package와 설치 안내 포함",
+        reason is not None
+        and "PyNaCl" in reason
+        and "yt-dlp" in reason
+        and "pip install" in reason,
+        f"({reason})",
+    )
+    with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
+        check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
+
+    check(
+        "MusicTrack은 불변이며 만료되는 stream URL을 담지 않음",
+        music_cog.MusicTrack.__dataclass_params__.frozen
+        and set(music_cog.MusicTrack.__dataclass_fields__)
+        == {"title", "webpage_url", "requester_id"},
+    )
+    check(
+        "MusicPlayer 상태 전이 API 보유",
+        all(
+            hasattr(music_cog.MusicPlayer, name)
+            for name in ("enqueue", "skip", "toggle_pause", "stop", "remove", "snapshot")
+        ),
+    )
+    check(
+        "길드별 player는 Cog dictionary에만 존재",
+        hasattr(music_cog.MusicCog, "get_player")
+        and hasattr(music_cog.MusicCog, "cog_unload"),
+    )
+    check(
+        "deque + asyncio.Lock + callback→loop 예약만 사용",
+        "deque()" in source
+        and "asyncio.Lock()" in source
+        and "run_coroutine_threadsafe" in source
+        and "concurrent.futures" not in source,
+    )
+    check(
+        "FFmpeg source는 reconnect option 사용",
+        "-reconnect 1" in music_cog.FFMPEG_BEFORE_OPTIONS
+        and "-reconnect_delay_max" in music_cog.FFMPEG_BEFORE_OPTIONS,
+    )
 
 
 def test_backup_round_trip():
@@ -2902,6 +2998,7 @@ if __name__ == "__main__":
         test_cog_facade()
         test_channel_sessions()
         test_imports()
+        test_music_core_contract()
         test_backup_round_trip()
         test_settings_backup_round_trip()
         test_legacy_backup_restore_and_prune()

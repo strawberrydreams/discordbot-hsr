@@ -1,12 +1,15 @@
 import asyncio
+import contextlib
 import gc
 import hashlib
 import json
 import pathlib
 import tempfile
+import threading
 import unittest
 import warnings
 from datetime import datetime, timezone
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
@@ -29,6 +32,14 @@ from module.hyacine_chat_cog import HyacineChatCog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
 from module.panel import drop_panel_locks, panel_lock, upsert_panel
+import module.music_cog as music_cog
+from module.music_cog import (
+    MusicCog,
+    MusicPlayer,
+    MusicTrack,
+    extract_track,
+    resolve_stream_url,
+)
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.backup as backup
@@ -94,6 +105,469 @@ class ConditionalExtensionTest(unittest.TestCase):
             "module.attendance_cog",
         ):
             self.assertIn(required, names)
+
+
+def _spec_faker(missing):
+    """nacl/yt_dlp의 설치 여부만 조작하고 나머지 모듈 조회는 그대로 둔다."""
+    real = music_cog.find_spec
+
+    def fake(name, *args, **kwargs):
+        if name in ("nacl", "yt_dlp"):
+            return None if name in missing else object()
+        return real(name, *args, **kwargs)
+
+    return fake
+
+
+_ALL_AI_KEYS = {"OPENAI_API_KEY": "a", "GOOGLE_API_KEY": "b"}
+_NO_AI_KEYS = {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
+_CORE_EXTENSIONS = (
+    "module.guildsettings_cog",
+    "module.eventnotice_cog",
+    "module.playwith_cog",
+    "module.forbiddenfilter_cog",
+    "module.attendance_cog",
+    "module.finance_cog",
+)
+
+
+class MusicDependencyGateTest(unittest.TestCase):
+    """선택적 의존성이 빠지면 음악 확장 하나만 사라져야 한다."""
+
+    def _load(self, missing=(), env=None):
+        buffer = StringIO()
+        with patch.object(music_cog, "find_spec", _spec_faker(set(missing))), \
+             patch.object(bot_main, "ENV_VALUES", dict(env or _ALL_AI_KEYS)), \
+             contextlib.redirect_stdout(buffer):
+            names = bot_main.available_extensions()
+        return names, buffer.getvalue()
+
+    def test_extension_entries_carry_env_names_and_dependency_check(self):
+        for entry in bot_main.EXTENSIONS:
+            self.assertEqual(len(entry), 3, entry)
+            module_name, required, dependency_check = entry
+            self.assertIsInstance(module_name, str)
+            self.assertIsInstance(required, tuple)
+            self.assertTrue(dependency_check is None or callable(dependency_check))
+
+    def test_music_loads_when_both_packages_are_installed(self):
+        names, _ = self._load()
+        self.assertIn("module.music_cog", names)
+
+    def test_music_alone_is_skipped_without_pynacl(self):
+        names, log = self._load(missing=["nacl"])
+        self.assertNotIn("module.music_cog", names)
+        for extension in _CORE_EXTENSIONS:
+            self.assertIn(extension, names)
+        self.assertIn("module.hyacine_chat_cog", names)
+        self.assertIn("module.hyacine_image_cog", names)
+        self.assertIn("PyNaCl", log)
+        self.assertNotIn("yt-dlp", log)
+        self.assertIn("pip install", log)
+
+    def test_music_alone_is_skipped_without_yt_dlp(self):
+        names, log = self._load(missing=["yt_dlp"])
+        self.assertNotIn("module.music_cog", names)
+        for extension in _CORE_EXTENSIONS:
+            self.assertIn(extension, names)
+        self.assertIn("yt-dlp", log)
+        self.assertIn("pip install", log)
+
+    def test_missing_packages_are_all_named_in_the_skip_reason(self):
+        _, log = self._load(missing=["nacl", "yt_dlp"])
+        self.assertIn("PyNaCl", log)
+        self.assertIn("yt-dlp", log)
+        self.assertIn("pip install PyNaCl yt-dlp", log)
+
+    def test_core_extensions_survive_when_every_optional_feature_is_absent(self):
+        names, _ = self._load(missing=["nacl", "yt_dlp"], env=_NO_AI_KEYS)
+        self.assertEqual(names, list(_CORE_EXTENSIONS))
+
+    def test_dependency_error_is_none_when_packages_exist(self):
+        with patch.object(music_cog, "find_spec", _spec_faker(set())):
+            self.assertIsNone(music_cog.music_dependency_error())
+
+
+class _RecordingYTDL:
+    """yt_dlp.YoutubeDL 대역. 어떤 thread에서 불렸는지까지 기록한다."""
+
+    def __init__(self, info=None, error=None):
+        self.info = info
+        self.error = error
+        self.urls = []
+        self.threads = []
+        self.download_flags = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url, download=False):
+        self.urls.append(url)
+        self.download_flags.append(download)
+        self.threads.append(threading.current_thread())
+        if self.error is not None:
+            raise self.error
+        return self.info
+
+
+class MusicExtractionTests(unittest.IsolatedAsyncioTestCase):
+    def _patch_ytdl(self, info=None, error=None):
+        ytdl = _RecordingYTDL(info, error)
+        patcher = patch.object(music_cog, "_youtube_dl", lambda: ytdl)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return ytdl
+
+    def test_ytdl_options_disable_download_playlist_and_search(self):
+        options = music_cog._YTDL_OPTIONS
+        self.assertIs(options["noplaylist"], True)
+        self.assertIs(options["skip_download"], True)
+        self.assertIs(options["extract_flat"], False)
+        # 기본 검색이 켜져 있으면 "아무 문자열"이 곡으로 승격된다.
+        self.assertEqual(options["default_search"], "error")
+
+    async def test_extraction_runs_off_the_event_loop(self):
+        ytdl = self._patch_ytdl(
+            {"title": "노래", "webpage_url": "https://example.com/watch?v=1"}
+        )
+        await extract_track("https://example.com/watch?v=1", requester_id=7)
+        self.assertEqual(len(ytdl.threads), 1)
+        self.assertIsNot(ytdl.threads[0], threading.main_thread())
+        self.assertEqual(ytdl.download_flags, [False])
+
+    async def test_only_single_http_urls_are_accepted(self):
+        ytdl = self._patch_ytdl({"title": "노래", "webpage_url": "https://e.com/1"})
+        for rejected in (
+            "file:///etc/passwd",
+            "ftp://example.com/song.mp3",
+            "javascript:alert(1)",
+            "example.com/watch",
+            "노래 제목 검색어",
+            "https:///no-host",
+            "",
+        ):
+            with self.subTest(url=rejected):
+                with self.assertRaises(ValueError):
+                    await extract_track(rejected, requester_id=7)
+        self.assertEqual(ytdl.urls, [])  # 검증 전에 yt-dlp를 부르지 않는다
+
+    async def test_playlists_are_rejected(self):
+        self._patch_ytdl({"_type": "playlist", "title": "목록", "entries": []})
+        with self.assertRaises(ValueError):
+            await extract_track("https://example.com/list", requester_id=7)
+
+    async def test_live_streams_are_rejected(self):
+        for info in (
+            {"title": "생방송", "webpage_url": "https://e.com/1", "is_live": True},
+            {
+                "title": "예정",
+                "webpage_url": "https://e.com/1",
+                "live_status": "is_upcoming",
+            },
+        ):
+            with self.subTest(info=info):
+                self._patch_ytdl(info)
+                with self.assertRaises(ValueError):
+                    await extract_track("https://example.com/1", requester_id=7)
+
+    async def test_title_must_be_a_non_empty_string(self):
+        for title in (None, 12, "", "   "):
+            with self.subTest(title=title):
+                self._patch_ytdl({"title": title, "webpage_url": "https://e.com/1"})
+                with self.assertRaises(ValueError):
+                    await extract_track("https://example.com/1", requester_id=7)
+
+    async def test_long_title_is_bounded(self):
+        self._patch_ytdl({"title": "가" * 400, "webpage_url": "https://e.com/1"})
+        track = await extract_track("https://example.com/1", requester_id=7)
+        self.assertEqual(len(track.title), music_cog.MAX_TITLE_LENGTH)
+
+    async def test_canonical_webpage_url_replaces_the_input_url(self):
+        self._patch_ytdl(
+            {"title": "노래", "webpage_url": "https://example.com/watch?v=abc"}
+        )
+        track = await extract_track(
+            "https://example.com/short/abc?utm=1", requester_id=99
+        )
+        self.assertEqual(track.webpage_url, "https://example.com/watch?v=abc")
+        self.assertEqual(track.requester_id, 99)
+
+    async def test_non_http_canonical_url_is_rejected(self):
+        self._patch_ytdl({"title": "노래", "webpage_url": "file:///tmp/song.mp3"})
+        with self.assertRaises(ValueError):
+            await extract_track("https://example.com/1", requester_id=7)
+
+    def test_track_is_immutable_and_stores_no_stream_url(self):
+        track = MusicTrack("노래", "https://example.com/1", 7)
+        self.assertEqual(
+            set(MusicTrack.__dataclass_fields__),
+            {"title", "webpage_url", "requester_id"},
+        )
+        with self.assertRaises(Exception):
+            track.title = "다른 노래"
+
+    async def test_stream_url_is_resolved_again_off_the_event_loop(self):
+        ytdl = self._patch_ytdl(
+            {
+                "title": "노래",
+                "webpage_url": "https://example.com/watch?v=1",
+                "url": "https://cdn.example.com/stream?expires=1",
+            }
+        )
+        track = MusicTrack("노래", "https://example.com/watch?v=1", 7)
+        stream = await resolve_stream_url(track)
+        self.assertEqual(stream, "https://cdn.example.com/stream?expires=1")
+        self.assertEqual(ytdl.urls, ["https://example.com/watch?v=1"])
+        self.assertIsNot(ytdl.threads[0], threading.main_thread())
+
+    async def test_unusable_stream_url_is_rejected(self):
+        for url in (None, "", "file:///tmp/song.mp3"):
+            with self.subTest(url=url):
+                self._patch_ytdl(
+                    {"title": "노래", "webpage_url": "https://e.com/1", "url": url}
+                )
+                with self.assertRaises(ValueError):
+                    await resolve_stream_url(MusicTrack("노래", "https://e.com/1", 7))
+
+
+class _FakeVoiceMember:
+    def __init__(self, bot=False):
+        self.bot = bot
+
+
+class _FakeVoiceChannel:
+    def __init__(self, members=()):
+        self.members = list(members)
+
+
+class _FakeVoiceClient:
+    """discord.VoiceClient 대역. stop()이 after callback을 부르는 것까지 흉내낸다."""
+
+    def __init__(self, channel=None):
+        self.channel = channel
+        self.sources = []
+        self.after = None
+        self.disconnects = 0
+        self._playing = False
+        self._paused = False
+
+    def play(self, source, *, after=None):
+        self.sources.append(source)
+        self.after = after
+        self._playing = True
+        self._paused = False
+
+    def is_playing(self):
+        return self._playing and not self._paused
+
+    def is_paused(self):
+        return self._paused
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def stop(self):
+        after, self.after = self.after, None
+        self._playing = False
+        self._paused = False
+        if after is not None:
+            after(None)
+
+    async def disconnect(self, *, force=False):
+        self.disconnects += 1
+        self._playing = False
+        self._paused = False
+
+
+def _fake_source(url, **options):
+    return SimpleNamespace(
+        url=url, options=options, thread=threading.current_thread()
+    )
+
+
+def _music_track(number):
+    return MusicTrack(f"곡{number}", f"https://example.com/{number}", 100 + number)
+
+
+class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fake_resolve(track):
+            return f"https://cdn.example.com/{track.title}"
+
+        for patcher in (
+            patch.object(music_cog, "resolve_stream_url", fake_resolve),
+            patch("discord.FFmpegPCMAudio", _fake_source),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def _wait_until(self, predicate, timeout=2.0):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not predicate():
+            if loop.time() > deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
+
+    async def test_first_enqueue_starts_playback_exactly_once(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        first, second = _music_track(1), _music_track(2)
+
+        await player.enqueue(voice, first)
+        self.assertEqual(len(voice.sources), 1)
+        self.assertEqual(player.current, first)
+        self.assertEqual(player.snapshot().queue, ())
+
+        await player.enqueue(voice, second)
+        self.assertEqual(len(voice.sources), 1)  # 재생 중이면 다시 시작하지 않는다
+        self.assertEqual(player.current, first)
+        self.assertEqual(player.snapshot().queue, (second,))
+
+    async def test_ffmpeg_source_reconnects_and_drops_video(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        await player.enqueue(voice, _music_track(1))
+        options = voice.sources[0].options
+        self.assertIn("-reconnect 1", options["before_options"])
+        self.assertIn("-reconnect_delay_max", options["before_options"])
+        self.assertEqual(options["options"], "-vn")
+
+    async def test_playback_callback_hands_the_next_track_to_the_event_loop(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        first, second = _music_track(1), _music_track(2)
+        await player.enqueue(voice, first)
+        await player.enqueue(voice, second)
+
+        # discord.py는 재생 완료 callback을 별도 thread에서 부른다.
+        worker = threading.Thread(target=voice.stop)
+        worker.start()
+        started = await self._wait_until(lambda: len(voice.sources) == 2)
+        worker.join(timeout=2)
+
+        self.assertTrue(started, "다음 곡이 시작되지 않았다")
+        self.assertEqual(player.current, second)
+        self.assertEqual(player.snapshot().queue, ())
+        # 다음 곡 준비는 worker thread가 아니라 event loop에서 이뤄져야 한다.
+        self.assertIs(voice.sources[1].thread, threading.main_thread())
+        self.assertIsNot(voice.sources[1].thread, worker)
+
+    async def test_skip_stops_the_current_source_and_advances(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        first, second = _music_track(1), _music_track(2)
+        await player.enqueue(voice, first)
+        await player.enqueue(voice, second)
+
+        skipped = await player.skip()
+        self.assertEqual(skipped, first)
+        self.assertTrue(await self._wait_until(lambda: player.current == second))
+        self.assertEqual(len(voice.sources), 2)
+        self.assertEqual(voice.sources[1].url, "https://cdn.example.com/곡2")
+        self.assertEqual(player.snapshot().queue, ())
+
+    async def test_skipping_the_last_track_leaves_the_player_idle(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        await player.enqueue(voice, _music_track(1))
+
+        await player.skip()
+        self.assertTrue(await self._wait_until(lambda: player.current is None))
+        self.assertEqual(len(voice.sources), 1)
+        self.assertFalse(voice.is_playing())
+
+    async def test_pause_and_resume_track_the_voice_client_state(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        await player.enqueue(voice, _music_track(1))
+
+        self.assertTrue(await player.toggle_pause())
+        self.assertTrue(voice.is_paused())
+        self.assertFalse(voice.is_playing())
+        self.assertTrue(player.snapshot().paused)
+
+        self.assertFalse(await player.toggle_pause())
+        self.assertFalse(voice.is_paused())
+        self.assertTrue(voice.is_playing())
+        self.assertFalse(player.snapshot().paused)
+
+    async def test_stop_clears_the_queue_and_disconnects(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        await player.enqueue(voice, _music_track(1))
+        await player.enqueue(voice, _music_track(2))
+
+        await player.stop()
+        snapshot = player.snapshot()
+        self.assertIsNone(snapshot.current)
+        self.assertEqual(snapshot.queue, ())
+        self.assertFalse(snapshot.connected)
+        self.assertEqual(voice.disconnects, 1)
+        self.assertIsNone(player.voice_client)
+
+    async def test_remove_uses_one_based_queue_numbers(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        playing, second, third = _music_track(1), _music_track(2), _music_track(3)
+        await player.enqueue(voice, playing)
+        await player.enqueue(voice, second)
+        await player.enqueue(voice, third)
+
+        self.assertIsNone(await player.remove(0))       # 0-based 번호는 없다
+        self.assertIsNone(await player.remove(3))       # 대기열은 2곡뿐이다
+        self.assertIsNone(await player.remove(-1))
+        self.assertIsNone(await player.remove(True))    # bool은 번호가 아니다
+        self.assertEqual(player.snapshot().queue, (second, third))
+
+        # 1번은 재생 중인 곡이 아니라 대기열 첫 곡이다.
+        self.assertEqual(await player.remove(1), second)
+        self.assertEqual(player.snapshot().queue, (third,))
+        self.assertEqual(player.current, playing)
+
+    async def test_empty_voice_channel_goes_idle_and_disconnects(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        listener = _FakeVoiceMember()
+        channel = _FakeVoiceChannel([_FakeVoiceMember(bot=True), listener])
+        voice = _FakeVoiceClient(channel)
+        await player.enqueue(voice, _music_track(1))
+        await player.enqueue(voice, _music_track(2))
+
+        self.assertFalse(await player.disconnect_if_alone())
+        self.assertEqual(voice.disconnects, 0)
+
+        channel.members.remove(listener)
+        self.assertTrue(await player.disconnect_if_alone())
+        snapshot = player.snapshot()
+        self.assertIsNone(snapshot.current)
+        self.assertEqual(snapshot.queue, ())
+        self.assertFalse(snapshot.connected)
+        self.assertEqual(voice.disconnects, 1)
+
+    async def test_players_are_per_guild_and_all_stop_on_unload(self):
+        cog = MusicCog(bot=None)
+        first = cog.get_player(1)
+        self.assertIs(cog.get_player(1), first)
+        second = cog.get_player(2)
+        self.assertIsNot(second, first)
+
+        voices = []
+        for player in (first, second):
+            voice = _FakeVoiceClient()
+            voices.append(voice)
+            await player.enqueue(voice, _music_track(1))
+
+        await cog.cog_unload()
+        self.assertEqual(cog.players, {})
+        self.assertTrue(all(voice.disconnects == 1 for voice in voices))
+        self.assertTrue(all(player.current is None for player in (first, second)))
 
 
 class RecordingResponse:

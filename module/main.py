@@ -13,6 +13,7 @@ from module.config import (
     OPENAI_API_KEY,
     validate_config,
 )
+from module.music_cog import music_dependency_error
 
 # 실행 커맨드: python -m module.main
 
@@ -22,16 +23,18 @@ intents.guild_scheduled_events = True
 intents.message_content = True
 intents.members = True
 
-# (확장 경로, 그 확장이 요구하는 환경변수 이름들)
+# (확장 경로, 그 확장이 요구하는 환경변수 이름들, 선택적 의존성 검사)
+# 세 번째 항목은 skip 사유 문자열 또는 None을 돌려주는 함수이며, 없으면 None이다.
 EXTENSIONS = (
-    ("module.guildsettings_cog", ()),
-    ("module.eventnotice_cog", ()),
-    ("module.playwith_cog", ()),
-    ("module.forbiddenfilter_cog", ()),
-    ("module.hyacine_chat_cog", ("OPENAI_API_KEY",)),
-    ("module.hyacine_image_cog", ("GOOGLE_API_KEY",)),
-    ("module.attendance_cog", ()),
-    ("module.finance_cog", ()),
+    ("module.guildsettings_cog", (), None),
+    ("module.eventnotice_cog", (), None),
+    ("module.playwith_cog", (), None),
+    ("module.forbiddenfilter_cog", (), None),
+    ("module.hyacine_chat_cog", ("OPENAI_API_KEY",), None),
+    ("module.hyacine_image_cog", ("GOOGLE_API_KEY",), None),
+    ("module.attendance_cog", (), None),
+    ("module.finance_cog", (), None),
+    ("module.music_cog", (), music_dependency_error),
 )
 
 ENV_VALUES = {
@@ -41,16 +44,20 @@ ENV_VALUES = {
 
 
 def available_extensions() -> list[str]:
-    """키가 갖춰진 확장만 돌려준다.
+    """키와 선택적 패키지가 갖춰진 확장만 돌려준다.
 
-    키가 없는 확장은 어차피 동작할 수 없다. 로드해서 런타임에 터지게 두는 것보다
-    건너뛰고 로그를 남기는 편이 낫다. 기능 선택 토글이 아니라 의존성 가드다.
+    키나 패키지가 없는 확장은 어차피 동작할 수 없다. 로드해서 런타임에 터지게 두는
+    것보다 건너뛰고 로그를 남기는 편이 낫다. 기능 선택 토글이 아니라 의존성 가드다.
     """
     names = []
-    for extension, required in EXTENSIONS:
+    for extension, required, dependency_check in EXTENSIONS:
         missing = [key for key in required if not ENV_VALUES.get(key)]
         if missing:
             print(f"⏭️ Skipped: {extension} ({', '.join(missing)} 없음)")
+            continue
+        reason = dependency_check() if dependency_check is not None else None
+        if reason:
+            print(f"⏭️ Skipped: {extension} ({reason})")
             continue
         names.append(extension)
     return names
