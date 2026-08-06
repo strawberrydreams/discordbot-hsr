@@ -1799,17 +1799,18 @@ def test_music_core_contract():
         "rm -rf /var/lib/apt/lists/*" in dockerfile,
     )
 
-    source = inspect.getsource(music_cog)
+    # 최상위(들여쓰기 0) import만 본다. `from yt_dlp import YoutubeDL`처럼 형태만 바꾼
+    # 회귀도 잡아야 하므로 문자열 하나가 아니라 import 줄 전체를 훑는다.
+    top_level_imports = [
+        line
+        for line in inspect.getsource(music_cog).splitlines()
+        if (line.startswith("import ") or line.startswith("from "))
+        and ("yt_dlp" in line or "nacl" in line)
+    ]
     check(
-        "yt-dlp/PyNaCl은 지연 import (미설치 환경에서도 import 가능)",
-        "\nimport yt_dlp" not in source and "\nimport nacl" not in source,
-    )
-    check(
-        "extension 항목은 (모듈, env 이름, 의존성 검사) 3-tuple",
-        all(
-            len(entry) == 3 and (entry[2] is None or callable(entry[2]))
-            for entry in bot_main.EXTENSIONS
-        ),
+        "yt-dlp/PyNaCl은 최상위에서 import하지 않음 (미설치 환경에서도 import 가능)",
+        top_level_imports == [],
+        f"({top_level_imports})",
     )
     check(
         "의존성 검사를 가진 확장은 음악뿐",
@@ -1830,36 +1831,9 @@ def test_music_core_contract():
     with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
         check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
 
-    check(
-        "MusicTrack은 불변이며 만료되는 stream URL을 담지 않음",
-        music_cog.MusicTrack.__dataclass_params__.frozen
-        and set(music_cog.MusicTrack.__dataclass_fields__)
-        == {"title", "webpage_url", "requester_id"},
-    )
-    check(
-        "MusicPlayer 상태 전이 API 보유",
-        all(
-            hasattr(music_cog.MusicPlayer, name)
-            for name in ("enqueue", "skip", "toggle_pause", "stop", "remove", "snapshot")
-        ),
-    )
-    check(
-        "길드별 player는 Cog dictionary에만 존재",
-        hasattr(music_cog.MusicCog, "get_player")
-        and hasattr(music_cog.MusicCog, "cog_unload"),
-    )
-    check(
-        "deque + asyncio.Lock + callback→loop 예약만 사용",
-        "deque()" in source
-        and "asyncio.Lock()" in source
-        and "run_coroutine_threadsafe" in source
-        and "concurrent.futures" not in source,
-    )
-    check(
-        "FFmpeg source는 reconnect option 사용",
-        "-reconnect 1" in music_cog.FFMPEG_BEFORE_OPTIONS
-        and "-reconnect_delay_max" in music_cog.FFMPEG_BEFORE_OPTIONS,
-    )
+    # 재생 엔진의 동작 계약(상태 전이, ffmpeg option, 불변 track)은
+    # test_discord_commands.py의 MusicPlayerStateTests가 실제로 실행해 검증한다.
+    # 여기서는 패키징과 import 시점 계약만 본다.
 
 
 def test_backup_round_trip():

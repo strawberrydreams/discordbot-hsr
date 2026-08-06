@@ -83,7 +83,7 @@ class MusicSnapshot:
     """패널이 렌더할 재생 상태의 정지 화면."""
 
     current: Optional[MusicTrack]
-    queue: tuple
+    queue: tuple[MusicTrack, ...]
     paused: bool
     connected: bool
 
@@ -147,6 +147,8 @@ async def extract_track(url: str, requester_id: int) -> MusicTrack:
 async def resolve_stream_url(track: MusicTrack) -> str:
     """재생 직전에 만료되지 않은 스트림 URL을 얻는다."""
     info = await asyncio.to_thread(_extract_info, track.webpage_url)
+    # 대기열에 있는 동안 영상이 생방송으로 바뀌거나 재생목록으로 대체될 수 있어
+    # 추가 시점에 이어 여기서 한 번 더 확인한다.
     _reject_unsupported(info)
     return _checked_http_url(info.get("url"), "스트림 URL", MAX_STREAM_URL_LENGTH)
 
@@ -165,6 +167,8 @@ class MusicPlayer:
         self.voice_client = None
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # lock 밖에서 도는 곡 시작 작업이 하나뿐임을 보장하는 표식.
+        self._starting = False
 
     def snapshot(self) -> MusicSnapshot:
         voice_client = self.voice_client
@@ -178,12 +182,18 @@ class MusicPlayer:
     async def enqueue(self, voice_client, track: MusicTrack) -> None:
         async with self._lock:
             self._loop = asyncio.get_running_loop()
+            if self.voice_client is not None and self.voice_client is not voice_client:
+                # 다른 채널의 연결을 말없이 버리면 ffmpeg가 계속 먹이는 유령 연결이 남는다.
+                self.queue.clear()
+                self.current = None
+                await self._disconnect()
             self.voice_client = voice_client
             self.queue.append(track)
-            if self.current is None and not (
+            idle = self.current is None and not (
                 voice_client.is_playing() or voice_client.is_paused()
-            ):
-                await self._play_next()
+            )
+        if idle:
+            await self._start_next()
 
     async def skip(self) -> Optional[MusicTrack]:
         """현재 곡을 끊는다. 다음 곡은 완료 callback이 이어서 건다."""
@@ -238,41 +248,83 @@ class MusicPlayer:
             await self._disconnect()
             return True
 
-    # ── 내부 (self._lock을 잡은 채로만 호출한다) ────────────────────────── #
+    async def forget_connection(self) -> None:
+        """밖에서 끊긴 연결의 잔재를 버린다.
 
-    async def _play_next(self) -> None:
-        # 스트림 해석(네트워크) 동안 player lock을 쥔 채로 있다. 그 사이 같은 길드의
-        # 다른 버튼은 잠깐 기다린다. 곡 시작 중복을 막는 대가로 받아들인 지연이다.
-        self.current = None
-        while self.queue:
-            track = self.queue.popleft()
-            voice_client = self.voice_client
-            if voice_client is None:
-                return
-            try:
-                stream_url = await resolve_stream_url(track)
-                source = discord.FFmpegPCMAudio(
-                    stream_url,
-                    before_options=FFMPEG_BEFORE_OPTIONS,
-                    options=FFMPEG_OPTIONS,
-                )
-                voice_client.play(source, after=self._schedule_advance)
-            except Exception:
-                logger.exception(
-                    "곡 재생을 시작하지 못했습니다: guild=%s url=%s",
-                    self.guild_id,
-                    track.webpage_url,
-                )
-                continue
-            self.current = track
+        운영자가 봇을 강제로 내보내면 disconnect할 대상이 이미 없다. 그대로 두면
+        죽은 voice client와 재생 목록이 영원히 남고 snapshot이 거짓말을 한다.
+        """
+        async with self._lock:
+            self.queue.clear()
+            self.current = None
+            self.voice_client = None
+
+    # ── 내부 ──────────────────────────────────────────────────────────── #
+
+    async def _start_next(self) -> None:
+        """대기열의 다음 곡을 건다.
+
+        스트림 해석은 15초까지 걸리는 네트워크 호출이라 lock 밖에서 한다. lock을
+        쥔 채로 기다리면 그동안 눌린 stop/skip 버튼이 Discord의 3초 응답 기한을
+        넘긴다. 중복 시작은 lock 대신 `_starting` 표식 하나로 막는다.
+        """
+        if self._starting:
             return
+        self._starting = True
+        try:
+            while True:
+                async with self._lock:
+                    voice_client = self.voice_client
+                    # 이미 소리가 나고 있으면 뒤늦게 도착한 완료 callback이다.
+                    busy = voice_client is not None and (
+                        voice_client.is_playing() or voice_client.is_paused()
+                    )
+                    if not busy:
+                        self.current = None
+                    track = (
+                        self.queue.popleft()
+                        if not busy and self.queue and voice_client is not None
+                        else None
+                    )
+                    if track is None:
+                        # 걸 곡이 없다는 판단은 lock 안에서 확정한다. 표식을 여기서
+                        # 내려야 방금 enqueue된 곡이 시작되지 못한 채 남지 않는다.
+                        self._starting = False
+                        return
+
+                source = None
+                try:
+                    source = discord.FFmpegPCMAudio(
+                        await resolve_stream_url(track),
+                        before_options=FFMPEG_BEFORE_OPTIONS,
+                        options=FFMPEG_OPTIONS,
+                    )
+                    async with self._lock:
+                        if self.voice_client is not voice_client:
+                            raise RuntimeError("재생 준비 중 voice 연결이 바뀌었습니다.")
+                        voice_client.play(source, after=self._schedule_advance)
+                        self.current = track
+                    return
+                except Exception:
+                    # FFmpegPCMAudio는 생성 시점에 프로세스를 띄운다. play()가 실패하면
+                    # discord.py가 거둬 갈 기회가 없어 고아 ffmpeg가 남는다.
+                    if source is not None:
+                        source.cleanup()
+                    logger.exception(
+                        "곡 재생을 시작하지 못했습니다: guild=%s url=%s",
+                        self.guild_id,
+                        track.webpage_url,
+                    )
+        finally:
+            self._starting = False
 
     async def _disconnect(self) -> None:
         voice_client, self.voice_client = self.voice_client, None
         if voice_client is None:
             return
         try:
-            await voice_client.disconnect(force=True)
+            # 게이트웨이가 멎으면 disconnect가 영영 안 돌아온다. 종료 경로가 매달리면 안 된다.
+            await asyncio.wait_for(voice_client.disconnect(force=True), timeout=10)
         except Exception:
             logger.exception("voice 연결 해제에 실패했습니다: guild=%s", self.guild_id)
 
@@ -289,9 +341,11 @@ class MusicPlayer:
 
     async def _advance(self) -> None:
         try:
-            async with self._lock:
-                if self.voice_client is not None:
-                    await self._play_next()
+            await self._start_next()
+            if self.current is None:
+                # 대기열이 말랐다. 남은 사람이 없으면 여기서 나간다. voice event가
+                # 오지 않는 경우(게이트웨이 공백 등)에도 혼자 남지 않게 하는 유일한 보루다.
+                await self.disconnect_if_alone()
         except Exception:
             logger.exception("다음 곡으로 넘어가지 못했습니다: guild=%s", self.guild_id)
 
@@ -309,19 +363,30 @@ class MusicCog(commands.Cog):
         return player
 
     async def cog_unload(self):
-        for player in list(self.players.values()):
-            await player.stop()
+        players = list(self.players.values())
         self.players.clear()
+        await asyncio.gather(*(player.stop() for player in players))
+
+    def _is_self(self, member) -> bool:
+        bot_user = getattr(self.bot, "user", None)
+        return bot_user is not None and getattr(member, "id", None) == bot_user.id
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        channel = getattr(before, "channel", None)
-        if channel is None or channel is getattr(after, "channel", None):
+        before_channel = getattr(before, "channel", None)
+        after_channel = getattr(after, "channel", None)
+        if before_channel is None or before_channel is after_channel:
             return
         guild = getattr(member, "guild", None)
         player = self.players.get(guild.id) if guild is not None else None
-        if player is not None:
-            await player.disconnect_if_alone()
+        if player is None:
+            return
+        if self._is_self(member):
+            # 채널 이동은 voice client가 알아서 따라간다. 완전히 쫓겨난 경우만 정리한다.
+            if after_channel is None:
+                await player.forget_connection()
+            return
+        await player.disconnect_if_alone()
 
 
 async def setup(bot: commands.Bot):

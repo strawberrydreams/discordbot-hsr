@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import gc
 import hashlib
 import json
@@ -295,10 +296,16 @@ class MusicExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(track.webpage_url, "https://example.com/watch?v=abc")
         self.assertEqual(track.requester_id, 99)
 
-    async def test_non_http_canonical_url_is_rejected(self):
-        self._patch_ytdl({"title": "노래", "webpage_url": "file:///tmp/song.mp3"})
-        with self.assertRaises(ValueError):
-            await extract_track("https://example.com/1", requester_id=7)
+    async def test_unusable_canonical_url_is_rejected(self):
+        for webpage_url in (
+            "file:///tmp/song.mp3",
+            12,
+            "https://example.com/" + "a" * music_cog.MAX_URL_LENGTH,
+        ):
+            with self.subTest(webpage_url=webpage_url):
+                self._patch_ytdl({"title": "노래", "webpage_url": webpage_url})
+                with self.assertRaises(ValueError):
+                    await extract_track("https://example.com/1", requester_id=7)
 
     def test_track_is_immutable_and_stores_no_stream_url(self):
         track = MusicTrack("노래", "https://example.com/1", 7)
@@ -306,7 +313,7 @@ class MusicExtractionTests(unittest.IsolatedAsyncioTestCase):
             set(MusicTrack.__dataclass_fields__),
             {"title", "webpage_url", "requester_id"},
         )
-        with self.assertRaises(Exception):
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             track.title = "다른 노래"
 
     async def test_stream_url_is_resolved_again_off_the_event_loop(self):
@@ -333,9 +340,14 @@ class MusicExtractionTests(unittest.IsolatedAsyncioTestCase):
                     await resolve_stream_url(MusicTrack("노래", "https://e.com/1", 7))
 
 
+BOT_USER_ID = 999
+
+
 class _FakeVoiceMember:
-    def __init__(self, bot=False):
+    def __init__(self, bot=False, user_id=1, guild_id=TEST_GUILD_ID):
         self.bot = bot
+        self.id = user_id
+        self.guild = SimpleNamespace(id=guild_id)
 
 
 class _FakeVoiceChannel:
@@ -343,11 +355,24 @@ class _FakeVoiceChannel:
         self.members = list(members)
 
 
-class _FakeVoiceClient:
-    """discord.VoiceClient 대역. stop()이 after callback을 부르는 것까지 흉내낸다."""
-
+class _FakeVoiceState:
     def __init__(self, channel=None):
         self.channel = channel
+
+
+class _FakeVoiceClient:
+    """discord.VoiceClient 대역.
+
+    실제 VoiceClient의 두 가지 성질을 그대로 흉내낸다.
+    - `stop()`과 `disconnect()`가 after callback을 부른다(`disconnect()`는 내부에서
+      `stop()`을 부른다). MusicPlayer.stop()이 별도 `stop()` 호출 없이도 유령 재생을
+      남기지 않는지는 이 성질에 기대고 있다.
+    - `play()`는 이미 재생 중이거나 연결이 없으면 `ClientException`을 던진다.
+    """
+
+    def __init__(self, channel=None, play_error=None):
+        self.channel = channel
+        self.play_error = play_error
         self.sources = []
         self.after = None
         self.disconnects = 0
@@ -355,6 +380,10 @@ class _FakeVoiceClient:
         self._paused = False
 
     def play(self, source, *, after=None):
+        if self.play_error is not None:
+            raise self.play_error
+        if self._playing:
+            raise discord.ClientException("Already playing audio.")
         self.sources.append(source)
         self.after = after
         self._playing = True
@@ -381,28 +410,45 @@ class _FakeVoiceClient:
 
     async def disconnect(self, *, force=False):
         self.disconnects += 1
-        self._playing = False
-        self._paused = False
+        self.stop()
 
 
-def _fake_source(url, **options):
-    return SimpleNamespace(
-        url=url, options=options, thread=threading.current_thread()
-    )
+class _FakeSource:
+    def __init__(self, url, **options):
+        self.url = url
+        self.options = options
+        self.thread = threading.current_thread()
+        self.cleaned = False
+
+    def cleanup(self):
+        self.cleaned = True
 
 
 def _music_track(number):
     return MusicTrack(f"곡{number}", f"https://example.com/{number}", 100 + number)
 
 
-class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
+class _PatchedPlaybackTests(unittest.IsolatedAsyncioTestCase):
+    """스트림 해석과 ffmpeg source를 대역으로 바꾼 공통 바탕."""
+
     async def asyncSetUp(self):
+        self.sources = []          # play() 성공 여부와 무관하게 생성된 모든 source
+        self.resolve_errors = {}   # 곡 제목 → 해석 시 던질 예외
+
         async def fake_resolve(track):
+            error = self.resolve_errors.get(track.title)
+            if error is not None:
+                raise error
             return f"https://cdn.example.com/{track.title}"
+
+        def fake_source(url, **options):
+            source = _FakeSource(url, **options)
+            self.sources.append(source)
+            return source
 
         for patcher in (
             patch.object(music_cog, "resolve_stream_url", fake_resolve),
-            patch("discord.FFmpegPCMAudio", _fake_source),
+            patch("discord.FFmpegPCMAudio", fake_source),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -416,6 +462,12 @@ class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         return True
 
+    async def _settle(self):
+        """thread→loop로 예약된 뒷정리 task가 다 돌도록 잠시 양보한다."""
+        await asyncio.sleep(0.05)
+
+
+class MusicPlayerStateTests(_PatchedPlaybackTests):
     async def test_first_enqueue_starts_playback_exactly_once(self):
         player = MusicPlayer(TEST_GUILD_ID)
         voice = _FakeVoiceClient()
@@ -506,11 +558,15 @@ class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
         await player.enqueue(voice, _music_track(2))
 
         await player.stop()
+        # 실제 disconnect()는 내부에서 stop()을 불러 after callback을 깨운다.
+        # 그 뒤늦은 _advance가 유령 재생을 만들지 않아야 한다.
+        await self._settle()
         snapshot = player.snapshot()
         self.assertIsNone(snapshot.current)
         self.assertEqual(snapshot.queue, ())
         self.assertFalse(snapshot.connected)
         self.assertEqual(voice.disconnects, 1)
+        self.assertEqual(len(voice.sources), 1)
         self.assertIsNone(player.voice_client)
 
     async def test_remove_uses_one_based_queue_numbers(self):
@@ -545,11 +601,13 @@ class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
 
         channel.members.remove(listener)
         self.assertTrue(await player.disconnect_if_alone())
+        await self._settle()
         snapshot = player.snapshot()
         self.assertIsNone(snapshot.current)
         self.assertEqual(snapshot.queue, ())
         self.assertFalse(snapshot.connected)
         self.assertEqual(voice.disconnects, 1)
+        self.assertEqual(len(voice.sources), 1)
 
     async def test_players_are_per_guild_and_all_stop_on_unload(self):
         cog = MusicCog(bot=None)
@@ -565,9 +623,193 @@ class MusicPlayerStateTests(unittest.IsolatedAsyncioTestCase):
             await player.enqueue(voice, _music_track(1))
 
         await cog.cog_unload()
+        await self._settle()
         self.assertEqual(cog.players, {})
         self.assertTrue(all(voice.disconnects == 1 for voice in voices))
         self.assertTrue(all(player.current is None for player in (first, second)))
+
+    async def test_controls_are_not_blocked_by_a_slow_resolution(self):
+        """해석은 lock 밖에서 돈다. 그렇지 않으면 Task 6 버튼이 3초 안에 응답하지 못한다."""
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        gate = asyncio.Event()
+        resolving = asyncio.Event()
+
+        async def slow_resolve(track):
+            resolving.set()
+            await gate.wait()
+            return f"https://cdn.example.com/{track.title}"
+
+        with patch.object(music_cog, "resolve_stream_url", slow_resolve), \
+             self.assertLogs(music_cog.logger, level="ERROR"):
+            enqueueing = asyncio.create_task(player.enqueue(voice, _music_track(1)))
+            await asyncio.wait_for(resolving.wait(), timeout=1)
+            # 해석이 아직 진행 중인데도 제어는 즉시 돌아와야 한다.
+            await asyncio.wait_for(player.stop(), timeout=1)
+            gate.set()
+            await asyncio.wait_for(enqueueing, timeout=1)
+
+        self.assertEqual(voice.sources, [])  # 끊긴 뒤에는 재생하지 않는다
+        self.assertIsNone(player.current)
+        self.assertEqual(voice.disconnects, 1)
+        self.assertTrue(all(source.cleaned for source in self.sources))
+
+    async def test_dead_link_is_skipped_and_the_queue_keeps_playing(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        playing, dead, alive = _music_track(1), _music_track(2), _music_track(3)
+        self.resolve_errors[dead.title] = ValueError("사라진 영상입니다.")
+        for track in (playing, dead, alive):
+            await player.enqueue(voice, track)
+
+        with self.assertLogs(music_cog.logger, level="ERROR"):
+            voice.stop()  # 첫 곡 종료 → 죽은 링크를 건너뛰고 다음 곡으로
+            self.assertTrue(await self._wait_until(lambda: player.current == alive))
+        self.assertEqual([source.url for source in voice.sources][-1],
+                         "https://cdn.example.com/곡3")
+        self.assertEqual(len(voice.sources), 2)
+        self.assertEqual(player.snapshot().queue, ())
+
+    async def test_only_dead_links_leave_the_player_idle(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient()
+        dead = _music_track(1)
+        self.resolve_errors[dead.title] = ValueError("사라진 영상입니다.")
+
+        with self.assertLogs(music_cog.logger, level="ERROR"):
+            await player.enqueue(voice, dead)
+
+        self.assertIsNone(player.current)
+        self.assertEqual(voice.sources, [])
+        self.assertEqual(player.snapshot().queue, ())
+
+    async def test_failed_play_reaps_the_ffmpeg_process(self):
+        # 해석 도중 연결이 끊기면 play()가 던진다. 이때 이미 떠 있는 ffmpeg를
+        # 거둬 가지 않으면 대기열 길이만큼 고아 프로세스가 남는다.
+        player = MusicPlayer(TEST_GUILD_ID)
+        voice = _FakeVoiceClient(
+            play_error=discord.ClientException("Not connected to voice.")
+        )
+        with self.assertLogs(music_cog.logger, level="ERROR"):
+            await player.enqueue(voice, _music_track(1))
+            await player.enqueue(voice, _music_track(2))
+
+        self.assertEqual(len(self.sources), 2)
+        self.assertTrue(all(source.cleaned for source in self.sources))
+        self.assertEqual(voice.sources, [])
+        self.assertIsNone(player.current)
+
+    async def test_enqueue_disconnects_a_voice_client_it_replaces(self):
+        player = MusicPlayer(TEST_GUILD_ID)
+        old, new = _FakeVoiceClient(), _FakeVoiceClient()
+        await player.enqueue(old, _music_track(1))
+        await player.enqueue(new, _music_track(2))
+        await self._settle()
+
+        self.assertEqual(old.disconnects, 1)
+        self.assertIs(player.voice_client, new)
+        self.assertEqual(len(new.sources), 1)
+        self.assertEqual(player.current, _music_track(2))
+
+
+class MusicVoiceEventTests(_PatchedPlaybackTests):
+    """on_voice_state_update — Task 5에서 봇이 실제로 실행하는 유일한 경로."""
+
+    def _cog(self):
+        return MusicCog(bot=SimpleNamespace(user=SimpleNamespace(id=BOT_USER_ID)))
+
+    async def _connected(self, cog, channel):
+        player = cog.get_player(TEST_GUILD_ID)
+        voice = _FakeVoiceClient(channel)
+        await player.enqueue(voice, _music_track(1))
+        await player.enqueue(voice, _music_track(2))
+        return player, voice
+
+    async def test_last_human_leaving_disconnects_the_player(self):
+        cog = self._cog()
+        listener = _FakeVoiceMember(user_id=1)
+        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
+        channel = _FakeVoiceChannel([bot_member, listener])
+        player, voice = await self._connected(cog, channel)
+
+        channel.members.remove(listener)
+        await cog.on_voice_state_update(
+            listener, _FakeVoiceState(channel), _FakeVoiceState(None)
+        )
+        await self._settle()
+        self.assertEqual(voice.disconnects, 1)
+        self.assertFalse(player.snapshot().connected)
+        self.assertEqual(player.snapshot().queue, ())
+
+    async def test_a_human_leaving_a_still_occupied_channel_changes_nothing(self):
+        cog = self._cog()
+        staying = _FakeVoiceMember(user_id=2)
+        leaving = _FakeVoiceMember(user_id=1)
+        channel = _FakeVoiceChannel(
+            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), staying, leaving]
+        )
+        player, voice = await self._connected(cog, channel)
+
+        channel.members.remove(leaving)
+        await cog.on_voice_state_update(
+            leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
+        )
+        self.assertEqual(voice.disconnects, 0)
+        self.assertTrue(player.snapshot().connected)
+
+    async def test_mute_toggles_do_not_touch_the_player(self):
+        cog = self._cog()
+        channel = _FakeVoiceChannel([_FakeVoiceMember(bot=True, user_id=BOT_USER_ID)])
+        player, voice = await self._connected(cog, channel)
+
+        member = _FakeVoiceMember(user_id=1)
+        # 같은 채널 안에서의 상태 변화(음소거 등)는 채널이 비어 있어도 무시한다.
+        await cog.on_voice_state_update(
+            member, _FakeVoiceState(channel), _FakeVoiceState(channel)
+        )
+        self.assertEqual(voice.disconnects, 0)
+        self.assertTrue(player.snapshot().connected)
+
+    async def test_forced_disconnect_of_the_bot_clears_stale_state(self):
+        cog = self._cog()
+        channel = _FakeVoiceChannel(
+            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
+        )
+        player, voice = await self._connected(cog, channel)
+
+        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
+        await cog.on_voice_state_update(
+            bot_member, _FakeVoiceState(channel), _FakeVoiceState(None)
+        )
+        snapshot = player.snapshot()
+        self.assertFalse(snapshot.connected)  # connected=True는 패널이 렌더할 거짓말이다
+        self.assertIsNone(snapshot.current)
+        self.assertEqual(snapshot.queue, ())
+        self.assertIsNone(player.voice_client)
+        self.assertEqual(voice.disconnects, 0)  # 이미 끊긴 연결을 다시 끊지 않는다
+
+    async def test_moving_the_bot_to_another_channel_keeps_playing(self):
+        cog = self._cog()
+        channel = _FakeVoiceChannel(
+            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
+        )
+        player, voice = await self._connected(cog, channel)
+
+        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
+        await cog.on_voice_state_update(
+            bot_member, _FakeVoiceState(channel), _FakeVoiceState(_FakeVoiceChannel())
+        )
+        self.assertTrue(player.snapshot().connected)
+        self.assertEqual(player.current, _music_track(1))
+        self.assertEqual(voice.disconnects, 0)
+
+    async def test_voice_events_from_guilds_without_a_player_are_ignored(self):
+        cog = self._cog()
+        member = _FakeVoiceMember(user_id=1, guild_id=TEST_GUILD_ID + 1)
+        await cog.on_voice_state_update(
+            member, _FakeVoiceState(_FakeVoiceChannel()), _FakeVoiceState(None)
+        )
+        self.assertEqual(cog.players, {})
 
 
 class RecordingResponse:
