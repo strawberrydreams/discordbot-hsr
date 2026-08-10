@@ -10,6 +10,12 @@
 
 채널 지정은 환경변수가 아니라 서버별 설정입니다. 각 서버 관리자가 `/설정 시작`으로 봇 채널을 만들거나 `/설정 파티채널`, `/설정 음악채널`, `/설정 공지허용`으로 값을 `guild_settings.db`에 저장하고 `/설정 확인`으로 볼 수 있습니다. 파티 모집은 파티 채널의 게임별 영속 패널 버튼으로 시작·참가·역할 변경·나가기를 처리합니다. `settings/games.json`을 바꾸면 새 게임 구성과 패널을 반영하도록 봇을 재시작해야 합니다. `/이벤트`는 어느 서버 채널에서나 사용할 수 있습니다.
 
+`/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다. 음악 패널을 쓰려면 해당 음성 채널에서 봇에게 `Connect`, `Speak` 권한도 부여하세요. 음악의 `추가`는 같은 음성 채널에 있는 사용자의 개별 HTTP(S) URL만 받습니다. 요청자 또는 서버 관리자는 건너뛰기·자기 대기열 항목 제거를 할 수 있고, 일시정지·정지는 서버 관리자만 할 수 있습니다. `PyNaCl` 또는 `yt-dlp`가 없으면 음악만 비활성이고 나머지 봇은 동작합니다. 외부 사이트 변경으로 yt-dlp가 실패할 수 있으므로 직접 실행은 `.venv/bin/python -m pip install --upgrade yt-dlp` 후 재시작하고, Docker는 `docker compose build --no-cache bot && docker compose up -d --no-deps bot`으로 이미지를 다시 만드세요. 저작권·서비스 약관 준수와 지원되지 않는 콘텐츠의 책임은 운영자에게 있습니다.
+
+`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 고정된 `127.0.0.1:8080`에서 시작하며, Compose는 web port를 publish하지 않습니다. launchd로 실행할 때도 loopback에서만 접근할 수 있습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
+
+웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 party channel에만 보냅니다.
+
 서버 간 데이터는 섞이지 않습니다. 포인트·출석·금지어 카운트·파티·설정은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 잔액은 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
 
 봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 포인트·원장·파티·설정을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
@@ -136,7 +142,7 @@ LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 �
 
 ### Docker Desktop
 
-Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`와 `runtime/backups/`를 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. 공개 포트는 없습니다.
+Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`와 `runtime/backups/`를 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. `bot`의 `settings` mount는 웹 관리의 원자 교체를 위해 read/write이고 `backup`의 `settings` mount는 read-only입니다. web port를 포함해 공개 포트는 없습니다.
 
 Docker Desktop을 로그인 시 시작하도록 설정한 뒤 최초 실행:
 
@@ -161,7 +167,7 @@ Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 .venv/bin/python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
 
 DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도** `-shm`/`-wal` 파일을 만들 수 있어야 하므로, Docker `backup` 서비스의 `./runtime/data` 마운트는 `:ro`가 아니라 쓰기 가능해야 합니다. `:ro`로 되돌리면 봇이 정지한 상태(= `-shm` 부재)에서만 백업이 `attempt to write a readonly database`로 실패하고, `module.backup loop`이 예외를 삼켜 조용히 재시도만 반복합니다. 백업 코드는 SQLite 온라인 백업 API로 읽기만 하므로 rw 마운트가 데이터를 바꾸지는 않습니다.
 
@@ -171,7 +177,7 @@ DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도**
 
 ## 검증된 백업으로 실제 복구
 
-복구는 자동화하지 않습니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 직접 선택한 뒤 **블록 전체를 한 번에** 실행하고, `cp -i`가 묻는 각 DB 덮어쓰기를 승인합니다. 과거 attendance v0/v1 백업도 먼저 manifest·크기·체크섬·기본 테이블을 검증한 뒤 restore stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 덮어쓰기를 거부해 파일이 선택한 백업과 다르면 봇을 시작하지 않습니다.
+복구는 자동화하지 않습니다. 서비스 중지 → manifest 검증과 내장 stage restore → DB 교체 → 존재한 설정 파일별 확인 교체 → 파일 권한 확인 → 서비스 시작 → health/log 확인 순서로 진행합니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 선택하고, 덮어쓰기 전 비상 사본을 보관하세요. `stage_restore`가 manifest의 크기·체크섬·DB 무결성을 검증하고 stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 복사를 거부했다면 서비스를 시작하지 마세요.
 
 ```bash
 (
@@ -213,43 +219,10 @@ esac
 test -f "$MANIFEST"
 RESTORE_STAGE=$(mktemp -d runtime/restore-stage.XXXXXX)
 .venv/bin/python - "$MANIFEST" "$RESTORE_STAGE" <<'PY'
-import json
 import sys
 from pathlib import Path
-
-from module.backup import DATABASES, stage_restore
-
-manifest_path = Path(sys.argv[1])
-stage = Path(sys.argv[2])
-document = json.loads(manifest_path.read_text(encoding="utf-8"))
-items = document.get("databases")
-expected = set(DATABASES)
-entries = {}
-backup_names = set()
-
-if not isinstance(items, list):
-    raise RuntimeError("manifest databases가 목록이 아닙니다.")
-for item in items:
-    if not isinstance(item, dict):
-        raise RuntimeError("잘못된 manifest DB 항목입니다.")
-    source = item.get("source")
-    backup = item.get("backup")
-    if (
-        not isinstance(source, str)
-        or source not in expected
-        or source in entries
-        or not isinstance(backup, str)
-        or not backup
-        or Path(backup).name != backup
-        or backup in backup_names
-    ):
-        raise RuntimeError("안전하지 않거나 중복된 manifest DB 항목입니다.")
-    entries[source] = backup
-    backup_names.add(backup)
-if set(entries) != expected:
-    raise RuntimeError("manifest에 운영 DB가 정확히 한 번씩 있어야 합니다.")
-
-stage_restore(manifest_path, stage)
+from module.backup import stage_restore
+stage_restore(Path(sys.argv[1]), Path(sys.argv[2]))
 PY
 
 EMERGENCY_DIR=$(mktemp -d "runtime/emergency.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
@@ -266,15 +239,15 @@ for staged in "$RESTORE_STAGE"/*.db; do
   cmp -s "$staged" "runtime/data/$name"
 done
 
-if test -d "$RESTORE_STAGE/settings"; then
-  for staged in "$RESTORE_STAGE"/settings/*.json; do
-    name=${staged##*/}
-    cp -ip "$staged" "settings/$name"
-    cmp -s "$staged" "settings/$name"
-  done
-fi
-
-.venv/bin/python -c 'from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; [print(name, verify_database(DATA_DIR / name, tables, source_name=name)) for name, tables in DATABASES.items()]'
+for name in persona.json forbidden_words.json games.json; do
+  staged="$RESTORE_STAGE/settings/$name"
+  test -f "$staged" || continue
+  cp -ip "$staged" "settings/$name"
+  cmp -s "$staged" "settings/$name"
+  chmod 600 "settings/$name"
+  mode=$(stat -f '%Lp' "settings/$name" 2>/dev/null || stat -c '%a' "settings/$name")
+  test "$mode" = 600
+done
 
 case "$DEPLOYMENT" in
   launchd)
@@ -289,7 +262,7 @@ esac
 )
 ```
 
-로그에 startup 오류가 없는지 확인하고 Discord에서 `/지갑`, `/랭킹`, `/프로필`과 파티 채널의 게임별 패널을 읽어 포인트·순위·파티·금지어 경고 횟수를 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
+Docker는 `docker inspect --format '{{.State.Health.Status}}' discordbot-hsr-bot-1`과 `docker compose logs --tail=100 bot`으로, launchd는 `launchctl print gui/$(id -u)/com.discordbot.hsr`와 bot log로 health를 확인하세요. 이어 Discord에서 `/지갑`, `/랭킹`, `/프로필`과 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
 
 ## 배포
 

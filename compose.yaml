@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     volumes:
+      # 웹 관리는 container loopback에만 bind하며 ports를 publish하지 않는다.
       - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups

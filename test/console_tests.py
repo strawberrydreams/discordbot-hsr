@@ -360,19 +360,105 @@ def test_readme_public_distribution_contract():
 def test_operations_document_contract():
     operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
     restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
-    check("복구 DB 목록은 코드에서 가져옴", "expected = set(DATABASES)" in restore)
+    check(
+        "복구는 내장 stage restore를 사용",
+        "stage_restore(Path(sys.argv[1]), Path(sys.argv[2]))" in restore,
+    )
     check("복구가 stage의 모든 DB를 순회", 'for staged in "$RESTORE_STAGE"/*.db' in restore)
     check(
-        "복구가 stage의 설정 파일을 설치",
-        'if test -d "$RESTORE_STAGE/settings"; then' in restore
-        and 'for staged in "$RESTORE_STAGE"/settings/*.json; do' in restore,
+        "복구가 존재한 설정 파일별 확인 교체",
+        "for name in persona.json forbidden_words.json games.json; do" in restore
+        and 'test -f "$staged" || continue' in restore
+        and 'cmp -s "$staged" "settings/$name"' in restore,
     )
+    check("복구 문서에 긴 DB 수리 one-liner 없음", "verify_database" not in restore)
     check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
     check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
     check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
     check("AI 한도는 KST 자정 리셋", "매일 KST 자정에 리셋" in operations)
     check("AI 한도는 포인트와 별도", "포인트와 별도로 적용" in operations)
     check("provider 계정 예산 안전망 유지", "OpenAI 계정 예산 한도" in operations)
+
+
+def test_final_installation_and_operations_contract():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    public_docs = f"{readme}\n{operations}"
+    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    check(
+        "설치 문서는 세 설정 JSON 초기 복사를 안내",
+        all(
+            f"settings/{name}.json" in readme
+            and f"settings/{name}.example.json" in readme
+            for name in ("persona", "forbidden_words", "games")
+        ),
+    )
+    check(
+        "문서는 현재 설정과 영속 panel 명령만 안내",
+        all(
+            term in public_docs
+            for term in ("/설정 시작", "/설정 파티채널", "/설정 음악채널", "/설정 공지허용")
+        ),
+    )
+    check(
+        "문서는 channel과 voice 권한을 안내",
+        all(term in public_docs for term in ("`Manage Channels`", "`Connect`", "`Speak`")),
+    )
+    check(
+        "웹 관리는 선택 토큰과 고정 loopback 경계를 문서화",
+        all(term in public_docs for term in ("`ADMIN_TOKEN`", "`127.0.0.1:8080`", "host-scoped")),
+    )
+    check(
+        "음악 선택 의존성과 yt-dlp 갱신 절차를 문서화",
+        "나머지 봇은 동작" in public_docs
+        and "pip install --upgrade yt-dlp" in public_docs,
+    )
+    check(
+        "MIT와 무기여 정책을 유지",
+        "MIT License" in readme and "사용자 기여를 받지 않습니다" in readme,
+    )
+    check(
+        "사용자 문서에 폐기된 파티 명령·설정 열 없음",
+        all(
+            term not in public_docs
+            for term in (
+                "/모집",
+                "/파티",
+                "/나가기",
+                "/변경",
+                "recruit_channel_id",
+                "event_channel_id",
+            )
+        ),
+    )
+    check(
+        "백업 문서는 세 DB와 존재한 세 설정 파일을 같은 set으로 설명",
+        all(
+            term in operations
+            for term in (
+                "attendance_data.db",
+                "party_data.db",
+                "guild_settings.db",
+                "settings/persona.json",
+                "settings/forbidden_words.json",
+                "settings/games.json",
+            )
+        ),
+    )
+    check(
+        "Compose bot 설정은 rw, backup 설정은 ro, web port는 없음",
+        "- ./settings:/app/settings\n" in compose
+        and "- ./settings:/app/settings:ro" in compose
+        and "ports:" not in compose,
+    )
+    check(
+        "Docker runtime은 ffmpeg와 main process healthcheck를 가진다",
+        "ffmpeg" in dockerfile
+        and "HEALTHCHECK" in dockerfile
+        and "b'module.main'" in dockerfile,
+    )
 
 
 def test_deployment_contracts():
@@ -2983,6 +3069,7 @@ if __name__ == "__main__":
         test_forbidden_word_document_path()
         test_readme_public_distribution_contract()
         test_operations_document_contract()
+        test_final_installation_and_operations_contract()
         test_deployment_contracts()
         test_macos_templates_render_portably()
         test_deployment_contracts_skip_only_compose_when_cli_missing()
