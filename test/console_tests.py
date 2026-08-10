@@ -2440,6 +2440,43 @@ def test_settings_backup_round_trip():
         )
 
 
+def test_setting_source_inspection_failure_closes_descriptor():
+    import module.backup as backup
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        source = root / "persona.json"
+        source.write_text("{}", encoding="utf-8")
+        opened = []
+        real_open = backup.os.open
+
+        def recording_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        with patch.object(backup.os, "open", side_effect=recording_open), patch.object(
+            backup.os, "fstat", side_effect=OSError("inspection failed")
+        ):
+            try:
+                backup._copy_setting(source, root / "copy.json")
+                failure = None
+            except RuntimeError as exc:
+                failure = exc
+
+        try:
+            os.fstat(opened[0])
+            closed = False
+        except OSError:
+            closed = True
+
+    check(
+        "설정 source 검사 실패를 RuntimeError로 연결",
+        failure is not None and isinstance(failure.__cause__, OSError),
+    )
+    check("설정 source 검사 실패 시 descriptor 종료", closed)
+
+
 def test_legacy_backup_restore_and_prune():
     import module.backup as backup
 
@@ -3286,6 +3323,7 @@ if __name__ == "__main__":
         test_music_core_contract()
         test_backup_round_trip()
         test_settings_backup_round_trip()
+        test_setting_source_inspection_failure_closes_descriptor()
         test_legacy_backup_restore_and_prune()
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()

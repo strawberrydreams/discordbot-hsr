@@ -1308,11 +1308,20 @@ class MusicPanelTests(_PatchedPlaybackTests):
             voice = _FakeVoiceClient(channel)
             await player.enqueue(voice, _music_track(1))
             channel.members.remove(leaving)
+            advance_finished = asyncio.Event()
+            original_advance = player._advance
 
-            await cog.on_voice_state_update(
-                leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
-            )
-            await self._settle()
+            async def observed_advance():
+                try:
+                    await original_advance()
+                finally:
+                    advance_finished.set()
+
+            with patch.object(player, "_advance", side_effect=observed_advance):
+                await cog.on_voice_state_update(
+                    leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
+                )
+                await asyncio.wait_for(advance_finished.wait(), timeout=1)
             panel_message_id = settings.get_music_panel_msg(guild.id)
             self.assertIsNotNone(panel_message_id)
             message = guild.channel.messages[panel_message_id]
