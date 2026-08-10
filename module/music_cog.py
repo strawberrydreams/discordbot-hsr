@@ -97,6 +97,7 @@ class MusicSnapshot:
     connected: bool
     resolving: Optional[MusicTrack] = None
     starting: bool = False
+    error: Optional[str] = None
 
 
 def _checked_http_url(value: object, label: str, limit: int = MAX_URL_LENGTH) -> str:
@@ -184,6 +185,7 @@ class MusicPlayer:
         self.queue: deque = deque()
         self.current: Optional[MusicTrack] = None
         self.resolving: Optional[MusicTrack] = None
+        self.last_error: Optional[str] = None
         self.voice_client = None
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -201,6 +203,7 @@ class MusicPlayer:
             connected=voice_client is not None,
             resolving=self.resolving,
             starting=self._starting,
+            error=self.last_error,
         )
 
     async def enqueue(self, voice_client, track: MusicTrack) -> None:
@@ -228,8 +231,8 @@ class MusicPlayer:
                 voice_client.is_playing() or voice_client.is_paused()
             )
 
-    async def start_if_idle(self) -> None:
-        await self._start_next()
+    async def start_if_idle(self) -> Optional[str]:
+        return await self._start_next()
 
     async def skip(self) -> Optional[MusicTrack]:
         """현재 곡을 끊는다. 다음 곡은 완료 callback이 이어서 건다."""
@@ -264,6 +267,7 @@ class MusicPlayer:
             self.queue.clear()
             self.current = None
             self.resolving = None
+            self.last_error = None
 
     async def remove(self, position: int) -> Optional[MusicTrack]:
         """대기열에서 한 곡을 뺀다. position은 UI에 보이는 1-based 번호다."""
@@ -276,10 +280,11 @@ class MusicPlayer:
             del self.queue[position - 1]
             return track
 
-    async def disconnect_if_alone(self) -> bool:
+    async def disconnect_if_alone(self, channel=None) -> bool:
         """사람이 아무도 없는 채널에 남아 있으면 idle로 정리하고 나간다."""
         async with self._lock:
-            channel = getattr(self.voice_client, "channel", None)
+            if channel is None:
+                channel = getattr(self.voice_client, "channel", None)
             if channel is None:
                 return False
             if any(not member.bot for member in getattr(channel, "members", ())):
@@ -288,6 +293,7 @@ class MusicPlayer:
             self.queue.clear()
             self.current = None
             self.resolving = None
+            self.last_error = None
             return True
 
     async def forget_connection(self) -> None:
@@ -300,11 +306,12 @@ class MusicPlayer:
             self.queue.clear()
             self.current = None
             self.resolving = None
+            self.last_error = None
             self.voice_client = None
 
     # ── 내부 ──────────────────────────────────────────────────────────── #
 
-    async def _start_next(self) -> None:
+    async def _start_next(self) -> Optional[str]:
         """대기열의 다음 곡을 건다.
 
         스트림 해석은 15초까지 걸리는 네트워크 호출이라 lock 밖에서 한다. lock을
@@ -334,6 +341,7 @@ class MusicPlayer:
                     else:
                         track = self.queue.popleft()
                         self.resolving = track
+                        self.last_error = None
                 await self._notify()
                 if track is None:
                     return
@@ -375,6 +383,7 @@ class MusicPlayer:
                             self.queue.appendleft(track)
                             self.resolving = None
                             self._starting = False
+                            self.last_error = "재생 오류 — 음성 재생을 시작하지 못했습니다."
                             source.cleanup()
                             logger.exception(
                                 "voice 재생 시작에 실패했습니다: guild=%s", self.guild_id
@@ -388,7 +397,7 @@ class MusicPlayer:
             if cancelled:
                 source.cleanup()
                 continue
-            return
+            return self.last_error
 
     async def _disconnect(self) -> None:
         voice_client = self.voice_client
@@ -439,7 +448,10 @@ def _bounded(value: str, limit: int = 1024) -> str:
 
 def music_panel(snapshot: MusicSnapshot) -> discord.Embed:
     embed = discord.Embed(title="🎵 음악", color=discord.Color.blurple())
-    if snapshot.resolving is not None:
+    if snapshot.error is not None:
+        state = f"❌ {snapshot.error}"
+        track = None
+    elif snapshot.resolving is not None:
         state = "⏳ 재생 준비 중"
         track = snapshot.resolving
     elif snapshot.current is not None:
@@ -498,13 +510,14 @@ class MusicURLModal(discord.ui.Modal, title="음악 URL 추가"):
 class MusicRemoveSelect(discord.ui.Select):
     def __init__(self, cog: "MusicCog", tracks: tuple[MusicTrack, ...]):
         self.cog = cog
+        self.tracks = tracks[:MAX_REMOVE_OPTIONS]
         options = [
             discord.SelectOption(
                 label=_bounded(track.title, MAX_TITLE_LENGTH),
                 description=f"요청자: {track.requester_id}",
                 value=str(position),
             )
-            for position, track in enumerate(tracks[:MAX_REMOVE_OPTIONS], 1)
+            for position, track in enumerate(self.tracks, 1)
         ]
         super().__init__(
             placeholder="대기열에서 제거할 곡을 선택하세요",
@@ -515,7 +528,10 @@ class MusicRemoveSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self.cog.remove_selected(interaction, int(self.values[0]))
+        position = int(self.values[0])
+        await self.cog.remove_selected(
+            interaction, position, self.tracks[position - 1]
+        )
 
 
 class MusicRemoveView(discord.ui.View):
@@ -626,7 +642,9 @@ class MusicCog(commands.Cog):
                 channel, message_id, embed=music_panel(snapshot), view=self.view
             )
         except (discord.Forbidden, discord.HTTPException):
-            logger.warning("음악 패널을 갱신하지 못했습니다: guild=%s", guild_id)
+            logger.warning(
+                "음악 패널을 갱신하지 못했습니다: guild=%s", guild_id, exc_info=True
+            )
             return
         if message_id != message.id:
             await run_db(self.settings.set_music_panel_msg, guild_id, message.id)
@@ -671,6 +689,20 @@ class MusicCog(commands.Cog):
         start = False
         try:
             async with panel_lock(guild.id, "music"):
+                current_channel = getattr(
+                    getattr(interaction.user, "voice", None), "channel", None
+                )
+                if current_channel is None or current_channel is not voice_channel:
+                    await _ephemeral(
+                        interaction, "❌ 음성 채널이 바뀌었습니다. 다시 시도해 주세요."
+                    )
+                    return
+                permissions = current_channel.permissions_for(guild.me)
+                if not permissions.connect or not permissions.speak:
+                    await _ephemeral(
+                        interaction, "❌ 이 음성 채널의 연결·말하기 권한이 필요합니다."
+                    )
+                    return
                 voice_client = getattr(guild, "voice_client", None)
                 if voice_client is not None and voice_client.channel is not voice_channel:
                     await _ephemeral(interaction, "❌ 봇이 다른 음성 채널에서 사용 중입니다.")
@@ -683,9 +715,15 @@ class MusicCog(commands.Cog):
             logger.exception("음성 채널 연결에 실패했습니다: guild=%s", guild.id)
             await _ephemeral(interaction, "❌ 음성 채널에 연결하지 못했습니다.")
             return
-        await _ephemeral(interaction, f"✅ 대기열에 추가했습니다: {track.title}")
         if start:
-            await self.get_player(guild.id).start_if_idle()
+            error = await self.get_player(guild.id).start_if_idle()
+            if error is not None:
+                await _ephemeral(
+                    interaction,
+                    f"❌ {error} 대기열은 보존했습니다.",
+                )
+                return
+        await _ephemeral(interaction, f"✅ 대기열에 추가했습니다: {track.title}")
 
     @staticmethod
     def _manager(interaction: discord.Interaction) -> bool:
@@ -769,7 +807,12 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    async def remove_selected(self, interaction: discord.Interaction, position: int) -> None:
+    async def remove_selected(
+        self,
+        interaction: discord.Interaction,
+        position: int,
+        expected_track: MusicTrack,
+    ) -> None:
         if interaction.guild is None:
             await _ephemeral(interaction, "❌ 서버 안에서만 사용할 수 있습니다.")
             return
@@ -777,7 +820,10 @@ class MusicCog(commands.Cog):
         async with panel_lock(interaction.guild_id, "music"):
             player = self.players.get(interaction.guild_id)
             queue = () if player is None else player.snapshot().queue
-            if not 1 <= position <= min(len(queue), MAX_REMOVE_OPTIONS):
+            if (
+                not 1 <= position <= min(len(queue), MAX_REMOVE_OPTIONS)
+                or queue[position - 1] is not expected_track
+            ):
                 await _ephemeral(interaction, "❌ 대기열이 바뀌었습니다. 다시 선택해 주세요.")
                 return
             target = queue[position - 1]
@@ -844,6 +890,17 @@ class MusicCog(commands.Cog):
             if self._is_self(member):
                 if after_channel is None:
                     await player.forget_connection()
+                    self.players.pop(guild.id, None)
+                    await self.render_panel(guild.id)
+                    return
+                try:
+                    stopped = await player.disconnect_if_alone(after_channel)
+                except (discord.DiscordException, asyncio.TimeoutError):
+                    logger.exception(
+                        "이동된 빈 음성 채널 정리에 실패했습니다: guild=%s", guild.id
+                    )
+                    return
+                if stopped:
                     self.players.pop(guild.id, None)
                     await self.render_panel(guild.id)
                 return

@@ -819,7 +819,7 @@ class MusicVoiceEventTests(_PatchedPlaybackTests):
         self.assertIsNone(player.voice_client)
         self.assertEqual(voice.disconnects, 0)  # 이미 끊긴 연결을 다시 끊지 않는다
 
-    async def test_moving_the_bot_to_another_channel_keeps_playing(self):
+    async def test_moving_the_bot_to_an_occupied_channel_keeps_playing(self):
         cog = self._cog()
         channel = _FakeVoiceChannel(
             [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
@@ -827,12 +827,33 @@ class MusicVoiceEventTests(_PatchedPlaybackTests):
         player, voice = await self._connected(cog, channel)
 
         bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
+        destination = _FakeVoiceChannel(
+            [bot_member, _FakeVoiceMember(user_id=2)]
+        )
         await cog.on_voice_state_update(
-            bot_member, _FakeVoiceState(channel), _FakeVoiceState(_FakeVoiceChannel())
+            bot_member, _FakeVoiceState(channel), _FakeVoiceState(destination)
         )
         self.assertTrue(player.snapshot().connected)
         self.assertEqual(player.current, _music_track(1))
         self.assertEqual(voice.disconnects, 0)
+
+    async def test_moving_the_bot_to_an_empty_channel_disconnects_and_evicts(self):
+        cog = self._cog()
+        channel = _FakeVoiceChannel(
+            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
+        )
+        player, voice = await self._connected(cog, channel)
+        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
+        destination = _FakeVoiceChannel([bot_member])
+
+        await cog.on_voice_state_update(
+            bot_member, _FakeVoiceState(channel), _FakeVoiceState(destination)
+        )
+        await self._settle()
+
+        self.assertEqual(voice.disconnects, 1)
+        self.assertFalse(player.snapshot().connected)
+        self.assertNotIn(TEST_GUILD_ID, cog.players)
 
     async def test_voice_events_from_guilds_without_a_player_are_ignored(self):
         cog = self._cog()
@@ -963,9 +984,10 @@ class MusicPanelTests(_PatchedPlaybackTests):
             self.assertNotEqual(replacement_id, 10)
 
             guild.channel.fetch_error = discord.Forbidden(_FakeResponse(403), "no")
-            with self.assertLogs(music_cog.logger, level="WARNING"):
+            with self.assertLogs(music_cog.logger, level="WARNING") as logged:
                 await cog.ensure_panel(guild)
             self.assertEqual(settings.get_music_panel_msg(guild.id), replacement_id)
+            self.assertIn("403", "\n".join(logged.output))
 
     def test_persistent_buttons_and_remove_select_obey_discord_limits(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1061,6 +1083,60 @@ class MusicPanelTests(_PatchedPlaybackTests):
             all(interaction.response.messages[0][1]["ephemeral"] for interaction in interactions)
         )
 
+    async def test_add_revalidates_voice_and_permissions_after_slow_extraction(self):
+        class VoiceChannel:
+            def __init__(self):
+                self.permissions = SimpleNamespace(connect=True, speak=True)
+                self.connects = 0
+
+            def permissions_for(self, member):
+                return self.permissions
+
+            async def connect(self):
+                self.connects += 1
+
+        async def suspend_then_change(cog, guild, change):
+            started = asyncio.Event()
+            release = asyncio.Event()
+            channel = VoiceChannel()
+            interaction = _MusicInteraction(guild, voice_channel=channel)
+
+            async def slow_extract(url, requester_id):
+                started.set()
+                await release.wait()
+                return MusicTrack("새 곡", url, requester_id)
+
+            with patch.object(music_cog, "extract_track", side_effect=slow_extract):
+                adding = asyncio.create_task(
+                    cog.add_url(interaction, "https://example.com/song")
+                )
+                await asyncio.wait_for(started.wait(), timeout=1)
+                change(interaction, channel)
+                release.set()
+                await asyncio.wait_for(adding, timeout=1)
+            return interaction, channel
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ):
+            cog, guild, _, _ = self._cog(directory)
+            left, left_channel = await suspend_then_change(
+                cog, guild, lambda interaction, channel: setattr(
+                    interaction.user.voice, "channel", None
+                )
+            )
+            revoked, revoked_channel = await suspend_then_change(
+                cog, guild, lambda interaction, channel: setattr(
+                    channel.permissions, "speak", False
+                )
+            )
+
+        self.assertEqual(left_channel.connects, 0)
+        self.assertEqual(revoked_channel.connects, 0)
+        self.assertEqual(cog.players, {})
+        self.assertIn("바뀌", left.followup.messages[0][0][0])
+        self.assertIn("권한", revoked.followup.messages[0][0][0])
+
     async def test_valid_modal_url_is_extracted_connected_and_queued(self):
         track = MusicTrack("새 곡", "https://example.com/song", 123)
 
@@ -1081,7 +1157,7 @@ class MusicPanelTests(_PatchedPlaybackTests):
         ), patch.object(
             music_cog, "extract_track", return_value=track
         ) as extract, patch.object(
-            MusicPlayer, "start_if_idle"
+            MusicPlayer, "start_if_idle", return_value=None
         ) as start:
             cog, guild, settings, _ = self._cog(directory)
             channel = VoiceChannel(guild)
@@ -1094,24 +1170,103 @@ class MusicPanelTests(_PatchedPlaybackTests):
         self.assertIsNotNone(settings.get_music_panel_msg(guild.id))
         self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
+    async def test_initial_voice_play_failure_reports_error_and_preserves_queue(self):
+        track = MusicTrack("실패 곡", "https://example.com/song", 123)
+
+        class VoiceChannel:
+            def __init__(self, guild):
+                self.guild = guild
+
+            def permissions_for(self, member):
+                return SimpleNamespace(connect=True, speak=True)
+
+            async def connect(self):
+                voice = _FakeVoiceClient(
+                    self, play_error=discord.ClientException("voice unavailable")
+                )
+                self.guild.voice_client = voice
+                return voice
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ), patch.object(
+            music_cog, "extract_track", return_value=track
+        ):
+            cog, guild, _, _ = self._cog(directory)
+            interaction = _MusicInteraction(
+                guild, voice_channel=VoiceChannel(guild)
+            )
+            with self.assertLogs(music_cog.logger, level="ERROR"):
+                await cog.add_url(interaction, "https://example.com/song")
+
+        snapshot = cog.get_player(guild.id).snapshot()
+        self.assertEqual(snapshot.queue, (track,))
+        self.assertIsNone(snapshot.current)
+        self.assertIn("시작하지 못", snapshot.error)
+        self.assertTrue(all(source.cleaned for source in self.sources))
+        self.assertIn("대기열은 보존", interaction.followup.messages[0][0][0])
+        self.assertNotIn("✅", interaction.followup.messages[0][0][0])
+
+    async def test_automatic_next_track_voice_failure_is_visible_on_panel(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ):
+            cog, guild, settings, _ = self._cog(directory)
+            voice_channel = _FakeVoiceChannel([_FakeVoiceMember(user_id=1)])
+            voice = _FakeVoiceClient(voice_channel)
+            player = cog.get_player(guild.id)
+            await player.enqueue(voice, _music_track(1))
+            await player.enqueue(voice, _music_track(2))
+            voice.play_error = discord.ClientException("voice unavailable")
+
+            with self.assertLogs(music_cog.logger, level="ERROR"):
+                voice.stop()
+                self.assertTrue(
+                    await self._wait_until(lambda: player.snapshot().error is not None)
+                )
+
+        message = guild.channel.messages[settings.get_music_panel_msg(guild.id)]
+        embed = message.edits[-1]["embed"]
+        self.assertIn("재생 오류", embed.fields[0].value)
+        self.assertEqual(player.snapshot().queue, (_music_track(2),))
+
     async def test_remove_rechecks_position_and_requester_under_panel_lock(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             music_cog, "music_dependency_error", return_value=None
         ):
             cog, guild, _, _ = self._cog(directory)
             player = cog.get_player(guild.id)
-            player.queue.extend((_music_track(1), _music_track(2)))
+            first, second = _music_track(1), _music_track(2)
+            player.queue.extend((first, second))
             denied = _MusicInteraction(guild, user_id=999)
-            await cog.remove_selected(denied, 1)
+            await cog.remove_selected(denied, 1, first)
             stale = _MusicInteraction(guild, user_id=_music_track(1).requester_id)
-            await cog.remove_selected(stale, 3)
+            await cog.remove_selected(stale, 3, first)
             allowed = _MusicInteraction(guild, user_id=_music_track(1).requester_id)
-            await cog.remove_selected(allowed, 1)
+            await cog.remove_selected(allowed, 1, first)
 
         self.assertEqual(player.snapshot().queue, (_music_track(2),))
         self.assertIn("요청자", denied.followup.messages[0][0][0])
         self.assertIn("바뀌", stale.followup.messages[0][0][0])
         self.assertIn("제거", allowed.followup.messages[0][0][0])
+
+    async def test_remove_select_rejects_a_shifted_but_still_valid_snapshot_item(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ):
+            cog, guild, _, _ = self._cog(directory)
+            player = cog.get_player(guild.id)
+            first, selected, shifted = _music_track(1), _music_track(2), _music_track(3)
+            player.queue.extend((first, selected, shifted))
+            select = MusicRemoveView(cog, player.snapshot().queue).children[0]
+            player.queue.popleft()
+            select._values = ["2"]
+            interaction = _MusicInteraction(guild, manager=True)
+
+            await select.callback(interaction)
+
+        self.assertEqual(player.snapshot().queue, (selected, shifted))
+        self.assertIn("바뀌", interaction.followup.messages[0][0][0])
 
     async def test_voice_api_stop_failure_is_ephemeral_logged_and_preserves_metadata(self):
         class FailingVoice(_FakeVoiceClient):
