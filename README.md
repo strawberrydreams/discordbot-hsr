@@ -18,45 +18,81 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 
 ## 빠른 시작
 
-### 1. Discord Application 생성과 설치
+### 1. Discord Application과 토큰 준비
 
-각 운영자는 Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 생성합니다. Installation은 **Guild Install만** 사용하고, 설치 scope는 `bot`, `applications.commands`로 설정합니다. 봇 권한은 다음만 부여합니다.
+Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 생성합니다. Bot 설정에서 privileged intent인 `Message Content`와 `Server Members`를 활성화합니다. 전자는 금지어 필터에, 후자는 퇴장 시 파티 정리에 필요합니다. 운영자 전용 앱은 `Public Bot`을 끄세요. 이는 Portal에서 하는 설정이며, 이 저장소의 코드가 Portal 설정을 변경하지는 않습니다. Guild 설치는 봇을 시작한 뒤 6단계에서 합니다.
+
+### 2. 환경 파일 작성
+
+`.env.example`을 기준으로 두 파일을 만들고, 다음 단계로 가기 전에 값을 채웁니다.
+
+- `.env.secrets`: 방금 만든 Discord 토큰과 선택적인 OpenAI·Google 자격 증명
+- `.env.runtime`: 데이터·백업 경로, 백업 주기, AI 쿨다운과 한도
+
+```bash
+touch .env.secrets .env.runtime
+chmod 600 .env.secrets .env.runtime
+```
+
+### 3. 설정 파일 초기화
+
+세 example을 모두 복사합니다.
+
+```bash
+cp settings/persona.example.json settings/persona.json
+cp settings/forbidden_words.example.json settings/forbidden_words.json
+cp settings/games.example.json settings/games.json
+mkdir -p runtime/data runtime/backups runtime/logs
+```
+
+### 4. 이미지 빌드
+
+```bash
+docker compose config --quiet
+docker compose build bot
+```
+
+### 5. bind mount 소유권·권한 설정 후 시작
+
+이미지의 non-root `bot` UID/GID를 호스트 bind mount에 적용합니다. `bot`과 `backup`은 같은 이미지를 사용하므로 이 소유권으로 bot은 settings/runtime을 쓰고 backup은 read-only settings를 읽을 수 있습니다. 아래 검증이 모두 성공하기 전에는 서비스를 시작하지 마세요.
+
+```bash
+BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
+sudo find settings runtime -type d -exec chmod 700 {} +
+sudo find settings runtime -type f -exec chmod 600 {} +
+test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" -o -perm -022 \) -print -quit)"
+docker compose run --rm --no-deps --entrypoint sh bot -c '
+  test -r /app/settings/persona.json && test -w /app/settings/persona.json &&
+  test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json &&
+  test -r /app/settings/games.json && test -w /app/settings/games.json &&
+  test -w /app/runtime/data && test -w /app/runtime/backups'
+docker compose run --rm --no-deps --entrypoint sh backup -c '
+  test -r /app/settings/persona.json && test ! -w /app/settings/persona.json &&
+  test -r /app/settings/forbidden_words.json && test -r /app/settings/games.json'
+docker compose up -d
+docker compose logs --tail=100 bot
+```
+
+### 6. Guild 설치와 Discord 설정
+
+Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `bot`, `applications.commands`로 설정합니다. 봇 권한은 다음만 부여한 뒤 Guild에 설치합니다.
 
 - `View Channel`
 - `Send Messages`
 - `Read Message History`
 - `Embed Links`
 - `Attach Files`
-- `Manage Channels` — `/설정 시작`이 봇 전용 category와 파티·음악 채널을 만들 때 필요
+- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
 - `Connect`
 - `Speak`
 
-Bot 설정에서 privileged intent인 `Message Content`와 `Server Members`를 활성화합니다. 전자는 금지어 필터에, 후자는 퇴장 시 파티 정리에 필요합니다. 운영자 전용 앱은 `Public Bot`을 끄세요. 이는 Portal에서 하는 설정이며, 이 저장소의 코드가 Portal 설정을 변경하지는 않습니다.
+설치 후 `Manage Guild` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만 바꿉니다.
 
 슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 포인트·파티·설정은 자동으로 삭제됩니다.
 
-### 2. 설치
-
-```bash
-touch .env.secrets .env.runtime
-mkdir -p runtime/data runtime/backups runtime/logs
-cp settings/persona.example.json settings/persona.json
-cp settings/forbidden_words.example.json settings/forbidden_words.json
-cp settings/games.example.json settings/games.json
-chmod 600 .env.secrets .env.runtime settings/persona.json settings/forbidden_words.json settings/games.json
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-### 3. 환경과 서버 설정
-
-`.env.example`을 기준으로 다음 두 파일을 채웁니다.
-
-- `.env.secrets`: 방금 만든 Discord 토큰과 OpenAI·Google 자격 증명
-- `.env.runtime`: 데이터·백업 경로, 백업 주기, AI 쿨다운과 한도
-
-채널 ID는 환경변수가 아닙니다. 봇을 Guild에 설치한 뒤 서버 관리자가 `/설정 시작`으로 봇 전용 category와 파티·음악 채널을 만들거나 `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정합니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만 바꿉니다.
+### 패널과 선택 기능
 
 파티 채널에는 `settings/games.json`의 게임별 영속 패널이 하나씩 유지됩니다. 빈 자리 버튼은 참가, 자신의 자리 버튼은 퇴장, 다른 역할 버튼은 역할 변경입니다. 게임·역할 설정을 바꾼 뒤에는 봇을 재시작하세요.
 
@@ -70,31 +106,7 @@ python3 -m venv .venv
 
 AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도를 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
 
-### 4. DB 초기화와 초기 백업
-
-새 설치에서만 빈 DB를 초기화합니다. 기존 운영 DB가 있다면 초기화하지 말고 [운영 가이드](docs/operations.md)의 복구 절차를 따르세요.
-
-```bash
-.venv/bin/python -c 'from module.database import create_attendance_repository, create_party_repository, create_guild_settings_repository; from module.backup import DATABASES, verify_database; from module.config import DATA_DIR; create_attendance_repository(); create_party_repository(); create_guild_settings_repository(); [print(name, verify_database(DATA_DIR / name, tables, source_name=name)) for name, tables in DATABASES.items()]'
-.venv/bin/python -m module.backup create
-.venv/bin/python -m module.backup verify
-.venv/bin/python -m module.backup restore-test
-```
-
-### 5. Docker Compose로 배포 (권장)
-
-일반 운영에는 Docker Compose를 권장합니다. 배포 순서는 테스트, Compose 설정 확인, 이미지 빌드, 봇·백업 서비스 시작입니다.
-
-```bash
-.venv/bin/python -m unittest test.test_discord_commands
-.venv/bin/python -m test.console_tests
-docker compose config --quiet
-docker compose build bot
-docker compose up -d
-docker compose logs --tail=100 bot
-```
-
-개발 중 직접 실행하려면 `.venv/bin/python -m module.main`을 사용합니다. macOS에서 Docker 대신 LaunchAgent를 직접 관리해야 하는 고급 운영자만 [launchd 선택 사항](docs/operations.md#macos-launchagent)을 따르세요. launchd와 Docker를 동시에 실행하지 마세요.
+일반 운영에는 Docker Compose를 권장합니다. macOS에서 Docker 대신 LaunchAgent를 직접 관리해야 하는 고급 운영자만 [launchd 선택 사항](docs/operations.md#macos-launchagent)을 따르세요. launchd와 Docker를 동시에 실행하지 마세요. 백업·복구 절차도 [운영 가이드](docs/operations.md)를 따르세요.
 
 ## 운영 시 주의
 

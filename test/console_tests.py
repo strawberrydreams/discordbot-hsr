@@ -386,34 +386,88 @@ def test_final_installation_and_operations_contract():
     public_docs = f"{readme}\n{operations}"
     compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    quick_start = readme.split("## 빠른 시작", 1)[1].split("## 운영 시 주의", 1)[0]
+    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    restore_script = restore.split("```bash", 1)[1].split("```", 1)[0]
+
+    def ordered(text, *terms):
+        cursor = -1
+        for term in terms:
+            cursor = text.find(term, cursor + 1)
+            if cursor < 0:
+                return False
+        return True
 
     check(
-        "설치 문서는 세 설정 JSON 초기 복사를 안내",
-        all(
-            f"settings/{name}.json" in readme
-            and f"settings/{name}.example.json" in readme
-            for name in ("persona", "forbidden_words", "games")
+        "설치 문서는 세 설정 JSON을 exact copy",
+        """cp settings/persona.example.json settings/persona.json
+cp settings/forbidden_words.example.json settings/forbidden_words.json
+cp settings/games.example.json settings/games.json""" in quick_start,
+    )
+    check(
+        "빠른 시작은 env 작성→copy→build→ownership→up→Guild 설정 순서",
+        ordered(
+            quick_start,
+            "다음 단계로 가기 전에 값을 채웁니다.",
+            "cp settings/persona.example.json settings/persona.json",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "test -z \"$(sudo find settings runtime",
+            "docker compose up -d",
+            "Installation은 **Guild Install만**",
+            "Discord에서 `/설정 시작`을 실행합니다.",
         ),
     )
     check(
-        "문서는 현재 설정과 영속 panel 명령만 안내",
-        all(
-            term in public_docs
-            for term in ("/설정 시작", "/설정 파티채널", "/설정 음악채널", "/설정 공지허용")
+        "설치 ownership은 image UID/GID와 restrictive mode를 exact 검증",
+        '''BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
+sudo find settings runtime -type d -exec chmod 700 {} +
+sudo find settings runtime -type f -exec chmod 600 {} +
+test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" -o -perm -022 \) -print -quit)"''' in quick_start,
+    )
+    check(
+        "설치는 container에서 settings rw와 runtime rw를 확인 후 up",
+        ordered(
+            quick_start,
+            "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+            "test -r /app/settings/persona.json && test -w /app/settings/persona.json",
+            "test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json",
+            "test -r /app/settings/games.json && test -w /app/settings/games.json",
+            "test -w /app/runtime/data && test -w /app/runtime/backups'",
+            "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+            "test -r /app/settings/persona.json && test ! -w /app/settings/persona.json",
+            "docker compose up -d",
         ),
     )
     check(
-        "문서는 channel과 voice 권한을 안내",
-        all(term in public_docs for term in ("`Manage Channels`", "`Connect`", "`Speak`")),
+        "현재 설정과 영속 panel 명령 block 유지",
+        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
     )
     check(
-        "웹 관리는 선택 토큰과 고정 loopback 경계를 문서화",
-        all(term in public_docs for term in ("`ADMIN_TOKEN`", "`127.0.0.1:8080`", "host-scoped")),
+        "channel과 voice permission block 유지",
+        """- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
+- `Connect`
+- `Speak`""" in quick_start,
     )
     check(
-        "음악 선택 의존성과 yt-dlp 갱신 절차를 문서화",
-        "나머지 봇은 동작" in public_docs
-        and "pip install --upgrade yt-dlp" in public_docs,
+        "웹 관리는 선택 token·고정 loopback·unsupported remote 경계",
+        "`ADMIN_TOKEN`은 선택 사항입니다." in readme
+        and "고정된 `127.0.0.1:8080`에만 bind됩니다." in readme
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다." in readme
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며" in operations
+        and "port가 아닌 host-scoped" in operations,
+    )
+    check(
+        "공지는 opt-in Guild의 configured party channel만 대상",
+        "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
+    )
+    check(
+        "음악 선택 의존성과 exact yt-dlp 갱신 절차",
+        "`PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다." in readme
+        and ".venv/bin/python -m pip install --upgrade yt-dlp" in readme
+        and "docker compose build --no-cache bot && docker compose up -d --no-deps bot" in readme,
     )
     check(
         "MIT와 무기여 정책을 유지",
@@ -434,30 +488,57 @@ def test_final_installation_and_operations_contract():
         ),
     )
     check(
-        "백업 문서는 세 DB와 존재한 세 설정 파일을 같은 set으로 설명",
-        all(
-            term in operations
-            for term in (
-                "attendance_data.db",
-                "party_data.db",
-                "guild_settings.db",
-                "settings/persona.json",
-                "settings/forbidden_words.json",
-                "settings/games.json",
-            )
+        "백업은 세 DB와 존재한 세 settings를 exact same manifest로 설명",
+        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+    )
+    check(
+        "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
+        ordered(
+            restore_script,
+            "docker compose stop bot backup",
+            "from module.backup import stage_restore",
+            'cp -ip "$staged" "runtime/data/$name"',
+            'cp -ip "$staged" "settings/$name"',
+            "SERVICE_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            'sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime',
+            "sudo find settings runtime -type d -exec chmod 700 {} +",
+            'test -z "$(sudo find settings runtime',
+            "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+            "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+            "docker compose start backup",
+            "docker compose start bot",
+            "BOT_CONTAINER_ID=$(docker compose ps -q bot)",
+            "docker inspect --format '{{.State.Health.Status}}' \"$BOT_CONTAINER_ID\"",
+            "docker compose logs --tail=100 bot",
+        )
+        and "discordbot-hsr-bot-1" not in restore,
+    )
+    check(
+        "복구는 Docker stage 뒤 operator에게 넘기고 restart 전 image user로 복귀",
+        ordered(
+            restore_script,
+            "docker compose run --rm --no-deps -T --entrypoint python backup",
+            'sudo chown -R "$(id -u):$(id -g)" settings runtime',
+            'sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime',
         ),
     )
+    bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
+    backup_service = compose.split("\n  backup:", 1)[1]
     check(
-        "Compose bot 설정은 rw, backup 설정은 ro, web port는 없음",
-        "- ./settings:/app/settings\n" in compose
-        and "- ./settings:/app/settings:ro" in compose
-        and "ports:" not in compose,
+        "Compose service별 settings mode와 no ports 구조",
+        "      - ./settings:/app/settings\n" in bot_service
+        and "      - ./settings:/app/settings:ro\n" not in bot_service
+        and "      - ./settings:/app/settings:ro\n" in backup_service
+        and "ports:" not in bot_service
+        and "ports:" not in backup_service,
     )
+    expected_healthcheck = """HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \\
+    CMD ["python", "-c", "import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)"]"""
     check(
-        "Docker runtime은 ffmpeg와 main process healthcheck를 가진다",
-        "ffmpeg" in dockerfile
-        and "HEALTHCHECK" in dockerfile
-        and "b'module.main'" in dockerfile,
+        "Docker runtime은 exact ffmpeg install과 main healthcheck",
+        "apt-get install -y --no-install-recommends ffmpeg" in dockerfile
+        and expected_healthcheck in dockerfile
+        and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
     )
 
 
@@ -578,6 +659,19 @@ def test_deployment_contracts():
                 and mount.get("read_only", False)
                 for mount in backup["volumes"]
             ),
+        )
+        check(
+            "bot 설정 마운트는 쓰기 가능",
+            any(
+                str(mount.get("source", "")).endswith("settings")
+                and mount.get("target") == "/app/settings"
+                and not mount.get("read_only", False)
+                for mount in bot["volumes"]
+            ),
+        )
+        check(
+            "Compose는 web port를 publish하지 않음",
+            all(not service.get("ports") for service in (bot, backup)),
         )
         check(
             "Compose 로그 크기 제한",
