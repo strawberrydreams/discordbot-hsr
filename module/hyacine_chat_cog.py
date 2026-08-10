@@ -28,12 +28,21 @@ DEFAULT_PERSONA = {
 }
 
 
+def canonicalize_persona(data: object, *, strict: bool = False) -> dict:
+    if not isinstance(data, dict):
+        if strict:
+            raise ValueError("persona.json 최상단은 객체여야 합니다.")
+        data = {}
+    accepted = {k: v for k, v in data.items() if isinstance(v, str) and v}
+    if strict and len(accepted) != len(data):
+        raise ValueError("persona.json 값은 비어 있지 않은 문자열이어야 합니다.")
+    return {**DEFAULT_PERSONA, **accepted}
+
+
 def load_persona() -> dict:
     """settings/persona.json → persona.example.json → 코드 기본값 순으로 읽는다."""
     data = load_settings_json("persona.json", "persona.example.json", default={})
-    if not isinstance(data, dict):
-        data = {}
-    return {**DEFAULT_PERSONA, **{k: v for k, v in data.items() if isinstance(v, str) and v}}
+    return canonicalize_persona(data)
 
 
 class ChannelSession:

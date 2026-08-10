@@ -71,6 +71,15 @@ def _build_pattern(terms: List[str]) -> re.Pattern:
     return re.compile("|".join(escaped))
 
 
+def canonicalize_forbidden_words(data: object, *, strict: bool = False) -> List[str]:
+    if not isinstance(data, list):
+        if strict:
+            raise ValueError("forbidden_words.json 최상단은 배열이어야 합니다.")
+        print("⚠️ 금지어 JSON 최상단은 배열이어야 합니다. 필터를 비활성합니다.")
+        return []
+    return [_normalize_term(str(word)) for word in data if str(word).strip()]
+
+
 def load_forbidden_words() -> List[str]:
     """금지어 목록을 읽는다. 없거나 비었으면 빈 목록 — 필터만 꺼진다.
 
@@ -78,10 +87,7 @@ def load_forbidden_words() -> List[str]:
     금지어는 선택 기능이므로 부팅을 막을 이유가 없다.
     """
     data = load_settings_json("forbidden_words.json", default=[])
-    if not isinstance(data, list):
-        print("⚠️ 금지어 JSON 최상단은 배열이어야 합니다. 필터를 비활성합니다.")
-        return []
-    return [_normalize_term(str(word)) for word in data if str(word).strip()]
+    return canonicalize_forbidden_words(data)
 
 
 class ForbiddenFilterCog(commands.Cog):

@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
+import re
 import secrets
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -22,6 +26,7 @@ from module.database import (
 HOST = "127.0.0.1"
 PORT = 8080
 SESSION_COOKIE = "admin_session"
+SESSION_TTL_SECONDS = 8 * 60 * 60
 MAX_BODY_BYTES = config.MAX_SETTINGS_BYTES
 ANNOUNCEMENT_TITLE_LIMIT = 256
 ANNOUNCEMENT_BODY_LIMIT = 4_096
@@ -35,6 +40,16 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
 }
 TEMPLATE_DIR = Path(__file__).with_name("templates")
+PLACEHOLDER_PATTERN = re.compile(
+    r"{{(csrf|notice|error|persona|forbidden_words|games)}}"
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AdminSession:
+    csrf: str
+    expires_at: float
 
 
 @web.middleware
@@ -44,6 +59,9 @@ async def _security_headers(request: web.Request, handler):
     except web.HTTPException as response:
         response.headers.update(SECURITY_HEADERS)
         raise
+    except Exception:
+        logger.exception("Unhandled web admin request: %s %s", request.method, request.path)
+        response = web.Response(status=500, text="서버 오류가 발생했습니다.")
     response.headers.update(SECURITY_HEADERS)
     return response
 
@@ -56,7 +74,7 @@ class WebAdminCog(commands.Cog):
     ):
         self.bot = bot
         self.settings = settings or create_guild_settings_repository()
-        self.sessions: dict[str, str] = {}
+        self.sessions: dict[str, AdminSession] = {}
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self._mutation_lock = asyncio.Lock()
@@ -83,7 +101,7 @@ class WebAdminCog(commands.Cog):
         try:
             site = web.TCPSite(runner, HOST, PORT)
             await site.start()
-        except Exception:
+        except BaseException:
             await runner.cleanup()
             raise
         self.runner = runner
@@ -101,30 +119,49 @@ class WebAdminCog(commands.Cog):
         await self.close()
 
     async def _read_form(self, request: web.Request) -> dict[str, str]:
+        if request.content_type != "application/x-www-form-urlencoded":
+            raise web.HTTPUnsupportedMediaType(
+                text="application/x-www-form-urlencoded 요청만 허용됩니다."
+            )
         length = request.content_length
         if length is not None and length > MAX_BODY_BYTES:
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_BODY_BYTES, actual_size=length
             )
-        body = await request.content.read(MAX_BODY_BYTES + 1)
+        body = await request.read()
         if len(body) > MAX_BODY_BYTES:
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_BODY_BYTES, actual_size=len(body)
             )
         try:
+            text = body.decode("utf-8")
+            if re.search(r"%(?![0-9A-Fa-f]{2})", text):
+                raise ValueError("잘못된 percent escape")
             parsed = parse_qs(
-                body.decode("utf-8"), keep_blank_values=True, max_num_fields=10
+                text,
+                keep_blank_values=True,
+                strict_parsing=True,
+                encoding="utf-8",
+                errors="strict",
+                max_num_fields=10,
             )
         except (UnicodeDecodeError, ValueError) as exc:
             raise web.HTTPBadRequest(text="잘못된 요청입니다.") from exc
         return {key: values[-1] for key, values in parsed.items()}
 
-    def _session(self, request: web.Request) -> tuple[str, str] | None:
+    def _session(self, request: web.Request) -> tuple[str, AdminSession] | None:
+        now = time.monotonic()
+        for expired_id in [
+            session_id
+            for session_id, session in self.sessions.items()
+            if session.expires_at <= now
+        ]:
+            self.sessions.pop(expired_id, None)
         session_id = request.cookies.get(SESSION_COOKIE)
-        csrf = self.sessions.get(session_id or "")
-        return (session_id, csrf) if session_id and csrf else None
+        session = self.sessions.get(session_id or "")
+        return (session_id, session) if session_id and session else None
 
-    def _require_session(self, request: web.Request) -> tuple[str, str]:
+    def _require_session(self, request: web.Request) -> tuple[str, AdminSession]:
         session = self._session(request)
         if session is None:
             raise web.HTTPUnauthorized(text="로그인이 필요합니다.")
@@ -132,11 +169,11 @@ class WebAdminCog(commands.Cog):
 
     def _require_csrf(
         self, request: web.Request, form: dict[str, str]
-    ) -> tuple[str, str]:
+    ) -> tuple[str, AdminSession]:
         session = self._require_session(request)
         supplied = form.get("csrf", "")
         if not supplied or not secrets.compare_digest(
-            supplied.encode(), session[1].encode()
+            supplied.encode(), session[1].csrf.encode()
         ):
             raise web.HTTPForbidden(text="잘못된 CSRF 토큰입니다.")
         return session
@@ -144,9 +181,10 @@ class WebAdminCog(commands.Cog):
     @staticmethod
     def _template(name: str, **values: str) -> str:
         source = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
-        for key, value in values.items():
-            source = source.replace("{{" + key + "}}", html.escape(value, quote=True))
-        return source
+        return PLACEHOLDER_PATTERN.sub(
+            lambda match: html.escape(values.get(match.group(1), ""), quote=True),
+            source,
+        )
 
     def _login_response(self, error: str = "", *, status: int = 200) -> web.Response:
         return web.Response(
@@ -158,16 +196,11 @@ class WebAdminCog(commands.Cog):
 
     @staticmethod
     def _settings_text(name: str) -> str:
-        path = config.SETTINGS_DIR / name
-        if path.is_symlink():
-            return ""
-        if not path.exists():
-            path = config.SETTINGS_DIR / name.replace(".json", ".example.json")
         try:
-            data = path.read_bytes()
-        except OSError:
+            data = config.read_settings_bytes(name)
+        except (OSError, ValueError):
             return ""
-        if len(data) > MAX_BODY_BYTES:
+        if data is None:
             return ""
         try:
             return data.decode("utf-8")
@@ -204,7 +237,10 @@ class WebAdminCog(commands.Cog):
 
         session_id = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
-        self.sessions[session_id] = csrf
+        self.sessions.clear()
+        self.sessions[session_id] = AdminSession(
+            csrf=csrf, expires_at=time.monotonic() + SESSION_TTL_SECONDS
+        )
         response = web.HTTPSeeOther("/")
         response.set_cookie(
             SESSION_COOKIE,
@@ -212,10 +248,12 @@ class WebAdminCog(commands.Cog):
             httponly=True,
             samesite="Strict",
             path="/",
+            max_age=SESSION_TTL_SECONDS,
         )
         raise response
 
     async def logout_post(self, request: web.Request) -> web.StreamResponse:
+        self._require_session(request)
         form = await self._read_form(request)
         session_id, _ = self._require_csrf(request, form)
         self.sessions.pop(session_id, None)
@@ -227,11 +265,13 @@ class WebAdminCog(commands.Cog):
         session = self._session(request)
         if session is None:
             raise web.HTTPFound("/login")
-        return self._index_response(session[1])
+        return self._index_response(session[1].csrf)
 
     async def settings_post(self, request: web.Request) -> web.StreamResponse:
+        self._require_session(request)
         form = await self._read_form(request)
-        _, csrf = self._require_csrf(request, form)
+        _, session = self._require_csrf(request, form)
+        csrf = session.csrf
         name = request.match_info["name"]
         if name not in config.SETTINGS_FILES:
             raise web.HTTPNotFound(text="허용되지 않은 설정 파일입니다.")
@@ -270,8 +310,10 @@ class WebAdminCog(commands.Cog):
         )
 
     async def announce_post(self, request: web.Request) -> web.StreamResponse:
+        self._require_session(request)
         form = await self._read_form(request)
-        _, csrf = self._require_csrf(request, form)
+        _, session = self._require_csrf(request, form)
+        csrf = session.csrf
         title = form.get("title", "").strip()
         body = form.get("body", "").strip()
         if not title or len(title) > ANNOUNCEMENT_TITLE_LIMIT:
@@ -301,6 +343,7 @@ class WebAdminCog(commands.Cog):
                     success += 1
                 except Exception:
                     failed += 1
+                    logger.exception("Host announcement failed for guild_id=%s", guild_id)
 
         return self._index_response(
             csrf, f"공지 완료: 성공 {success}, 건너뜀 {skipped}, 실패 {failed}"
@@ -312,6 +355,6 @@ async def setup(bot: commands.Bot) -> None:
     await cog.start()
     try:
         await bot.add_cog(cog)
-    except Exception:
+    except BaseException:
         await cog.close()
         raise

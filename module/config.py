@@ -1,8 +1,8 @@
 # Configuration Module
 import json
 import os
-import tempfile
-from contextvars import ContextVar
+import secrets
+import stat
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,9 +47,6 @@ SETTINGS_FILES: tuple[str, ...] = (
     "games.json",
 )
 MAX_SETTINGS_BYTES = 256 * 1024
-_SETTINGS_DOCUMENT: ContextVar[tuple[str, object] | None] = ContextVar(
-    "settings_document", default=None
-)
 
 
 def load_settings_json(*names: str, default):
@@ -59,10 +56,6 @@ def load_settings_json(*names: str, default):
     커밋된 *.example.json으로 떨어지는 용도다. 전부 실패하면 default를 돌려준다.
     운영자 설정 하나가 없다고 봇 전체가 죽으면 안 된다.
     """
-    override = _SETTINGS_DOCUMENT.get()
-    if override is not None and override[0] in names:
-        return override[1]
-
     for name in names:
         path = SETTINGS_DIR / name
         try:
@@ -76,68 +69,164 @@ def load_settings_json(*names: str, default):
     return default
 
 
+def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
+    if not isinstance(raw, dict):
+        if strict:
+            raise ValueError("games.json 최상단은 객체여야 합니다.")
+        return {}
+    games = {}
+    for name, info in raw.items():
+        if not isinstance(name, str) or not 1 <= len(name) <= 89:
+            message = f"games.json의 게임 이름이 1~89자가 아닙니다: {name}"
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message}")
+            continue
+        if not isinstance(info, dict):
+            message = f"games.json 항목이 객체가 아닙니다: {name}"
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message}")
+            continue
+        max_players = info.get("max_players")
+        roles = info.get("roles", [])
+        if type(max_players) is not int or not 1 <= max_players <= 25:
+            message = f"games.json의 max_players가 1~25의 정수가 아닙니다: {name}"
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message}")
+            continue
+        if (
+            not isinstance(roles, list)
+            or len(roles) > 25
+            or not all(isinstance(role, str) and 1 <= len(role) <= 100 for role in roles)
+            or len(", ".join(roles)) > 1_024
+        ):
+            message = (
+                "games.json의 roles가 최대 25개·각 1~100자·합계 1,024자 이내가 "
+                f"아닙니다: {name}"
+            )
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message}")
+            continue
+        games[name] = {"max_players": max_players, "roles": roles}
+    return games
+
+
 def _validate_settings_document(name: str, document: object) -> None:
-    """실서비스 loader가 손실 없이 받아들이는 문서만 저장한다."""
-    token = _SETTINGS_DOCUMENT.set((name, document))
+    """실서비스 loader와 공유하는 canonicalizer로 문서를 검증한다."""
+    if name == "persona.json":
+        from module.hyacine_chat_cog import canonicalize_persona
+
+        canonicalize_persona(document, strict=True)
+    elif name == "forbidden_words.json":
+        from module.forbiddenfilter_cog import canonicalize_forbidden_words
+
+        canonicalize_forbidden_words(document, strict=True)
+    elif name == "games.json":
+        _canonicalize_games(document, strict=True)
+    else:
+        raise ValueError("허용되지 않은 설정 파일입니다.")
+
+
+def _open_settings_directory(*, create: bool) -> int:
+    if create:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(SETTINGS_DIR, flags)
+
+
+def _open_temporary_at(directory_fd: int, target_name: str):
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    while True:
+        name = f".{target_name}.{secrets.token_hex(8)}"
+        try:
+            file_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        return name, os.fdopen(file_fd, "wb")
+
+
+def _reject_symlink(directory_fd: int, name: str) -> None:
     try:
-        if name == "persona.json":
-            from module.hyacine_chat_cog import DEFAULT_PERSONA, load_persona
+        mode = os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        raise ValueError("심볼릭 링크 설정 파일은 사용할 수 없습니다.")
 
-            loaded = load_persona()
+
+def read_settings_bytes(name: str) -> bytes | None:
+    """고정한 settings directory에서 symlink를 따르지 않고 현재 설정을 읽는다."""
+    if name not in SETTINGS_FILES:
+        raise ValueError("허용되지 않은 설정 파일입니다.")
+    try:
+        directory_fd = _open_settings_directory(create=False)
+    except FileNotFoundError:
+        return None
+    try:
+        for candidate in (name, name.replace(".json", ".example.json")):
             try:
-                expected = {**DEFAULT_PERSONA, **document}  # type: ignore[arg-type]
-            except TypeError as exc:
-                raise ValueError("persona.json 최상단은 객체여야 합니다.") from exc
-            valid = loaded == expected
-        elif name == "forbidden_words.json":
-            from module.forbiddenfilter_cog import load_forbidden_words
-
-            loaded = load_forbidden_words()
-            valid = isinstance(document, list) and len(loaded) == len(document)
-        elif name == "games.json":
-            loaded = load_games()
-            valid = loaded == document
-        else:
-            raise ValueError("허용되지 않은 설정 파일입니다.")
+                file_fd = os.open(
+                    candidate,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+            with os.fdopen(file_fd, "rb") as fp:
+                if not stat.S_ISREG(os.fstat(fp.fileno()).st_mode):
+                    return None
+                data = fp.read(MAX_SETTINGS_BYTES + 1)
+            return data if len(data) <= MAX_SETTINGS_BYTES else None
+        return None
     finally:
-        _SETTINGS_DOCUMENT.reset(token)
-    if not valid:
-        raise ValueError(f"{name} 설정 형식 또는 크기 제한을 확인하세요.")
+        os.close(directory_fd)
 
 
 def atomic_write_settings(name: str, document: object) -> None:
     """허용된 설정 JSON을 검증한 뒤 같은 디렉터리에서 원자 교체한다."""
     if name not in SETTINGS_FILES:
         raise ValueError("허용되지 않은 설정 파일입니다.")
-    target = SETTINGS_DIR / name
-    if target.is_symlink():
-        raise ValueError("심볼릭 링크 설정 파일은 저장할 수 없습니다.")
 
     payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
     if len(payload) > MAX_SETTINGS_BYTES:
         raise ValueError("설정 파일이 너무 큽니다.")
     _validate_settings_document(name, document)
 
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = None
+    directory_fd = _open_settings_directory(create=True)
+    temporary_name = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=SETTINGS_DIR, prefix=f".{name}.", delete=False
-        ) as fp:
-            temporary = Path(fp.name)
+        _reject_symlink(directory_fd, name)
+        temporary_name, temporary_file = _open_temporary_at(directory_fd, name)
+        with temporary_file as fp:
             fp.write(payload)
             fp.flush()
             os.fsync(fp.fileno())
-        os.replace(temporary, target)
-        temporary = None
-        directory_fd = os.open(SETTINGS_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _reject_symlink(directory_fd, name)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -190,34 +279,7 @@ def load_games() -> dict:
     참조하므로, 잘못된 항목 하나가 파티 기능 전체를 깨뜨리면 안 된다.
     """
     raw = load_settings_json("games.json", "games.example.json", default={})
-    if not isinstance(raw, dict):
-        return {}
-    games = {}
-    for name, info in raw.items():
-        if not isinstance(name, str) or not 1 <= len(name) <= 89:
-            print(f"⚠️ games.json의 게임 이름이 1~89자가 아닙니다: {name}")
-            continue
-        if not isinstance(info, dict):
-            print(f"⚠️ games.json 항목이 객체가 아닙니다: {name}")
-            continue
-        max_players = info.get("max_players")
-        roles = info.get("roles", [])
-        if type(max_players) is not int or not 1 <= max_players <= 25:
-            print(f"⚠️ games.json의 max_players가 1~25의 정수가 아닙니다: {name}")
-            continue
-        if (
-            not isinstance(roles, list)
-            or len(roles) > 25
-            or not all(isinstance(role, str) and 1 <= len(role) <= 100 for role in roles)
-            or len(", ".join(roles)) > 1_024
-        ):
-            print(
-                "⚠️ games.json의 roles가 최대 25개·각 1~100자·합계 1,024자 이내가 "
-                f"아닙니다: {name}"
-            )
-            continue
-        games[name] = {"max_players": max_players, "roles": roles}
-    return games
+    return _canonicalize_games(raw)
 
 
 GAMES = load_games()

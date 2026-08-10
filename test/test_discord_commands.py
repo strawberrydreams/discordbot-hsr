@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import hashlib
 import json
+import os
 import pathlib
 import secrets
 import tempfile
@@ -18,8 +19,9 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import discord
 import httpx
 import openai
-from aiohttp import CookieJar, web
+from aiohttp import CookieJar
 from aiohttp.test_utils import TestClient, TestServer
+from discord.ext import commands
 
 import module.config as config
 import module.main as bot_main
@@ -3605,11 +3607,48 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
             await cog.close()  # bot close after extension unload
         runner.cleanup.assert_awaited_once()
 
+    async def test_bot_close_cleans_runner_before_isolated_superclass_close(self):
+        events = []
+        runner = SimpleNamespace(
+            cleanup=AsyncMock(side_effect=lambda: events.append("runner"))
+        )
+        cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
+        cog.runner = runner
+        bot = object.__new__(bot_main.MyBot)
+        superclass_close = AsyncMock(side_effect=lambda: events.append("super"))
+        with patch.object(bot_main.MyBot, "get_cog", return_value=cog), patch.object(
+            commands.Bot, "close", superclass_close
+        ):
+            await bot.close()
+        runner.cleanup.assert_awaited_once_with()
+        superclass_close.assert_awaited_once_with()
+        self.assertEqual(events, ["runner", "super"])
+
+    async def test_cancelled_start_cleans_unowned_runner(self):
+        runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+        site = SimpleNamespace(start=AsyncMock(side_effect=asyncio.CancelledError))
+        cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
+        with patch.object(webadmin_cog.web, "AppRunner", return_value=runner), patch.object(
+            webadmin_cog.web, "TCPSite", return_value=site
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await cog.start()
+        runner.cleanup.assert_awaited_once_with()
+
+    async def test_cancelled_cog_registration_cleans_started_runner(self):
+        cog = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+        bot = SimpleNamespace(add_cog=AsyncMock(side_effect=asyncio.CancelledError))
+        with patch.object(webadmin_cog, "WebAdminCog", return_value=cog):
+            with self.assertRaises(asyncio.CancelledError):
+                await webadmin_cog.setup(bot)
+        cog.close.assert_awaited_once_with()
+
 
 class WebAdminAtomicSettingsTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.settings_dir = pathlib.Path(self.directory.name)
+        self.settings_dir = pathlib.Path(self.directory.name) / "settings"
+        self.settings_dir.mkdir()
         self.patch = patch.object(config, "SETTINGS_DIR", self.settings_dir)
         self.patch.start()
         self.addCleanup(self.patch.stop)
@@ -3621,29 +3660,101 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         events = []
         real_fsync = config.os.fsync
         real_replace = config.os.replace
+        real_open_temporary = config._open_temporary_at
+        file_descriptor = None
+        file_mode = None
+
+        class RecordingTemporaryFile:
+            def __init__(self, fp):
+                self.fp = fp
+            def __enter__(self):
+                self.fp.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.fp.__exit__(*args)
+
+            def write(self, payload):
+                return self.fp.write(payload)
+
+            def flush(self):
+                events.append("flush")
+                return self.fp.flush()
+
+            def fileno(self):
+                return self.fp.fileno()
+
+        def record_open_temporary(directory_fd, target_name):
+            nonlocal file_descriptor, file_mode
+            temporary_name, fp = real_open_temporary(directory_fd, target_name)
+            file_descriptor = fp.fileno()
+            file_mode = os.fstat(file_descriptor).st_mode & 0o777
+            return temporary_name, RecordingTemporaryFile(fp)
 
         def record_fsync(fd):
-            events.append("fsync")
+            events.append("file-fsync" if fd == file_descriptor else "directory-fsync")
             return real_fsync(fd)
 
-        def record_replace(source, destination):
+        def record_replace(source, destination, **kwargs):
             events.append("replace")
-            return real_replace(source, destination)
+            self.assertEqual(kwargs["src_dir_fd"], kwargs["dst_dir_fd"])
+            self.assertEqual(pathlib.Path(source).name, source)
+            self.assertEqual(destination, "forbidden_words.json")
+            return real_replace(source, destination, **kwargs)
 
         with patch.object(config.os, "fsync", side_effect=record_fsync), patch.object(
             config.os, "replace", side_effect=record_replace
         ), patch.object(
-            config.tempfile,
-            "NamedTemporaryFile",
-            wraps=config.tempfile.NamedTemporaryFile,
-        ) as named:
+            config, "_open_temporary_at", side_effect=record_open_temporary
+        ) as opened:
             config.atomic_write_settings("forbidden_words.json", ["new"])
 
-        self.assertEqual(events, ["fsync", "replace", "fsync"])
+        self.assertEqual(
+            events, ["flush", "file-fsync", "replace", "directory-fsync"]
+        )
         self.assertEqual(json.loads(target.read_text(encoding="utf-8")), ["new"])
-        self.assertEqual(named.call_args.kwargs["dir"], self.settings_dir)
-        self.assertIs(named.call_args.kwargs["delete"], False)
+        self.assertEqual(opened.call_args.args[1], "forbidden_words.json")
+        self.assertEqual(file_mode, 0o600)
         self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
+
+    def test_loader_valid_games_default_roles_is_accepted_and_invalid_types_rejected(self):
+        document = {"Game": {"max_players": 2}}
+        config.atomic_write_settings("games.json", document)
+        self.assertEqual(
+            json.loads((self.settings_dir / "games.json").read_text(encoding="utf-8")),
+            document,
+        )
+        with patch.object(config, "SETTINGS_DIR", self.settings_dir):
+            self.assertEqual(
+                config.load_games(),
+                {"Game": {"max_players": 2, "roles": []}},
+            )
+        original = (self.settings_dir / "games.json").read_bytes()
+        for invalid in (
+            {"Game": {"max_players": True}},
+            {"Game": {"max_players": 2, "roles": [1]}},
+            {"Game": "invalid"},
+        ):
+            with self.subTest(document=invalid), self.assertRaises(ValueError):
+                config.atomic_write_settings("games.json", invalid)
+            self.assertEqual((self.settings_dir / "games.json").read_bytes(), original)
+
+    def test_persona_and_forbidden_validation_share_loader_semantics(self):
+        config.atomic_write_settings("persona.json", {"greeting": "hello"})
+        self.assertEqual(
+            json.loads((self.settings_dir / "persona.json").read_text()),
+            {"greeting": "hello"},
+        )
+        config.atomic_write_settings("forbidden_words.json", [1, "", "Word"])
+        with patch.object(config, "SETTINGS_DIR", self.settings_dir):
+            self.assertEqual(forbiddenfilter_cog.load_forbidden_words(), ["1", "word"])
+        for name, invalid in (
+            ("persona.json", []),
+            ("persona.json", {"greeting": 3}),
+            ("forbidden_words.json", {}),
+        ):
+            with self.subTest(name=name, document=invalid), self.assertRaises(ValueError):
+                config.atomic_write_settings(name, invalid)
 
     def test_invalid_disallowed_and_symlink_documents_preserve_bytes(self):
         target = self.settings_dir / "games.json"
@@ -3658,6 +3769,7 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
 
         link = self.settings_dir / "persona.json"
         link.symlink_to(target)
+        self.assertEqual(webadmin_cog.WebAdminCog._settings_text("persona.json"), "")
         with self.assertRaises(ValueError):
             config.atomic_write_settings("persona.json", {})
         self.assertEqual(target.read_bytes(), original)
@@ -3677,6 +3789,36 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
                 config.atomic_write_settings("forbidden_words.json", ["valid"])
         self.assertEqual(target.read_bytes(), original)
         self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
+
+    def test_directory_replacement_cannot_redirect_atomic_write_or_read(self):
+        target = self.settings_dir / "forbidden_words.json"
+        target.write_bytes(b'["old"]\n')
+        moved = self.settings_dir.with_name("pinned-settings")
+        real_open_temporary = config._open_temporary_at
+
+        def swap_after_open(directory_fd, target_name):
+            self.settings_dir.rename(moved)
+            self.settings_dir.mkdir()
+            return real_open_temporary(directory_fd, target_name)
+
+        with patch.object(config, "_open_temporary_at", side_effect=swap_after_open):
+            config.atomic_write_settings("forbidden_words.json", ["new"])
+        self.assertEqual(json.loads((moved / "forbidden_words.json").read_text()), ["new"])
+        self.assertFalse((self.settings_dir / "forbidden_words.json").exists())
+
+        (self.settings_dir / "persona.json").write_text('{"greeting":"decoy"}')
+        real_open_directory = config._open_settings_directory
+
+        def swap_before_read(*, create):
+            directory_fd = real_open_directory(create=create)
+            replacement = self.settings_dir.with_name("decoy-settings")
+            self.settings_dir.rename(replacement)
+            moved.rename(self.settings_dir)
+            return directory_fd
+
+        with patch.object(config, "_open_settings_directory", side_effect=swap_before_read):
+            data = config.read_settings_bytes("persona.json")
+        self.assertEqual(data, b'{"greeting":"decoy"}')
 
 
 class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
@@ -3715,7 +3857,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 303)
         session_id = response.cookies[webadmin_cog.SESSION_COOKIE].value
-        return session_id, self.cog.sessions[session_id]
+        return session_id, self.cog.sessions[session_id].csrf
 
     async def test_auth_redirect_headers_cookie_and_non_reflection(self):
         response = await self.client.get("/", allow_redirects=False)
@@ -3725,6 +3867,18 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.client.post("/announce", data={})
         self.assertEqual(response.status, 401)
+        oversized = await self.client.post(
+            "/announce",
+            data=b"x" * (webadmin_cog.MAX_BODY_BYTES + 1),
+            headers={"Content-Type": "text/plain"},
+        )
+        self.assertEqual(oversized.status, 401)
+        malformed = await self.client.post(
+            "/settings/games.json",
+            data=b"csrf=%ZZ",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(malformed.status, 401)
         failed = await self.client.post(
             "/login", data={"token": "operator-secret-wrong"}
         )
@@ -3758,8 +3912,9 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(morsel["httponly"])
         self.assertEqual(morsel["samesite"], "Strict")
         self.assertEqual(morsel["path"], "/")
+        self.assertEqual(morsel["max-age"], str(webadmin_cog.SESSION_TTL_SECONDS))
         session_id = morsel.value
-        csrf = self.cog.sessions[session_id]
+        csrf = self.cog.sessions[session_id].csrf
 
         rejected = await self.client.post(
             "/settings/forbidden_words.json", data={"document": "[]"}
@@ -3781,6 +3936,33 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         restarted = webadmin_cog.WebAdminCog(self.bot, self.repository)
         self.assertEqual(restarted.sessions, {})
+
+    async def test_session_expiry_relogin_revocation_and_stale_cookie(self):
+        with patch.object(webadmin_cog.time, "monotonic", return_value=100.0):
+            first_id, _ = await self._login()
+        with patch.object(webadmin_cog.time, "monotonic", return_value=101.0):
+            second_id, _ = await self._login()
+        self.assertNotEqual(first_id, second_id)
+        self.assertNotIn(first_id, self.cog.sessions)
+        self.assertEqual(list(self.cog.sessions), [second_id])
+
+        self.client.session.cookie_jar.update_cookies(
+            {webadmin_cog.SESSION_COOKIE: first_id}, self.client.make_url("/")
+        )
+        stale = await self.client.get("/", allow_redirects=False)
+        self.assertEqual((stale.status, stale.headers["Location"]), (302, "/login"))
+
+        self.client.session.cookie_jar.update_cookies(
+            {webadmin_cog.SESSION_COOKIE: second_id}, self.client.make_url("/")
+        )
+        with patch.object(
+            webadmin_cog.time,
+            "monotonic",
+            return_value=101.0 + webadmin_cog.SESSION_TTL_SECONDS,
+        ):
+            expired = await self.client.get("/", allow_redirects=False)
+        self.assertEqual((expired.status, expired.headers["Location"]), (302, "/login"))
+        self.assertEqual(self.cog.sessions, {})
 
     async def test_settings_validation_reload_notices_and_html_escape(self):
         session_id, csrf = await self._login()
@@ -3806,6 +3988,20 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("다시 불러왔습니다", await saved.text())
         reload_cog.load_prohibited_words.assert_called_once_with()
 
+        persona = await self.client.post(
+            "/settings/persona.json",
+            data={
+                "csrf": csrf,
+                "document": json.dumps({"system_prompt": "p", "greeting": "g"}),
+            },
+        )
+        self.assertIn("새 AI 세션부터", await persona.text())
+        games = await self.client.post(
+            "/settings/games.json",
+            data={"csrf": csrf, "document": '{"Game":{"max_players":2}}'},
+        )
+        self.assertIn("봇을 재시작", await games.text())
+
         (self.settings_dir / "persona.json").write_text(
             json.dumps(
                 {"system_prompt": "</textarea><script>x</script>", "greeting": "hi"}
@@ -3818,6 +4014,18 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;/textarea&gt;&lt;script&gt;", page)
         self.assertIn(session_id, self.cog.sessions)
 
+    def test_template_replaces_original_placeholders_once(self):
+        page = self.cog._template(
+            "admin_index.html",
+            csrf="csrf",
+            notice="",
+            persona='{"system_prompt":"{{games}}"}',
+            forbidden_words='["{{games}}"]',
+            games='{"Game":{"max_players":2}}',
+        )
+        self.assertEqual(page.count("{{games}}"), 2)
+        self.assertIn("{&quot;Game&quot;:{&quot;max_players&quot;:2}}", page)
+
     async def test_content_length_and_actual_body_bytes_are_bounded(self):
         response = await self.client.post(
             "/login",
@@ -3826,16 +4034,41 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 413)
 
-        request = SimpleNamespace(
-            content_length=None,
-            content=SimpleNamespace(
-                read=AsyncMock(
-                    return_value=b"x" * (webadmin_cog.MAX_BODY_BYTES + 1)
-                )
-            ),
+        async def slow_chunks():
+            yield b"token=operator-secret"
+            await asyncio.sleep(0)
+            yield b"&padding=" + b"x" * webadmin_cog.MAX_BODY_BYTES
+
+        chunked = await self.client.post(
+            "/login",
+            data=slow_chunks(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with self.assertRaises(web.HTTPRequestEntityTooLarge):
-            await self.cog._read_form(request)
+        self.assertEqual(chunked.status, 413)
+
+    async def test_form_content_type_strict_decoding_and_generic_500_headers(self):
+        _, csrf = await self._login()
+        wrong_type = await self.client.post(
+            "/announce",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(wrong_type.status, 415)
+        malformed = await self.client.post(
+            "/announce",
+            data=b"csrf=%ZZ&title=t&body=b",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(malformed.status, 400)
+
+        with patch.object(self.cog, "_index_response", side_effect=RuntimeError("boom")), patch.object(
+            webadmin_cog.logger, "exception"
+        ):
+            failed = await self.client.get("/")
+        self.assertEqual(failed.status, 500)
+        for key, value in webadmin_cog.SECURITY_HEADERS.items():
+            self.assertEqual(failed.headers[key], value)
+        self.assertNotIn(csrf, await failed.text())
 
 
 class _AnnouncementChannel:
@@ -3888,14 +4121,17 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             # guild 5 is inaccessible
             999: _AnnouncementGuild({999: _AnnouncementChannel()}),  # opted out
         }
-        response = await self.client.post(
-            "/announce",
-            data={"csrf": csrf, "title": "Title", "body": "Body"},
-        )
+        with patch.object(webadmin_cog.logger, "exception") as logged:
+            response = await self.client.post(
+                "/announce",
+                data={"csrf": csrf, "title": "Title", "body": "Body"},
+            )
         page = await response.text()
         self.assertIn("성공 1, 건너뜀 3, 실패 1", page)
         self.assertEqual(len(sent.embeds), 1)
         self.assertEqual((sent.embeds[0].title, sent.embeds[0].description), ("Title", "Body"))
+        logged.assert_called_once()
+        self.assertEqual(logged.call_args.args[-1], 4)
         self.assertIn(session_id, self.cog.sessions)
 
     async def test_announcement_rejects_empty_and_discord_overlimit_text(self):
