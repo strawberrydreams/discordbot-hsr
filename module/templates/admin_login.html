@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>봇 관리자 로그인</title>
+  <style>body{font:16px system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem}label,input,button{display:block;width:100%;box-sizing:border-box}input,button{padding:.7rem;margin:.5rem 0}.error{color:#b00020}</style>
+</head>
+<body>
+  <h1>봇 관리자 로그인</h1>
+  <p class="error">{{error}}</p>
+  <form method="post" action="/login">
+    <label>관리 토큰<input type="password" name="token" required autocomplete="current-password"></label>
+    <button type="submit">로그인</button>
+  </form>
+</body>
+</html>

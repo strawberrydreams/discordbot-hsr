@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import pathlib
+import secrets
 import tempfile
 import threading
 import unittest
@@ -12,11 +13,13 @@ import warnings
 from datetime import datetime, timezone
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import discord
 import httpx
 import openai
+from aiohttp import CookieJar, web
+from aiohttp.test_utils import TestClient, TestServer
 
 import module.config as config
 import module.main as bot_main
@@ -48,6 +51,7 @@ from module.music_cog import (
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.backup as backup
+import module.webadmin_cog as webadmin_cog
 
 
 
@@ -3535,3 +3539,376 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
         self.assertIn("old greeting", old_hello.response.messages[0][0][0])
         self.assertIn("new greeting", new_hello.response.messages[0][0][0])
+
+
+class _WebSettingsRepository:
+    def __init__(self, guild_ids=(), channels=None):
+        self.guild_ids = list(guild_ids)
+        self.channels = dict(channels or {})
+
+    def list_announcement_guild_ids(self):
+        return list(self.guild_ids)
+
+    def get_party_channel(self, guild_id):
+        value = self.channels.get(guild_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class _WebBot:
+    def __init__(self):
+        self.guilds = {}
+        self.cogs = {}
+
+    def get_guild(self, guild_id):
+        return self.guilds.get(guild_id)
+
+    def get_cog(self, name):
+        return self.cogs.get(name)
+
+
+class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
+    def test_web_admin_is_the_only_extension_skipped_without_admin_token(self):
+        env = {
+            "ADMIN_TOKEN": None,
+            "OPENAI_API_KEY": "openai",
+            "GOOGLE_API_KEY": "google",
+        }
+        with patch.object(bot_main, "ENV_VALUES", env):
+            names = bot_main.available_extensions()
+        self.assertNotIn("module.webadmin_cog", names)
+        self.assertIn("module.guildsettings_cog", names)
+        self.assertIn("module.hyacine_chat_cog", names)
+
+    def test_web_admin_loads_only_with_admin_token(self):
+        env = {
+            "ADMIN_TOKEN": "secret",
+            "OPENAI_API_KEY": None,
+            "GOOGLE_API_KEY": None,
+        }
+        with patch.object(bot_main, "ENV_VALUES", env):
+            names = bot_main.available_extensions()
+        self.assertIn("module.webadmin_cog", names)
+        self.assertNotIn("module.hyacine_chat_cog", names)
+
+    async def test_fixed_loopback_bind_and_idempotent_cleanup(self):
+        runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+        site = SimpleNamespace(start=AsyncMock())
+        cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
+        with patch.object(webadmin_cog.web, "AppRunner", return_value=runner), patch.object(
+            webadmin_cog.web, "TCPSite", return_value=site
+        ) as site_factory:
+            await cog.start()
+            site_factory.assert_called_once_with(runner, "127.0.0.1", 8080)
+            await cog.cog_unload()
+            await cog.close()  # bot close after extension unload
+        runner.cleanup.assert_awaited_once()
+
+
+class WebAdminAtomicSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.settings_dir = pathlib.Path(self.directory.name)
+        self.patch = patch.object(config, "SETTINGS_DIR", self.settings_dir)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.addCleanup(self.directory.cleanup)
+
+    def test_valid_write_flushes_replaces_and_syncs_directory_in_order(self):
+        target = self.settings_dir / "forbidden_words.json"
+        target.write_bytes(b'["old"]\n')
+        events = []
+        real_fsync = config.os.fsync
+        real_replace = config.os.replace
+
+        def record_fsync(fd):
+            events.append("fsync")
+            return real_fsync(fd)
+
+        def record_replace(source, destination):
+            events.append("replace")
+            return real_replace(source, destination)
+
+        with patch.object(config.os, "fsync", side_effect=record_fsync), patch.object(
+            config.os, "replace", side_effect=record_replace
+        ), patch.object(
+            config.tempfile,
+            "NamedTemporaryFile",
+            wraps=config.tempfile.NamedTemporaryFile,
+        ) as named:
+            config.atomic_write_settings("forbidden_words.json", ["new"])
+
+        self.assertEqual(events, ["fsync", "replace", "fsync"])
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), ["new"])
+        self.assertEqual(named.call_args.kwargs["dir"], self.settings_dir)
+        self.assertIs(named.call_args.kwargs["delete"], False)
+        self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
+
+    def test_invalid_disallowed_and_symlink_documents_preserve_bytes(self):
+        target = self.settings_dir / "games.json"
+        original = b'{"Good":{"max_players":2,"roles":[]}}\n'
+        target.write_bytes(original)
+        with self.assertRaises(ValueError):
+            config.atomic_write_settings("games.json", {"Bad": "not an object"})
+        self.assertEqual(target.read_bytes(), original)
+        with self.assertRaises(ValueError):
+            config.atomic_write_settings("../games.json", {})
+        self.assertEqual(target.read_bytes(), original)
+
+        link = self.settings_dir / "persona.json"
+        link.symlink_to(target)
+        with self.assertRaises(ValueError):
+            config.atomic_write_settings("persona.json", {})
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_oversized_output_and_replace_failure_preserve_original(self):
+        target = self.settings_dir / "forbidden_words.json"
+        original = b'["old"]\n'
+        target.write_bytes(original)
+        with self.assertRaises(ValueError):
+            config.atomic_write_settings(
+                "forbidden_words.json", ["x" * config.MAX_SETTINGS_BYTES]
+            )
+        self.assertEqual(target.read_bytes(), original)
+
+        with patch.object(config.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                config.atomic_write_settings("forbidden_words.json", ["valid"])
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
+
+
+class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.settings_dir = pathlib.Path(self.directory.name)
+        for name, document in {
+            "persona.json": {"system_prompt": "prompt", "greeting": "hello"},
+            "forbidden_words.json": ["bad"],
+            "games.json": {"Game": {"max_players": 2, "roles": []}},
+        }.items():
+            (self.settings_dir / name).write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+        self.token_patch = patch.object(config, "ADMIN_TOKEN", "operator-secret")
+        self.dir_patch = patch.object(config, "SETTINGS_DIR", self.settings_dir)
+        self.token_patch.start()
+        self.dir_patch.start()
+        self.bot = _WebBot()
+        self.repository = _WebSettingsRepository()
+        self.cog = webadmin_cog.WebAdminCog(self.bot, self.repository)
+        self.client = TestClient(
+            TestServer(self.cog.app), cookie_jar=CookieJar(unsafe=True)
+        )
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.dir_patch.stop()
+        self.token_patch.stop()
+        self.directory.cleanup()
+
+    async def _login(self):
+        response = await self.client.post(
+            "/login", data={"token": "operator-secret"}, allow_redirects=False
+        )
+        self.assertEqual(response.status, 303)
+        session_id = response.cookies[webadmin_cog.SESSION_COOKIE].value
+        return session_id, self.cog.sessions[session_id]
+
+    async def test_auth_redirect_headers_cookie_and_non_reflection(self):
+        response = await self.client.get("/", allow_redirects=False)
+        self.assertEqual((response.status, response.headers["Location"]), (302, "/login"))
+        for key, value in webadmin_cog.SECURITY_HEADERS.items():
+            self.assertEqual(response.headers[key], value)
+
+        response = await self.client.post("/announce", data={})
+        self.assertEqual(response.status, 401)
+        failed = await self.client.post(
+            "/login", data={"token": "operator-secret-wrong"}
+        )
+        self.assertEqual(failed.status, 401)
+        self.assertNotIn("operator-secret-wrong", await failed.text())
+
+        with patch.object(
+            webadmin_cog.secrets,
+            "compare_digest",
+            wraps=secrets.compare_digest,
+        ) as compared:
+            session_id, csrf = await self._login()
+        compared.assert_called_with(b"operator-secret", b"operator-secret")
+        self.assertGreaterEqual(len(session_id), 32)
+        self.assertGreaterEqual(len(csrf), 32)
+        self.assertNotEqual(session_id, "operator-secret")
+        cookie = self.client.session.cookie_jar.filter_cookies(
+            self.client.make_url("/")
+        )[webadmin_cog.SESSION_COOKIE]
+        self.assertNotEqual(cookie.value, "operator-secret")
+
+        index = await self.client.get("/")
+        page = await index.text()
+        self.assertNotIn("operator-secret", page)
+
+    async def test_cookie_attributes_csrf_logout_and_restart_memory(self):
+        response = await self.client.post(
+            "/login", data={"token": "operator-secret"}, allow_redirects=False
+        )
+        morsel = response.cookies[webadmin_cog.SESSION_COOKIE]
+        self.assertTrue(morsel["httponly"])
+        self.assertEqual(morsel["samesite"], "Strict")
+        self.assertEqual(morsel["path"], "/")
+        session_id = morsel.value
+        csrf = self.cog.sessions[session_id]
+
+        rejected = await self.client.post(
+            "/settings/forbidden_words.json", data={"document": "[]"}
+        )
+        self.assertEqual(rejected.status, 403)
+        rejected = await self.client.post(
+            "/logout", data={"csrf": "wrong"}, allow_redirects=False
+        )
+        self.assertEqual(rejected.status, 403)
+        self.assertIn(session_id, self.cog.sessions)
+
+        logout = await self.client.post(
+            "/logout", data={"csrf": csrf}, allow_redirects=False
+        )
+        self.assertEqual(logout.status, 303)
+        self.assertNotIn(session_id, self.cog.sessions)
+        self.assertEqual(
+            logout.cookies[webadmin_cog.SESSION_COOKIE]["max-age"], "0"
+        )
+        restarted = webadmin_cog.WebAdminCog(self.bot, self.repository)
+        self.assertEqual(restarted.sessions, {})
+
+    async def test_settings_validation_reload_notices_and_html_escape(self):
+        session_id, csrf = await self._login()
+        original = (self.settings_dir / "games.json").read_bytes()
+        invalid = await self.client.post(
+            "/settings/games.json",
+            data={"csrf": csrf, "document": "{broken"},
+        )
+        self.assertEqual(invalid.status, 200)
+        self.assertEqual((self.settings_dir / "games.json").read_bytes(), original)
+        denied = await self.client.post(
+            "/settings/not-allowed.json",
+            data={"csrf": csrf, "document": "{}"},
+        )
+        self.assertEqual(denied.status, 404)
+
+        reload_cog = SimpleNamespace(load_prohibited_words=Mock())
+        self.bot.cogs["ForbiddenFilterCog"] = reload_cog
+        saved = await self.client.post(
+            "/settings/forbidden_words.json",
+            data={"csrf": csrf, "document": '["new"]'},
+        )
+        self.assertIn("다시 불러왔습니다", await saved.text())
+        reload_cog.load_prohibited_words.assert_called_once_with()
+
+        (self.settings_dir / "persona.json").write_text(
+            json.dumps(
+                {"system_prompt": "</textarea><script>x</script>", "greeting": "hi"}
+            ),
+            encoding="utf-8",
+        )
+        index = await self.client.get("/")
+        page = await index.text()
+        self.assertNotIn("</textarea><script>", page)
+        self.assertIn("&lt;/textarea&gt;&lt;script&gt;", page)
+        self.assertIn(session_id, self.cog.sessions)
+
+    async def test_content_length_and_actual_body_bytes_are_bounded(self):
+        response = await self.client.post(
+            "/login",
+            data=b"x" * (webadmin_cog.MAX_BODY_BYTES + 1),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(response.status, 413)
+
+        request = SimpleNamespace(
+            content_length=None,
+            content=SimpleNamespace(
+                read=AsyncMock(
+                    return_value=b"x" * (webadmin_cog.MAX_BODY_BYTES + 1)
+                )
+            ),
+        )
+        with self.assertRaises(web.HTTPRequestEntityTooLarge):
+            await self.cog._read_form(request)
+
+
+class _AnnouncementChannel:
+    type = discord.ChannelType.text
+
+    def __init__(self, error=None, allowed=True):
+        self.error = error
+        self.allowed = allowed
+        self.embeds = []
+
+    def permissions_for(self, member):
+        return SimpleNamespace(
+            view_channel=self.allowed,
+            send_messages=self.allowed,
+            embed_links=self.allowed,
+        )
+
+    async def send(self, *, embed):
+        if self.error:
+            raise self.error
+        self.embeds.append(embed)
+
+
+class _AnnouncementGuild:
+    def __init__(self, channels):
+        self.channels = channels
+        self.me = object()
+
+    def get_channel(self, channel_id):
+        return self.channels.get(channel_id)
+
+
+class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebAdminHTTPTests.asyncSetUp
+    asyncTearDown = WebAdminHTTPTests.asyncTearDown
+    _login = WebAdminHTTPTests._login
+
+    async def test_only_opted_in_accessible_channels_receive_isolated_announcement(self):
+        session_id, csrf = await self._login()
+        sent = _AnnouncementChannel()
+        forbidden = _AnnouncementChannel(allowed=False)
+        broken = _AnnouncementChannel(error=RuntimeError("discord unavailable"))
+        self.repository.guild_ids = [1, 2, 3, 4, 5]
+        self.repository.channels = {1: 11, 2: 22, 3: 33, 4: 44, 5: 55}
+        self.bot.guilds = {
+            1: _AnnouncementGuild({11: sent}),
+            2: _AnnouncementGuild({22: forbidden}),
+            3: _AnnouncementGuild({}),
+            4: _AnnouncementGuild({44: broken}),
+            # guild 5 is inaccessible
+            999: _AnnouncementGuild({999: _AnnouncementChannel()}),  # opted out
+        }
+        response = await self.client.post(
+            "/announce",
+            data={"csrf": csrf, "title": "Title", "body": "Body"},
+        )
+        page = await response.text()
+        self.assertIn("성공 1, 건너뜀 3, 실패 1", page)
+        self.assertEqual(len(sent.embeds), 1)
+        self.assertEqual((sent.embeds[0].title, sent.embeds[0].description), ("Title", "Body"))
+        self.assertIn(session_id, self.cog.sessions)
+
+    async def test_announcement_rejects_empty_and_discord_overlimit_text(self):
+        _, csrf = await self._login()
+        for title, body in (
+            ("", "body"),
+            ("t" * 257, "body"),
+            ("title", ""),
+            ("title", "b" * 4_097),
+        ):
+            with self.subTest(title_length=len(title), body_length=len(body)):
+                response = await self.client.post(
+                    "/announce", data={"csrf": csrf, "title": title, "body": body}
+                )
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.repository.guild_ids, [])

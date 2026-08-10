@@ -1,6 +1,8 @@
 # Configuration Module
 import json
 import os
+import tempfile
+from contextvars import ContextVar
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,6 +46,10 @@ SETTINGS_FILES: tuple[str, ...] = (
     "forbidden_words.json",
     "games.json",
 )
+MAX_SETTINGS_BYTES = 256 * 1024
+_SETTINGS_DOCUMENT: ContextVar[tuple[str, object] | None] = ContextVar(
+    "settings_document", default=None
+)
 
 
 def load_settings_json(*names: str, default):
@@ -53,6 +59,10 @@ def load_settings_json(*names: str, default):
     커밋된 *.example.json으로 떨어지는 용도다. 전부 실패하면 default를 돌려준다.
     운영자 설정 하나가 없다고 봇 전체가 죽으면 안 된다.
     """
+    override = _SETTINGS_DOCUMENT.get()
+    if override is not None and override[0] in names:
+        return override[1]
+
     for name in names:
         path = SETTINGS_DIR / name
         try:
@@ -65,9 +75,74 @@ def load_settings_json(*names: str, default):
             continue
     return default
 
+
+def _validate_settings_document(name: str, document: object) -> None:
+    """실서비스 loader가 손실 없이 받아들이는 문서만 저장한다."""
+    token = _SETTINGS_DOCUMENT.set((name, document))
+    try:
+        if name == "persona.json":
+            from module.hyacine_chat_cog import DEFAULT_PERSONA, load_persona
+
+            loaded = load_persona()
+            try:
+                expected = {**DEFAULT_PERSONA, **document}  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise ValueError("persona.json 최상단은 객체여야 합니다.") from exc
+            valid = loaded == expected
+        elif name == "forbidden_words.json":
+            from module.forbiddenfilter_cog import load_forbidden_words
+
+            loaded = load_forbidden_words()
+            valid = isinstance(document, list) and len(loaded) == len(document)
+        elif name == "games.json":
+            loaded = load_games()
+            valid = loaded == document
+        else:
+            raise ValueError("허용되지 않은 설정 파일입니다.")
+    finally:
+        _SETTINGS_DOCUMENT.reset(token)
+    if not valid:
+        raise ValueError(f"{name} 설정 형식 또는 크기 제한을 확인하세요.")
+
+
+def atomic_write_settings(name: str, document: object) -> None:
+    """허용된 설정 JSON을 검증한 뒤 같은 디렉터리에서 원자 교체한다."""
+    if name not in SETTINGS_FILES:
+        raise ValueError("허용되지 않은 설정 파일입니다.")
+    target = SETTINGS_DIR / name
+    if target.is_symlink():
+        raise ValueError("심볼릭 링크 설정 파일은 저장할 수 없습니다.")
+
+    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+    if len(payload) > MAX_SETTINGS_BYTES:
+        raise ValueError("설정 파일이 너무 큽니다.")
+    _validate_settings_document(name, document)
+
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=SETTINGS_DIR, prefix=f".{name}.", delete=False
+        ) as fp:
+            temporary = Path(fp.name)
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        directory_fd = os.open(SETTINGS_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or None
 CHAT_MODEL_LIGHT = os.getenv("CHAT_MODEL_LIGHT", "gpt-5.6-terra")
 CHAT_MODEL_DEEP = os.getenv("CHAT_MODEL_DEEP", "gpt-5.6-sol")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")

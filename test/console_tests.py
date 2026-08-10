@@ -244,6 +244,7 @@ def test_public_env_contract():
         "DISCORD_TOKEN",
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
+        "ADMIN_TOKEN",
         "DATA_DIR",
         "BACKUP_DIR",
         "SETTINGS_DIR",
@@ -259,7 +260,7 @@ def test_public_env_contract():
         "LIMIT_IMAGE",
     }
     check("공개 env 변수 계약", set(example) == expected)
-    check("죽은 ADMIN_TOKEN 비공개", "ADMIN_TOKEN" not in example)
+    check("관리 토큰 env 예제는 빈 값", example["ADMIN_TOKEN"] == "")
     check(
         "실제 env 파일 ignore",
         all(
@@ -283,6 +284,31 @@ def test_public_env_contract():
         ).returncode
         == 0,
     )
+
+
+def test_web_admin_atomic_settings_contract():
+    import module.config as config
+
+    settings_dir = _TMP_DIR / "web-admin-settings"
+    settings_dir.mkdir()
+    target = settings_dir / "forbidden_words.json"
+    target.write_bytes(b'["old"]\n')
+    with patch.object(config, "SETTINGS_DIR", settings_dir):
+        config.atomic_write_settings("forbidden_words.json", ["new"])
+        check(
+            "관리 설정 정상 원자 교체",
+            json.loads(target.read_text(encoding="utf-8")) == ["new"],
+        )
+        valid_bytes = target.read_bytes()
+        try:
+            config.atomic_write_settings("forbidden_words.json", {})
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(
+            "관리 설정 validation 실패 시 원본 보존",
+            rejected and target.read_bytes() == valid_bytes,
+        )
 
 
 def test_forbidden_word_document_path():
@@ -1757,6 +1783,7 @@ def test_imports():
         "module.playwith_cog",
         "module.eventnotice_cog",
         "module.forbiddenfilter_cog",
+        "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
         "module.finance_cog",
@@ -2952,6 +2979,7 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
+        test_web_admin_atomic_settings_contract()
         test_forbidden_word_document_path()
         test_readme_public_distribution_contract()
         test_operations_document_contract()
