@@ -181,9 +181,10 @@ def _copy_setting(source: Path, temporary: Path) -> bool:
         if exc.errno == errno.ELOOP:
             raise RuntimeError(f"설정 파일 symlink는 백업하지 않습니다: {source}") from exc
         raise RuntimeError(f"설정 파일을 열 수 없습니다: {source}") from exc
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError(f"설정 경로가 일반 파일이 아닙니다: {source}")
     with os.fdopen(descriptor, "rb") as input_file:
-        if not stat.S_ISREG(os.fstat(input_file.fileno()).st_mode):
-            raise RuntimeError(f"설정 경로가 일반 파일이 아닙니다: {source}")
         with temporary.open("wb") as output_file:
             shutil.copyfileobj(input_file, output_file)
     return True

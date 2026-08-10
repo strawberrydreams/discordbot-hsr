@@ -432,7 +432,7 @@ docker compose build bot""" in quick_start,
     )
     check(
         "설치 ownership은 image UID/GID와 restrictive mode를 exact 검증",
-        '''BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+        r'''BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
 BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
 sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
 sudo find settings runtime -type d -exec chmod 700 {} +
@@ -1132,7 +1132,10 @@ def test_startup_cog_failure_stops_postverification_and_sync():
         events.append(f"verify:{path.name}")
         return {}
 
-    with patch.object(pathlib.Path, "exists", return_value=True), \
+    with patch.object(main, "available_extensions", return_value=[
+             main.EXTENSIONS[0][0], main.EXTENSIONS[1][0]
+         ]), \
+         patch.object(pathlib.Path, "exists", return_value=True), \
          patch.object(main, "verify_database", side_effect=verify):
         try:
             asyncio.run(main.MyBot.setup_hook(FakeBot()))
@@ -2459,6 +2462,7 @@ def test_legacy_backup_restore_and_prune():
         )
         conn.execute("INSERT INTO guild_settings VALUES (7, 700, 701)")
         conn.execute("PRAGMA user_version = 1")
+        conn.commit()
     with closing(sqlite3.connect(party_path)) as conn:
         conn.execute("PRAGMA user_version = 0")
     backup_dir.mkdir(parents=True)

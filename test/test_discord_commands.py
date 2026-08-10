@@ -689,7 +689,8 @@ class MusicPlayerStateTests(_PatchedPlaybackTests):
 
         self.assertEqual(player.current, _music_track(2))
         self.assertEqual(len(voice.sources), 1)
-        self.assertTrue(self.sources[0].url.endswith("곡2"))
+        self.assertTrue(voice.sources[0].url.endswith("곡2"))
+        self.assertTrue(self.sources[0].cleaned)
 
     async def test_dead_link_is_skipped_and_the_queue_keeps_playing(self):
         player = MusicPlayer(TEST_GUILD_ID)
@@ -1169,11 +1170,11 @@ class MusicPanelTests(_PatchedPlaybackTests):
             channel = VoiceChannel(guild)
             interaction = _MusicInteraction(guild, voice_channel=channel)
             await cog.add_url(interaction, "https://example.com/song")
+            self.assertIsNotNone(settings.get_music_panel_msg(guild.id))
 
         extract.assert_awaited_once_with("https://example.com/song", 123)
         start.assert_awaited_once_with()
         self.assertEqual(cog.get_player(guild.id).snapshot().queue, (track,))
-        self.assertIsNotNone(settings.get_music_panel_msg(guild.id))
         self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
     async def test_initial_voice_play_failure_reports_error_and_preserves_queue(self):
@@ -1230,8 +1231,8 @@ class MusicPanelTests(_PatchedPlaybackTests):
                 self.assertTrue(
                     await self._wait_until(lambda: player.snapshot().error is not None)
                 )
+            message = guild.channel.messages[settings.get_music_panel_msg(guild.id)]
 
-        message = guild.channel.messages[settings.get_music_panel_msg(guild.id)]
         embed = message.edits[-1]["embed"]
         self.assertIn("재생 오류", embed.fields[0].value)
         self.assertEqual(player.snapshot().queue, (_music_track(2),))
@@ -1311,10 +1312,12 @@ class MusicPanelTests(_PatchedPlaybackTests):
             await cog.on_voice_state_update(
                 leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
             )
+            await self._settle()
+            panel_message_id = settings.get_music_panel_msg(guild.id)
+            self.assertIsNotNone(panel_message_id)
+            message = guild.channel.messages[panel_message_id]
 
         self.assertNotIn(guild.id, cog.players)
-        self.assertIsNotNone(settings.get_music_panel_msg(guild.id))
-        message = guild.channel.messages[settings.get_music_panel_msg(guild.id)]
         embed = message.edits[-1]["embed"]
         self.assertEqual(embed.fields[0].value, "⏹️ 대기 중")
 
@@ -2299,6 +2302,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
         party = SQLitePartyRepository(root / "party.db")
         settings = SQLiteGuildSettingsRepository(root / "settings.db")
         settings.set_party_channel(guild.id, guild.channel.id)
+        self.addCleanup(drop_panel_locks, guild.id)
         bot = _PartyBot(guild)
         patches = patch.object(playwith_cog, "GAMES", games) if games else None
         if patches:
