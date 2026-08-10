@@ -389,6 +389,10 @@ def test_final_installation_and_operations_contract():
     quick_start = readme.split("## 빠른 시작", 1)[1].split("## 운영 시 주의", 1)[0]
     restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
     restore_script = restore.split("```bash", 1)[1].split("```", 1)[0]
+    deployment = operations.split("## 배포", 1)[1].split("## 코드 롤백", 1)[0]
+    docker_deploy = deployment.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+    rollback = operations.split("## 코드 롤백", 1)[1].split("## 호스트 한계", 1)[0]
+    docker_rollback = rollback.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
 
     def ordered(text, *terms):
         cursor = -1
@@ -417,6 +421,14 @@ cp settings/games.example.json settings/games.json""" in quick_start,
             "Installation은 **Guild Install만**",
             "Discord에서 `/설정 시작`을 실행합니다.",
         ),
+    )
+    check(
+        "Docker quick-start는 host test virtualenv를 build 전에 설치",
+        """python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+docker compose config --quiet
+docker compose build bot""" in quick_start,
     )
     check(
         "설치 ownership은 image UID/GID와 restrictive mode를 exact 검증",
@@ -522,6 +534,72 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
             'sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime',
         ),
     )
+    trap_contract = (
+        "trap restore_bot_mounts EXIT",
+        "trap 'exit 129' HUP",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
+    )
+    mount_guard_contract = (
+        "restore_bot_mounts() {",
+        'sudo chown -R "$BOT_UID:$BOT_GID" settings runtime',
+        "sudo find settings runtime -type d -exec chmod 700 {} +",
+        "sudo find settings runtime -type f -exec chmod 600 {} +",
+        "verify_bot_mounts() {",
+        'test -z "$(sudo find settings runtime',
+        "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+        "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+    )
+    check(
+        "Docker deploy는 stop→host handoff→Git→restore/verify→trap clear→restart",
+        ordered(
+            docker_deploy,
+            "test -x .venv/bin/python",
+            "docker compose stop bot backup",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "trap restore_bot_mounts EXIT",
+            'sudo chown -R "$HOST_UID:$HOST_GID" settings',
+            "git pull --ff-only",
+            ".venv/bin/python -m test.console_tests",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "restore_bot_mounts",
+            "verify_bot_mounts",
+            "trap - EXIT HUP INT TERM",
+            "docker compose up -d --no-deps bot backup",
+        )
+        and all(term in docker_deploy for term in trap_contract + mount_guard_contract)
+        and 'sudo chown -R "$HOST_UID:$HOST_GID" settings runtime' not in docker_deploy,
+    )
+    check(
+        "Docker rollback은 stop→host handoff→Git→restore/verify→trap clear→restart",
+        ordered(
+            docker_rollback,
+            "test -x .venv/bin/python",
+            "docker compose stop bot backup",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "trap restore_bot_mounts EXIT",
+            'sudo chown -R "$HOST_UID:$HOST_GID" settings',
+            'revert) git revert "$TARGET_COMMIT"',
+            ".venv/bin/python -m test.console_tests",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "restore_bot_mounts",
+            "verify_bot_mounts",
+            "docker compose run --rm --no-deps backup python -m module.backup verify",
+            "trap - EXIT HUP INT TERM",
+            "docker compose up -d --no-deps bot backup",
+        )
+        and 'checkout) git checkout "$TARGET_COMMIT"' in docker_rollback
+        and all(term in docker_rollback for term in trap_contract + mount_guard_contract)
+        and 'sudo chown -R "$HOST_UID:$HOST_GID" settings runtime' not in docker_rollback,
+    )
+    check(
+        "모든 Docker host venv workflow는 setup과 executable guard에 연결",
+        "이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다." in operations
+        and ordered(docker_deploy, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests")
+        and ordered(docker_rollback, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests"),
+    )
     bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
     backup_service = compose.split("\n  backup:", 1)[1]
     check(
@@ -532,8 +610,12 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         and "ports:" not in bot_service
         and "ports:" not in backup_service,
     )
-    expected_healthcheck = """HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \\
-    CMD ["python", "-c", "import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)"]"""
+    expected_healthcheck = (
+        "HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 "
+        + chr(92)
+        + "\n"
+        + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
+    )
     check(
         "Docker runtime은 exact ffmpeg install과 main healthcheck",
         "apt-get install -y --no-install-recommends ffmpeg" in dockerfile

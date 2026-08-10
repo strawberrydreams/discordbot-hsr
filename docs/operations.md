@@ -2,6 +2,8 @@
 
 최초 설치와 환경 설정은 [README](../README.md)를 먼저 따르세요.
 
+이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다. Docker container에서 실행하는 명령은 `docker compose run`으로 따로 표시합니다.
+
 > launchd와 Docker를 동시에 실행하지 마세요. 같은 Discord 토큰과 SQLite 파일을 두 프로세스가 함께 사용하게 됩니다.
 
 ## 환경 설정
@@ -353,11 +355,14 @@ esac
 
 변경을 모아 한 번에 배포합니다. 두 방식 모두 **현재 코드로 온라인 백업 생성·검증 → pull → 테스트·빌드 → 봇·백업 재시작** 순서로 진행합니다. 이렇게 해야 새 코드의 스키마 마이그레이션 전에 구버전 DB 백업이 남습니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
+각 배포·롤백 workflow는 Git 작업 전에 host virtualenv executable 존재 여부를 확인합니다.
+
 macOS:
 
 ```bash
 (
 set -euo pipefail
+test -x .venv/bin/python
 git rev-parse HEAD
 .venv/bin/python -m module.backup create
 .venv/bin/python -m module.backup verify
@@ -374,14 +379,52 @@ Docker:
 ```bash
 (
 set -euo pipefail
+test -x .venv/bin/python
 git rev-parse HEAD
 BACKUP_MANIFEST=$(docker compose run --rm --no-deps backup python -m module.backup create | tail -n 1)
 test -n "$BACKUP_MANIFEST"
 docker compose run --rm --no-deps backup python -c 'from pathlib import Path; from module.backup import verify_backup_set; import sys; verify_backup_set(Path(sys.argv[1]))' "$BACKUP_MANIFEST"
+docker compose stop bot backup
+running_services=$(docker compose ps --status running --services)
+if grep -Eq '^(bot|backup)$' <<<"$running_services"; then
+  echo "Compose 서비스가 아직 실행 중입니다." >&2
+  exit 1
+fi
+
+BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+restore_bot_mounts() {
+  sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
+  sudo find settings runtime -type d -exec chmod 700 {} +
+  sudo find settings runtime -type f -exec chmod 600 {} +
+}
+verify_bot_mounts() {
+  test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" -o -perm -022 \) -print -quit)"
+  docker compose run --rm --no-deps --entrypoint sh bot -c '
+    test -r /app/settings/persona.json && test -w /app/settings/persona.json &&
+    test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json &&
+    test -r /app/settings/games.json && test -w /app/settings/games.json &&
+    test -w /app/runtime/data && test -w /app/runtime/backups'
+  docker compose run --rm --no-deps --entrypoint sh backup -c '
+    test -r /app/settings/persona.json && test ! -w /app/settings/persona.json &&
+    test -r /app/settings/forbidden_words.json && test -r /app/settings/games.json'
+}
+trap restore_bot_mounts EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+sudo chown -R "$HOST_UID:$HOST_GID" settings
 git pull --ff-only
 .venv/bin/python -m test.console_tests
 docker compose config --quiet
 docker compose build bot
+BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+restore_bot_mounts
+verify_bot_mounts
+trap - EXIT HUP INT TERM
 docker compose up -d --no-deps bot backup
 docker compose logs --tail=100 bot
 )
@@ -396,6 +439,7 @@ macOS:
 ```bash
 (
 set -euo pipefail
+test -x .venv/bin/python
 ROLLBACK_MODE=revert
 TARGET_COMMIT=replace-with-reviewed-commit
 
@@ -416,9 +460,42 @@ Docker:
 ```bash
 (
 set -euo pipefail
+test -x .venv/bin/python
 ROLLBACK_MODE=revert
 TARGET_COMMIT=replace-with-reviewed-commit
 
+docker compose stop bot backup
+running_services=$(docker compose ps --status running --services)
+if grep -Eq '^(bot|backup)$' <<<"$running_services"; then
+  echo "Compose 서비스가 아직 실행 중입니다." >&2
+  exit 1
+fi
+
+BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+restore_bot_mounts() {
+  sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
+  sudo find settings runtime -type d -exec chmod 700 {} +
+  sudo find settings runtime -type f -exec chmod 600 {} +
+}
+verify_bot_mounts() {
+  test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" -o -perm -022 \) -print -quit)"
+  docker compose run --rm --no-deps --entrypoint sh bot -c '
+    test -r /app/settings/persona.json && test -w /app/settings/persona.json &&
+    test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json &&
+    test -r /app/settings/games.json && test -w /app/settings/games.json &&
+    test -w /app/runtime/data && test -w /app/runtime/backups'
+  docker compose run --rm --no-deps --entrypoint sh backup -c '
+    test -r /app/settings/persona.json && test ! -w /app/settings/persona.json &&
+    test -r /app/settings/forbidden_words.json && test -r /app/settings/games.json'
+}
+trap restore_bot_mounts EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+sudo chown -R "$HOST_UID:$HOST_GID" settings
 case "$ROLLBACK_MODE" in
   revert) git revert "$TARGET_COMMIT" ;;
   checkout) git checkout "$TARGET_COMMIT" ;;
@@ -428,7 +505,12 @@ esac
 .venv/bin/python -m test.console_tests
 docker compose config --quiet
 docker compose build bot
+BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+restore_bot_mounts
+verify_bot_mounts
 docker compose run --rm --no-deps backup python -m module.backup verify
+trap - EXIT HUP INT TERM
 docker compose up -d --no-deps bot backup
 )
 ```

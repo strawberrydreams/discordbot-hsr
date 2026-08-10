@@ -45,9 +45,14 @@ cp settings/games.example.json settings/games.json
 mkdir -p runtime/data runtime/backups runtime/logs
 ```
 
-### 4. 이미지 빌드
+### 4. host test 환경과 이미지 빌드
+
+배포·롤백 전에 실행할 console suite용 host virtualenv를 먼저 설치한 뒤 이미지를 build합니다.
 
 ```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 docker compose config --quiet
 docker compose build bot
 ```
