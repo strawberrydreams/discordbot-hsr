@@ -15,6 +15,7 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
+from module.music_cog import music_dependency_error
 from module.panel import drop_panel_locks, panel_lock
 
 
@@ -44,7 +45,8 @@ class SetupView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         party, music = await self.cog._ensure_bot_channels(guild)
         await interaction.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}",
+            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}"
+            f"{self.cog._music_disabled_notice()}",
             ephemeral=True,
         )
 
@@ -90,14 +92,22 @@ class GuildSettingsCog(commands.Cog):
     ) -> tuple[discord.TextChannel, discord.TextChannel]:
         async with panel_lock(guild.id, "setup"):
             channels = await self.ensure_bot_channels(guild)
-            await self._ensure_party_panels(guild)
+            await self._ensure_panels(guild)
             return channels
 
-    async def _ensure_party_panels(self, guild: discord.Guild) -> None:
+    async def _ensure_panels(self, guild: discord.Guild) -> None:
         get_cog = getattr(self.bot, "get_cog", None)
         play_cog = get_cog("PlayWithCog") if get_cog else None
         if play_cog is not None:
             await play_cog.ensure_panels(guild)
+        music_cog = get_cog("MusicCog") if get_cog else None
+        if music_cog is not None:
+            await music_cog.ensure_panel(guild)
+
+    @staticmethod
+    def _music_disabled_notice() -> str:
+        reason = music_dependency_error()
+        return f"\n⚠️ 음악 기능 비활성: {reason}" if reason else ""
 
     async def ensure_bot_channels(
         self, guild: discord.Guild
@@ -137,7 +147,8 @@ class GuildSettingsCog(commands.Cog):
         await inter.response.defer(ephemeral=True)
         party, music = await self._ensure_bot_channels(inter.guild)
         await inter.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}",
+            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}"
+            f"{self._music_disabled_notice()}",
             ephemeral=True,
         )
 
@@ -149,7 +160,7 @@ class GuildSettingsCog(commands.Cog):
         target = 채널 or inter.channel
         await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
-        await self._ensure_party_panels(inter.guild)
+        await self._ensure_panels(inter.guild)
         await inter.followup.send(
             f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
@@ -160,9 +171,13 @@ class GuildSettingsCog(commands.Cog):
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
+        await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_music_channel, inter.guild_id, target.id)
-        await inter.response.send_message(
-            f"✅ 음악 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+        await self._ensure_panels(inter.guild)
+        await inter.followup.send(
+            f"✅ 음악 패널 채널을 {target.mention} 으로 지정했습니다."
+            f"{self._music_disabled_notice()}",
+            ephemeral=True,
         )
 
     @설정.command(name="공지허용", description="파티 호스트 공지를 허용하거나 차단합니다.")
@@ -189,7 +204,8 @@ class GuildSettingsCog(commands.Cog):
         )
         embed.add_field(
             name="음악 패널 채널",
-            value=f"<#{music}>" if music else "미지정 — `/설정 음악채널`",
+            value=(f"<#{music}>" if music else "미지정 — `/설정 음악채널`")
+            + self._music_disabled_notice(),
             inline=False,
         )
         embed.add_field(

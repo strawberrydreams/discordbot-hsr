@@ -10,7 +10,7 @@
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
 #   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
-#   9. 음악 core 계약 (선택 의존성 skip, 최소 재생 엔진, ffmpeg 컨테이너)
+#   9. 음악 core·영속 패널 계약
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
@@ -32,6 +32,7 @@ import threading
 import time
 from contextlib import closing, redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dotenv import dotenv_values
@@ -1769,7 +1770,7 @@ def test_imports():
 
 
 def test_music_core_contract():
-    print("\n[9] 음악 core (선택 의존성·최소 재생 엔진)")
+    print("\n[9] 음악 core·영속 패널")
     import module.main as bot_main
     import module.music_cog as music_cog
 
@@ -1831,9 +1832,24 @@ def test_music_core_contract():
     with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
         check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
 
+    view = music_cog.MusicPanelView(SimpleNamespace())
+    check("음악 패널 view는 persistent", view.is_persistent())
+    check(
+        "음악 패널 button custom_id 고정",
+        {item.custom_id for item in view.children}
+        == {"music:add", "music:skip", "music:pause", "music:stop", "music:remove"},
+    )
+    check("패널 queue 표시는 10곡", music_cog.MAX_QUEUE_DISPLAY == 10)
+    check("remove select는 25곡", music_cog.MAX_REMOVE_OPTIONS == 25)
+    check(
+        "패널 복구·렌더 interface 존재",
+        all(callable(getattr(music_cog.MusicCog, name, None)) for name in ("ensure_panel", "render_panel")),
+    )
+    source = inspect.getsource(music_cog)
+    check("주기적 음악 progress update 없음", "@tasks.loop" not in source)
+
     # 재생 엔진의 동작 계약(상태 전이, ffmpeg option, 불변 track)은
-    # test_discord_commands.py의 MusicPlayerStateTests가 실제로 실행해 검증한다.
-    # 여기서는 패키징과 import 시점 계약만 본다.
+    # test_discord_commands.py의 MusicPlayerStateTests/MusicPanelTests가 실행해 검증한다.
 
 
 def test_backup_round_trip():
