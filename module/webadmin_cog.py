@@ -97,8 +97,8 @@ class WebAdminCog(commands.Cog):
         if self.runner is not None:
             return
         runner = web.AppRunner(self.app)
-        await runner.setup()
         try:
+            await runner.setup()
             site = web.TCPSite(runner, HOST, PORT)
             await site.start()
         except BaseException:
@@ -282,7 +282,7 @@ class WebAdminCog(commands.Cog):
                 if name == "forbidden_words.json":
                     cog = self.bot.get_cog("ForbiddenFilterCog")
                     if cog is not None:
-                        cog.load_prohibited_words()
+                        await cog.reload_prohibited_words()
         except (OSError, ValueError, RecursionError) as exc:
             return self._index_response(csrf, f"저장 실패: {exc}")
 

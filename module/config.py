@@ -1,8 +1,8 @@
 # Configuration Module
 import json
 import os
-import secrets
 import stat
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -114,18 +114,20 @@ def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
     return games
 
 
-def _validate_settings_document(name: str, document: object) -> None:
+def _validate_settings_document(name: str, document: object) -> object:
     """실서비스 loader와 공유하는 canonicalizer로 문서를 검증한다."""
     if name == "persona.json":
         from module.hyacine_chat_cog import canonicalize_persona
 
         canonicalize_persona(document, strict=True)
+        return document
     elif name == "forbidden_words.json":
         from module.forbiddenfilter_cog import canonicalize_forbidden_words
 
-        canonicalize_forbidden_words(document, strict=True)
+        return canonicalize_forbidden_words(document, strict=True)
     elif name == "games.json":
         _canonicalize_games(document, strict=True)
+        return document
     else:
         raise ValueError("허용되지 않은 설정 파일입니다.")
 
@@ -134,23 +136,27 @@ def _open_settings_directory(*, create: bool) -> int:
     if create:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    return os.open(SETTINGS_DIR, flags)
+    directory_fd = os.open(SETTINGS_DIR, flags)
+    try:
+        info = os.fstat(directory_fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise PermissionError(
+                "SETTINGS_DIR은 현재 프로세스 소유이며 group/world 쓰기 불가여야 합니다."
+            )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
 
 
-def _open_temporary_at(directory_fd: int, target_name: str):
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    while True:
-        name = f".{target_name}.{secrets.token_hex(8)}"
-        try:
-            file_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
-        except FileExistsError:
-            continue
-        return name, os.fdopen(file_fd, "wb")
+def _verify_temporary_entry(directory_fd: int, name: str, file_fd: int) -> None:
+    entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    opened = os.fstat(file_fd)
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise RuntimeError("설정 임시 파일 entry가 교체되었습니다.")
 
 
 def _reject_symlink(directory_fd: int, name: str) -> None:
@@ -197,20 +203,38 @@ def atomic_write_settings(name: str, document: object) -> None:
     if name not in SETTINGS_FILES:
         raise ValueError("허용되지 않은 설정 파일입니다.")
 
-    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+    submitted = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+    if len(submitted) > MAX_SETTINGS_BYTES:
+        raise ValueError("설정 파일이 너무 큽니다.")
+    validated = _validate_settings_document(name, document)
+    payload = (json.dumps(validated, ensure_ascii=False, indent=2) + "\n").encode()
     if len(payload) > MAX_SETTINGS_BYTES:
         raise ValueError("설정 파일이 너무 큽니다.")
-    _validate_settings_document(name, document)
 
     directory_fd = _open_settings_directory(create=True)
     temporary_name = None
+    temporary_path = None
+    temporary_file = None
+    temporary_verified = False
     try:
         _reject_symlink(directory_fd, name)
-        temporary_name, temporary_file = _open_temporary_at(directory_fd, name)
+        temporary_file = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=SETTINGS_DIR,
+            prefix=f".{name}.",
+            delete=False,
+        )
+        temporary_path = Path(temporary_file.name)
+        temporary_name = temporary_path.name
         with temporary_file as fp:
+            _verify_temporary_entry(directory_fd, temporary_name, fp.fileno())
+            temporary_verified = True
             fp.write(payload)
             fp.flush()
             os.fsync(fp.fileno())
+            temporary_verified = False
+            _verify_temporary_entry(directory_fd, temporary_name, fp.fileno())
+            temporary_verified = True
         _reject_symlink(directory_fd, name)
         os.replace(
             temporary_name,
@@ -219,14 +243,21 @@ def atomic_write_settings(name: str, document: object) -> None:
             dst_dir_fd=directory_fd,
         )
         temporary_name = None
+        temporary_path = None
         os.fsync(directory_fd)
     finally:
-        if temporary_name is not None:
+        try:
+            if temporary_file is not None and not temporary_file.closed:
+                temporary_file.close()
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
+                if temporary_name is not None and temporary_verified:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                elif temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
-        os.close(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

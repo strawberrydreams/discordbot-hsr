@@ -14,7 +14,7 @@ import warnings
 from datetime import datetime, timezone
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import AsyncMock, call, patch
 
 import discord
 import httpx
@@ -3195,6 +3195,19 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.counter.counts, [FakeUser.id])
         self.assertIn("나쁜말", after.sent[0])
 
+    async def test_reload_prepares_off_loop_then_publishes_state(self):
+        pattern = forbiddenfilter_cog._build_pattern(["새금지어"])
+        with patch.object(
+            forbiddenfilter_cog.asyncio,
+            "to_thread",
+            AsyncMock(return_value=(["새금지어"], pattern)),
+        ) as to_thread, patch("module.forbiddenfilter_cog.print"):
+            loaded = await self.cog.reload_prohibited_words()
+        to_thread.assert_awaited_once_with(forbiddenfilter_cog._load_prohibited_pattern)
+        self.assertEqual(loaded, ["새금지어"])
+        self.assertEqual(self.cog._banned, ["새금지어"])
+        self.assertIs(self.cog._banned_pattern, pattern)
+
     async def test_edit_of_an_already_caught_message_is_not_double_counted(self):
         before = FakeMessage("나쁜말 하나", guild_id=TEST_GUILD_ID)
         after = FakeMessage("나쁜말 둘", guild_id=TEST_GUILD_ID)
@@ -3635,6 +3648,16 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
                 await cog.start()
         runner.cleanup.assert_awaited_once_with()
 
+    async def test_cancelled_runner_setup_is_cleaned(self):
+        runner = SimpleNamespace(
+            setup=AsyncMock(side_effect=asyncio.CancelledError), cleanup=AsyncMock()
+        )
+        cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
+        with patch.object(webadmin_cog.web, "AppRunner", return_value=runner):
+            with self.assertRaises(asyncio.CancelledError):
+                await cog.start()
+        runner.cleanup.assert_awaited_once_with()
+
     async def test_cancelled_cog_registration_cleans_started_runner(self):
         cog = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
         bot = SimpleNamespace(add_cog=AsyncMock(side_effect=asyncio.CancelledError))
@@ -3660,7 +3683,7 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         events = []
         real_fsync = config.os.fsync
         real_replace = config.os.replace
-        real_open_temporary = config._open_temporary_at
+        real_named_temporary = config.tempfile.NamedTemporaryFile
         file_descriptor = None
         file_mode = None
 
@@ -3684,12 +3707,12 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
             def fileno(self):
                 return self.fp.fileno()
 
-        def record_open_temporary(directory_fd, target_name):
+        def record_named_temporary(*args, **kwargs):
             nonlocal file_descriptor, file_mode
-            temporary_name, fp = real_open_temporary(directory_fd, target_name)
+            fp = real_named_temporary(*args, **kwargs)
             file_descriptor = fp.fileno()
             file_mode = os.fstat(file_descriptor).st_mode & 0o777
-            return temporary_name, RecordingTemporaryFile(fp)
+            return RecordingTemporaryFile(fp)
 
         def record_fsync(fd):
             events.append("file-fsync" if fd == file_descriptor else "directory-fsync")
@@ -3705,7 +3728,7 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         with patch.object(config.os, "fsync", side_effect=record_fsync), patch.object(
             config.os, "replace", side_effect=record_replace
         ), patch.object(
-            config, "_open_temporary_at", side_effect=record_open_temporary
+            config.tempfile, "NamedTemporaryFile", side_effect=record_named_temporary
         ) as opened:
             config.atomic_write_settings("forbidden_words.json", ["new"])
 
@@ -3713,7 +3736,8 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
             events, ["flush", "file-fsync", "replace", "directory-fsync"]
         )
         self.assertEqual(json.loads(target.read_text(encoding="utf-8")), ["new"])
-        self.assertEqual(opened.call_args.args[1], "forbidden_words.json")
+        self.assertEqual(opened.call_args.kwargs["dir"], self.settings_dir)
+        self.assertIs(opened.call_args.kwargs["delete"], False)
         self.assertEqual(file_mode, 0o600)
         self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
 
@@ -3746,8 +3770,16 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
             {"greeting": "hello"},
         )
         config.atomic_write_settings("forbidden_words.json", [1, "", "Word"])
+        self.assertEqual(
+            json.loads((self.settings_dir / "forbidden_words.json").read_text()),
+            ["1", "word"],
+        )
         with patch.object(config, "SETTINGS_DIR", self.settings_dir):
             self.assertEqual(forbiddenfilter_cog.load_forbidden_words(), ["1", "word"])
+        self.assertEqual(
+            forbiddenfilter_cog.canonicalize_forbidden_words([1, {}, ""]),
+            ["1", "{}"],
+        )
         for name, invalid in (
             ("persona.json", []),
             ("persona.json", {"greeting": 3}),
@@ -3794,14 +3826,17 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         target = self.settings_dir / "forbidden_words.json"
         target.write_bytes(b'["old"]\n')
         moved = self.settings_dir.with_name("pinned-settings")
-        real_open_temporary = config._open_temporary_at
+        real_named_temporary = config.tempfile.NamedTemporaryFile
 
-        def swap_after_open(directory_fd, target_name):
+        def swap_after_create(*args, **kwargs):
+            temporary_file = real_named_temporary(*args, **kwargs)
             self.settings_dir.rename(moved)
             self.settings_dir.mkdir()
-            return real_open_temporary(directory_fd, target_name)
+            return temporary_file
 
-        with patch.object(config, "_open_temporary_at", side_effect=swap_after_open):
+        with patch.object(
+            config.tempfile, "NamedTemporaryFile", side_effect=swap_after_create
+        ):
             config.atomic_write_settings("forbidden_words.json", ["new"])
         self.assertEqual(json.loads((moved / "forbidden_words.json").read_text()), ["new"])
         self.assertFalse((self.settings_dir / "forbidden_words.json").exists())
@@ -3819,6 +3854,93 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         with patch.object(config, "_open_settings_directory", side_effect=swap_before_read):
             data = config.read_settings_bytes("persona.json")
         self.assertEqual(data, b'{"greeting":"decoy"}')
+
+    def test_settings_directory_must_be_process_owned_and_private(self):
+        target = self.settings_dir / "forbidden_words.json"
+        target.write_bytes(b'["old"]\n')
+        self.settings_dir.chmod(0o777)
+        try:
+            with self.assertRaises(PermissionError):
+                config.atomic_write_settings("forbidden_words.json", ["new"])
+            with self.assertRaises(PermissionError):
+                config.read_settings_bytes("forbidden_words.json")
+        finally:
+            self.settings_dir.chmod(0o700)
+        with patch.object(config.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(PermissionError):
+                config.atomic_write_settings("forbidden_words.json", ["new"])
+        self.assertEqual(target.read_bytes(), b'["old"]\n')
+
+    def test_temporary_entry_inode_mismatch_fails_closed_and_cleans_up(self):
+        target = self.settings_dir / "forbidden_words.json"
+        original = b'["old"]\n'
+        target.write_bytes(original)
+        real_stat = config.os.stat
+        temporary_stats = 0
+
+        def substituted_stat(path, *args, **kwargs):
+            nonlocal temporary_stats
+            result = real_stat(path, *args, **kwargs)
+            if str(path).startswith(".forbidden_words.json."):
+                temporary_stats += 1
+                if temporary_stats == 2:
+                    values = list(result)
+                    values[1] += 1
+                    return os.stat_result(values)
+            return result
+
+        with patch.object(config.os, "stat", side_effect=substituted_stat):
+            with self.assertRaises(RuntimeError):
+                config.atomic_write_settings("forbidden_words.json", ["new"])
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(list(self.settings_dir.glob(".forbidden_words.json.*")), [])
+
+    def test_cleanup_closes_directory_fd_even_when_temp_unlink_fails(self):
+        captured = []
+        real_open_directory = config._open_settings_directory
+
+        def record_directory(*, create):
+            directory_fd = real_open_directory(create=create)
+            captured.append(directory_fd)
+            return directory_fd
+
+        with patch.object(config, "_open_settings_directory", side_effect=record_directory), patch.object(
+            config.os, "replace", side_effect=OSError("replace failed")
+        ), patch.object(config.os, "unlink", side_effect=PermissionError("unlink failed")):
+            with self.assertRaises(PermissionError):
+                config.atomic_write_settings("forbidden_words.json", ["new"])
+        with self.assertRaises(OSError):
+            os.fstat(captured[0])
+
+    def test_named_temporary_context_failure_closes_and_unlinks(self):
+        real_named_temporary = config.tempfile.NamedTemporaryFile
+        temporary_file = real_named_temporary(
+            mode="wb", dir=self.settings_dir, delete=False
+        )
+
+        class BrokenContext:
+            name = temporary_file.name
+
+            @property
+            def closed(self):
+                return temporary_file.closed
+
+            def close(self):
+                temporary_file.close()
+
+            def __enter__(self):
+                raise OSError("wrapper failed")
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(
+            config.tempfile, "NamedTemporaryFile", return_value=BrokenContext()
+        ):
+            with self.assertRaises(OSError):
+                config.atomic_write_settings("forbidden_words.json", ["new"])
+        self.assertTrue(temporary_file.closed)
+        self.assertFalse(pathlib.Path(temporary_file.name).exists())
 
 
 class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
@@ -3979,14 +4101,14 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(denied.status, 404)
 
-        reload_cog = SimpleNamespace(load_prohibited_words=Mock())
+        reload_cog = SimpleNamespace(reload_prohibited_words=AsyncMock())
         self.bot.cogs["ForbiddenFilterCog"] = reload_cog
         saved = await self.client.post(
             "/settings/forbidden_words.json",
             data={"csrf": csrf, "document": '["new"]'},
         )
         self.assertIn("다시 불러왔습니다", await saved.text())
-        reload_cog.load_prohibited_words.assert_called_once_with()
+        reload_cog.reload_prohibited_words.assert_awaited_once_with()
 
         persona = await self.client.post(
             "/settings/persona.json",

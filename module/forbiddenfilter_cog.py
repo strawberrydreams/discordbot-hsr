@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import discord
 import re
 import unicodedata
@@ -90,6 +91,11 @@ def load_forbidden_words() -> List[str]:
     return canonicalize_forbidden_words(data)
 
 
+def _load_prohibited_pattern() -> tuple[List[str], re.Pattern]:
+    banned = load_forbidden_words()
+    return banned, _build_pattern(banned)
+
+
 class ForbiddenFilterCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -99,10 +105,20 @@ class ForbiddenFilterCog(commands.Cog):
 
     def load_prohibited_words(self) -> List[str]:
         """JSON을 읽어 내부 캐시에 저장하고 패턴을 갱신합니다."""
-        self._banned = load_forbidden_words()
-        self._banned_pattern = _build_pattern(self._banned)
+        banned, pattern = _load_prohibited_pattern()
+        self._publish_prohibited_words(banned, pattern)
+        return banned
+
+    def _publish_prohibited_words(self, banned: List[str], pattern: re.Pattern) -> None:
+        self._banned = banned
+        self._banned_pattern = pattern
         print(f"📥 금지어 {len(self._banned)}개 로드")
-        return self._banned
+
+    async def reload_prohibited_words(self) -> List[str]:
+        """파일 읽기·정규화·정규식 컴파일은 worker에서, 상태 교체는 loop에서 한다."""
+        banned, pattern = await asyncio.to_thread(_load_prohibited_pattern)
+        self._publish_prohibited_words(banned, pattern)
+        return banned
 
     def _find_match(self, content: str) -> Optional[str]:
         """금지어를 찾으면 정규화된 형태로 반환한다."""
