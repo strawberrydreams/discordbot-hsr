@@ -758,14 +758,18 @@ class MusicCog(commands.Cog):
                     return
                 if voice_client is None:
                     voice_client = await voice_channel.connect()
-                start = await self.get_player(guild.id).queue_track(voice_client, track)
+                # 큐에 넣은 player와 시작시킬 player가 반드시 같은 객체여야 한다.
+                # get_player()를 두 번 부르면 그 사이 _player_changed()가 idle
+                # player를 정리했을 때 방금 넣은 곡이 사라진다.
+                player = self.get_player(guild.id)
+                start = await player.queue_track(voice_client, track)
                 await self.render_panel(guild.id)
         except discord.DiscordException:
             logger.exception("음성 채널 연결에 실패했습니다: guild=%s", guild.id)
             await _ephemeral(interaction, "❌ 음성 채널에 연결하지 못했습니다.")
             return
         if start:
-            error = await self.get_player(guild.id).start_if_idle()
+            error = await player.start_if_idle()
             if error is not None:
                 await _ephemeral(
                     interaction,

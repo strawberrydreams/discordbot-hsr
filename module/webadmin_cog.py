@@ -27,9 +27,14 @@ HOST = "127.0.0.1"
 PORT = 8080
 SESSION_COOKIE = "admin_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
-MAX_BODY_BYTES = config.MAX_SETTINGS_BYTES
+# form body는 percent-encoded라 UTF-8 한 바이트가 최대 "%XX" 3자로 늘어난다. 한글
+# 설정 파일이 파일 한도 안인데도 413으로 막히면 안 된다. 실제 파일 크기는
+# config.atomic_write_settings가 따로 강제하므로 여기는 전송 한도일 뿐이다.
+MAX_BODY_BYTES = config.MAX_SETTINGS_BYTES * 3 + 4_096
 ANNOUNCEMENT_TITLE_LIMIT = 256
 ANNOUNCEMENT_BODY_LIMIT = 4_096
+# 길드 하나가 매달려도 나머지 전송과 HTTP 응답까지 끌고 가지 않게 한다.
+ANNOUNCE_SEND_TIMEOUT = 10
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -78,6 +83,9 @@ class WebAdminCog(commands.Cog):
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self._mutation_lock = asyncio.Lock()
+        # 공지는 길드 수에 비례해 오래 걸린다. 설정 저장과 lock을 공유하면 공지 한
+        # 번이 관리 화면 전체를 막는다.
+        self._announce_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self.app = web.Application(
             client_max_size=MAX_BODY_BYTES, middlewares=[_security_headers]
@@ -195,27 +203,44 @@ class WebAdminCog(commands.Cog):
         )
 
     @staticmethod
-    def _settings_text(name: str) -> str:
+    def _settings_text(name: str) -> tuple[str, str]:
+        """(현재 내용, 읽기 실패 사유)를 돌려준다.
+
+        빈 문자열만 돌려주면 파일이 없는 것과 못 읽는 것이 화면에서 구분되지
+        않는다. SETTINGS_DIR이 group 쓰기 가능하거나 소유자가 다르면
+        read_settings_bytes()가 PermissionError를 내는데, 그 이유를 삼키면
+        운영자는 빈 textarea만 보고 원인을 알 수 없다.
+        """
         try:
             data = config.read_settings_bytes(name)
-        except (OSError, ValueError):
-            return ""
+        except (OSError, ValueError) as exc:
+            return "", f"{name}: {exc}"
         if data is None:
-            return ""
+            return "", ""
         try:
-            return data.decode("utf-8")
+            return data.decode("utf-8"), ""
         except UnicodeDecodeError:
-            return ""
+            return "", f"{name}: UTF-8로 읽을 수 없습니다."
 
     def _index_response(self, csrf: str, notice: str = "") -> web.Response:
+        texts: dict[str, str] = {}
+        problems: list[str] = []
+        for name in config.SETTINGS_FILES:
+            text, problem = self._settings_text(name)
+            texts[name] = text
+            if problem:
+                problems.append(problem)
+        if problems:
+            warning = "설정을 읽지 못했습니다 — " + " / ".join(problems)
+            notice = f"{notice} {warning}" if notice else warning
         return web.Response(
             text=self._template(
                 "admin_index.html",
                 csrf=csrf,
                 notice=notice,
-                persona=self._settings_text("persona.json"),
-                forbidden_words=self._settings_text("forbidden_words.json"),
-                games=self._settings_text("games.json"),
+                persona=texts["persona.json"],
+                forbidden_words=texts["forbidden_words.json"],
+                games=texts["games.json"],
             ),
             content_type="text/html",
             charset="utf-8",
@@ -322,7 +347,7 @@ class WebAdminCog(commands.Cog):
             return self._index_response(csrf, "공지 본문은 1~4,096자여야 합니다.")
 
         success = skipped = failed = 0
-        async with self._mutation_lock:
+        async with self._announce_lock:
             try:
                 guild_ids = await run_db(self.settings.list_announcement_guild_ids)
             except Exception:
@@ -339,7 +364,9 @@ class WebAdminCog(commands.Cog):
                     if not self._sendable_text_channel(guild, channel):
                         skipped += 1
                         continue
-                    await channel.send(embed=embed)
+                    await asyncio.wait_for(
+                        channel.send(embed=embed), timeout=ANNOUNCE_SEND_TIMEOUT
+                    )
                     success += 1
                 except Exception:
                     failed += 1

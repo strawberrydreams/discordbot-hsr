@@ -1267,6 +1267,52 @@ class MusicPanelTests(_PatchedPlaybackTests):
         self.assertEqual(cog.get_player(guild.id).snapshot().queue, (track,))
         self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
+    async def test_queue_and_start_use_the_same_player_instance(self):
+        """get_player()를 두 번 부르면 그 사이 정리된 player에 곡을 잃는다."""
+        track = MusicTrack("새 곡", "https://example.com/song", 123)
+
+        class VoiceChannel:
+            def __init__(self, guild):
+                self.guild = guild
+
+            def permissions_for(self, member):
+                return SimpleNamespace(connect=True, speak=True)
+
+            async def connect(self):
+                voice = _FakeVoiceClient(self)
+                self.guild.voice_client = voice
+                return voice
+
+        handed_out = []
+        started = []
+
+        async def record_start(self):
+            started.append(self)
+            return None
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ), patch.object(music_cog, "extract_track", return_value=track):
+            cog, guild, _, _ = self._cog(directory)
+            real_get_player = cog.get_player
+
+            def counting_get_player(guild_id):
+                player = real_get_player(guild_id)
+                handed_out.append(player)
+                return player
+
+            with patch.object(cog, "get_player", counting_get_player), patch.object(
+                MusicPlayer, "start_if_idle", record_start
+            ):
+                interaction = _MusicInteraction(
+                    guild, voice_channel=VoiceChannel(guild)
+                )
+                await cog.add_url(interaction, "https://example.com/song")
+
+        self.assertEqual(len(handed_out), 1)
+        self.assertEqual(started, handed_out)
+        self.assertEqual(handed_out[0].snapshot().queue, (track,))
+
     async def test_initial_voice_play_failure_reports_error_and_preserves_queue(self):
         track = MusicTrack("실패 곡", "https://example.com/song", 123)
 
@@ -3962,7 +4008,9 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
 
         link = self.settings_dir / "persona.json"
         link.symlink_to(target)
-        self.assertEqual(webadmin_cog.WebAdminCog._settings_text("persona.json"), "")
+        self.assertEqual(
+            webadmin_cog.WebAdminCog._settings_text("persona.json"), ("", "")
+        )
         with self.assertRaises(ValueError):
             config.atomic_write_settings("persona.json", {})
         self.assertEqual(target.read_bytes(), original)
@@ -4353,6 +4401,45 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(failed.headers[key], value)
         self.assertNotIn(csrf, await failed.text())
 
+    async def test_unreadable_settings_directory_reports_reason_not_blank_boxes(self):
+        """빈 textarea만 보여주면 파일 없음과 못 읽음이 구분되지 않는다."""
+        await self._login()
+        readable = await self.client.get("/")
+        self.assertIn("prompt", await readable.text())
+
+        # group 쓰기 가능한 SETTINGS_DIR은 config가 거부한다. 그 사유가 화면에
+        # 올라와야 운영자가 chmod 하나로 끝낼 수 있다.
+        # 소유자 권한은 그대로라 tearDown의 tempdir 정리는 영향받지 않는다.
+        self.settings_dir.chmod(0o775)
+        degraded = await self.client.get("/")
+        page = await degraded.text()
+        self.assertEqual(degraded.status, 200)
+        self.assertIn("설정을 읽지 못했습니다", page)
+        for name in config.SETTINGS_FILES:
+            self.assertIn(name, page)
+
+    async def test_percent_encoded_korean_settings_within_file_limit_are_accepted(self):
+        """form body 한도가 파일 한도보다 작아서 저장이 막히면 안 된다."""
+        _, csrf = await self._login()
+        # UTF-8 3바이트 문자는 percent-encoding에서 9자로 늘어난다. 파일 한도의
+        # 3분의 1을 넘는 한글 문서는 옛 한도(= 파일 한도)에서 413으로 막혔다.
+        prompt = "가" * (config.MAX_SETTINGS_BYTES // 6)
+        document = {"system_prompt": prompt, "greeting": "안녕"}
+        self.assertGreater(
+            len(json.dumps(document, ensure_ascii=False).encode()) * 3,
+            config.MAX_SETTINGS_BYTES,
+        )
+        response = await self.client.post(
+            "/settings/persona.json",
+            data={"csrf": csrf, "document": json.dumps(document, ensure_ascii=False)},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn("새 AI 세션부터 적용", await response.text())
+        saved = json.loads(
+            (self.settings_dir / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["system_prompt"], prompt)
+
 
 class _AnnouncementChannel:
     type = discord.ChannelType.text
@@ -4416,6 +4503,46 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         logged.assert_called_once()
         self.assertEqual(logged.call_args.args[-1], 4)
         self.assertIn(session_id, self.cog.sessions)
+
+    async def test_hanging_guild_times_out_without_blocking_settings_saves(self):
+        """공지가 한 길드에 매달려도 관리 화면 전체가 멈추면 안 된다."""
+        _, csrf = await self._login()
+        sending = asyncio.Event()
+
+        class _HangingChannel(_AnnouncementChannel):
+            async def send(self, *, embed):
+                sending.set()
+                await asyncio.sleep(3600)
+
+        delivered = _AnnouncementChannel()
+        self.repository.guild_ids = [1, 2]
+        self.repository.channels = {1: 11, 2: 22}
+        self.bot.guilds = {
+            1: _AnnouncementGuild({11: _HangingChannel()}),
+            2: _AnnouncementGuild({22: delivered}),
+        }
+        with patch.object(webadmin_cog, "ANNOUNCE_SEND_TIMEOUT", 0.2), patch.object(
+            webadmin_cog.logger, "exception"
+        ):
+            announcing = asyncio.create_task(
+                self.client.post(
+                    "/announce", data={"csrf": csrf, "title": "Title", "body": "Body"}
+                )
+            )
+            await asyncio.wait_for(sending.wait(), timeout=1)
+            saved = await self.client.post(
+                "/settings/games.json",
+                data={
+                    "csrf": csrf,
+                    "document": json.dumps({"Game": {"max_players": 3, "roles": []}}),
+                },
+            )
+            response = await asyncio.wait_for(announcing, timeout=5)
+
+        self.assertEqual(saved.status, 200)
+        page = await response.text()
+        self.assertIn("성공 1, 건너뜀 0, 실패 1", page)
+        self.assertEqual(len(delivered.embeds), 1)
 
     async def test_announcement_rejects_empty_and_discord_overlimit_text(self):
         _, csrf = await self._login()
