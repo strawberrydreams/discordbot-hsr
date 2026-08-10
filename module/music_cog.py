@@ -499,18 +499,27 @@ class MusicURLModal(discord.ui.Modal, title="음악 URL 추가"):
         max_length=MAX_URL_LENGTH,
     )
 
-    def __init__(self, cog: "MusicCog"):
+    def __init__(self, cog: "MusicCog", panel_message_id: Optional[int] = None):
         super().__init__()
         self.cog = cog
+        self.panel_message_id = panel_message_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.add_url(interaction, str(self.url.value))
+        await self.cog.add_url(
+            interaction, str(self.url.value), panel_message_id=self.panel_message_id
+        )
 
 
 class MusicRemoveSelect(discord.ui.Select):
-    def __init__(self, cog: "MusicCog", tracks: tuple[MusicTrack, ...]):
+    def __init__(
+        self,
+        cog: "MusicCog",
+        tracks: tuple[MusicTrack, ...],
+        panel_message_id: Optional[int] = None,
+    ):
         self.cog = cog
         self.tracks = tracks[:MAX_REMOVE_OPTIONS]
+        self.panel_message_id = panel_message_id
         options = [
             discord.SelectOption(
                 label=_bounded(track.title, MAX_TITLE_LENGTH),
@@ -530,14 +539,22 @@ class MusicRemoveSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         position = int(self.values[0])
         await self.cog.remove_selected(
-            interaction, position, self.tracks[position - 1]
+            interaction,
+            position,
+            self.tracks[position - 1],
+            panel_message_id=self.panel_message_id,
         )
 
 
 class MusicRemoveView(discord.ui.View):
-    def __init__(self, cog: "MusicCog", tracks: tuple[MusicTrack, ...]):
+    def __init__(
+        self,
+        cog: "MusicCog",
+        tracks: tuple[MusicTrack, ...],
+        panel_message_id: Optional[int] = None,
+    ):
         super().__init__(timeout=60)
-        self.add_item(MusicRemoveSelect(cog, tracks))
+        self.add_item(MusicRemoveSelect(cog, tracks, panel_message_id))
 
 
 class MusicPanelView(discord.ui.View):
@@ -549,7 +566,10 @@ class MusicPanelView(discord.ui.View):
         label="추가", style=discord.ButtonStyle.primary, custom_id="music:add"
     )
     async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(MusicURLModal(self.cog))
+        panel_message_id = self.cog.interaction_panel_message_id(interaction)
+        if not await self.cog.is_current_panel(interaction, panel_message_id):
+            return
+        await interaction.response.send_modal(MusicURLModal(self.cog, panel_message_id))
 
     @discord.ui.button(
         label="건너뛰기", style=discord.ButtonStyle.secondary, custom_id="music:skip"
@@ -601,6 +621,27 @@ class MusicCog(commands.Cog):
             self.players[guild_id] = player
         return player
 
+    @staticmethod
+    def interaction_panel_message_id(interaction: discord.Interaction) -> Optional[int]:
+        return getattr(getattr(interaction, "message", None), "id", None)
+
+    async def is_current_panel(
+        self,
+        interaction: discord.Interaction,
+        panel_message_id: Optional[int] = None,
+    ) -> bool:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await _ephemeral(interaction, "❌ 서버 안에서만 사용할 수 있습니다.")
+            return False
+        if panel_message_id is None:
+            panel_message_id = self.interaction_panel_message_id(interaction)
+        current_id = await run_db(self.settings.get_music_panel_msg, guild_id)
+        if panel_message_id is None or panel_message_id != current_id:
+            await _ephemeral(interaction, "❌ 최신 음악 패널에서 다시 시도해 주세요.")
+            return False
+        return True
+
     async def _player_changed(self, guild_id: int) -> None:
         player = self.players.get(guild_id)
         if player is not None:
@@ -649,7 +690,13 @@ class MusicCog(commands.Cog):
         if message_id != message.id:
             await run_db(self.settings.set_music_panel_msg, guild_id, message.id)
 
-    async def add_url(self, interaction: discord.Interaction, url: str) -> None:
+    async def add_url(
+        self,
+        interaction: discord.Interaction,
+        url: str,
+        *,
+        panel_message_id: Optional[int] = None,
+    ) -> None:
         guild = interaction.guild
         if guild is None:
             await _ephemeral(interaction, "❌ 서버 안에서만 사용할 수 있습니다.")
@@ -689,6 +736,8 @@ class MusicCog(commands.Cog):
         start = False
         try:
             async with panel_lock(guild.id, "music"):
+                if not await self.is_current_panel(interaction, panel_message_id):
+                    return
                 current_channel = getattr(
                     getattr(interaction.user, "voice", None), "channel", None
                 )
@@ -736,6 +785,8 @@ class MusicCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         async with panel_lock(guild.id, "music"):
+            if not await self.is_current_panel(interaction):
+                return
             player = self.players.get(guild.id)
             current = None if player is None else (player.current or player.resolving)
             if current is None:
@@ -759,6 +810,8 @@ class MusicCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         async with panel_lock(interaction.guild_id, "music"):
+            if not await self.is_current_panel(interaction):
+                return
             player = self.players.get(interaction.guild_id)
             if player is None or player.current is None:
                 await _ephemeral(interaction, "❌ 재생 중인 곡이 없습니다.")
@@ -778,6 +831,8 @@ class MusicCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         async with panel_lock(interaction.guild_id, "music"):
+            if not await self.is_current_panel(interaction):
+                return
             player = self.players.get(interaction.guild_id)
             if player is None:
                 await _ephemeral(interaction, "❌ 정지할 재생이 없습니다.")
@@ -796,14 +851,18 @@ class MusicCog(commands.Cog):
         if interaction.guild is None:
             await _ephemeral(interaction, "❌ 서버 안에서만 사용할 수 있습니다.")
             return
-        player = self.players.get(interaction.guild_id)
-        queue = () if player is None else player.snapshot().queue[:MAX_REMOVE_OPTIONS]
-        if not queue:
-            await _ephemeral(interaction, "❌ 대기열이 비어 있습니다.")
-            return
+        panel_message_id = self.interaction_panel_message_id(interaction)
+        async with panel_lock(interaction.guild_id, "music"):
+            if not await self.is_current_panel(interaction, panel_message_id):
+                return
+            player = self.players.get(interaction.guild_id)
+            queue = () if player is None else player.snapshot().queue[:MAX_REMOVE_OPTIONS]
+            if not queue:
+                await _ephemeral(interaction, "❌ 대기열이 비어 있습니다.")
+                return
         await interaction.response.send_message(
             "제거할 곡을 선택하세요.",
-            view=MusicRemoveView(self, queue),
+            view=MusicRemoveView(self, queue, panel_message_id),
             ephemeral=True,
         )
 
@@ -812,12 +871,16 @@ class MusicCog(commands.Cog):
         interaction: discord.Interaction,
         position: int,
         expected_track: MusicTrack,
+        *,
+        panel_message_id: Optional[int] = None,
     ) -> None:
         if interaction.guild is None:
             await _ephemeral(interaction, "❌ 서버 안에서만 사용할 수 있습니다.")
             return
         await interaction.response.defer(ephemeral=True)
         async with panel_lock(interaction.guild_id, "music"):
+            if not await self.is_current_panel(interaction, panel_message_id):
+                return
             player = self.players.get(interaction.guild_id)
             queue = () if player is None else player.snapshot().queue
             if (

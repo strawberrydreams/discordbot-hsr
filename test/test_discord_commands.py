@@ -24,6 +24,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from discord.ext import commands
 
 import module.config as config
+import module.guildsettings_cog as guildsettings_cog
 import module.main as bot_main
 from module.attendance_cog import AttendanceCog, KST
 from module.database import (
@@ -928,9 +929,18 @@ class _MusicBot:
 
 
 class _MusicInteraction:
-    def __init__(self, guild, user_id=123, *, manager=False, voice_channel=None):
+    def __init__(
+        self,
+        guild,
+        user_id=123,
+        *,
+        manager=False,
+        voice_channel=None,
+        message_id=10,
+    ):
         self.guild = guild
         self.guild_id = guild.id
+        self.message = SimpleNamespace(id=message_id) if message_id is not None else None
         self.user = SimpleNamespace(
             id=user_id,
             voice=SimpleNamespace(channel=voice_channel),
@@ -945,6 +955,7 @@ class MusicPanelTests(_PatchedPlaybackTests):
         settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
         guild = _MusicGuild()
         settings.set_music_channel(guild.id, guild.channel.id)
+        settings.set_music_panel_msg(guild.id, 10)
         bot = _MusicBot(guild)
         cog = MusicCog(bot, settings)
         self.addCleanup(drop_panel_locks, guild.id)
@@ -1013,6 +1024,85 @@ class MusicPanelTests(_PatchedPlaybackTests):
             modal = music_cog.MusicURLModal(cog)
             self.assertEqual(len(modal.children), 1)
             self.assertEqual(modal.children[0].max_length, music_cog.MAX_URL_LENGTH)
+
+    async def test_replaced_panel_denies_old_controls_and_accepts_the_current_panel(self):
+        class VoiceChannel:
+            def __init__(self):
+                self.connects = 0
+
+            def permissions_for(self, member):
+                return SimpleNamespace(connect=True, speak=True)
+
+            async def connect(self):
+                self.connects += 1
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            music_cog, "music_dependency_error", return_value=None
+        ), patch.object(
+            music_cog, "extract_track", return_value=_music_track(3)
+        ) as extract:
+            cog, guild, settings, _ = self._cog(directory)
+            player = cog.get_player(guild.id)
+            player.current = _music_track(1)
+            player.queue.append(_music_track(2))
+            before = player.snapshot()
+            settings.set_music_panel_msg(guild.id, 20)
+
+            stale = [
+                _MusicInteraction(guild, manager=True, message_id=10)
+                for _ in range(5)
+            ]
+            for child, interaction in zip(cog.view.children, stale):
+                await child.callback(interaction)
+
+            voice_channel = VoiceChannel()
+            stale_modal = _MusicInteraction(
+                guild, voice_channel=voice_channel, message_id=None
+            )
+            await cog.add_url(
+                stale_modal,
+                "https://example.com/song",
+                panel_message_id=10,
+            )
+
+            current = _MusicInteraction(guild, message_id=20)
+            await cog.view.children[0].callback(current)
+
+        self.assertEqual(player.snapshot(), before)
+        self.assertEqual(voice_channel.connects, 0)
+        self.assertEqual(extract.await_count, 1)
+        self.assertTrue(all("최신" in item.followup.messages[0][0][0] for item in stale[1:4]))
+        self.assertIn("최신", stale[0].response.messages[0][0][0])
+        self.assertIn("최신", stale[4].response.messages[0][0][0])
+        self.assertIn("최신", stale_modal.followup.messages[0][0][0])
+        self.assertIsInstance(current.response.modal, music_cog.MusicURLModal)
+        self.assertEqual(current.response.modal.panel_message_id, 20)
+
+    async def test_panel_id_is_rechecked_after_waiting_for_music_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cog, guild, settings, _ = self._cog(directory)
+            player = cog.get_player(guild.id)
+            player.current = _music_track(1)
+            before = player.snapshot()
+            interaction = _MusicInteraction(guild, user_id=1, message_id=10)
+            deferred = asyncio.Event()
+            original_defer = interaction.response.defer
+
+            async def recording_defer(**kwargs):
+                await original_defer(**kwargs)
+                deferred.set()
+
+            interaction.response.defer = recording_defer
+            lock = panel_lock(guild.id, "music")
+            await lock.acquire()
+            task = asyncio.create_task(cog.skip(interaction))
+            await deferred.wait()
+            settings.set_music_panel_msg(guild.id, 20)
+            lock.release()
+            await task
+
+        self.assertEqual(player.snapshot(), before)
+        self.assertIn("최신", interaction.followup.messages[0][0][0])
 
     async def test_permission_denials_do_not_change_player_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1344,6 +1434,7 @@ class RecordingResponse:
     def __init__(self):
         self.messages = []
         self.deferred = False
+        self.modal = None
 
     async def send_message(self, *args, **kwargs):
         if self.messages:
@@ -1355,6 +1446,9 @@ class RecordingResponse:
 
     async def defer(self, **kwargs):
         self.deferred = True
+
+    async def send_modal(self, modal):
+        self.modal = modal
 
 
 class RecordingFollowup:
@@ -2951,6 +3045,45 @@ class _DeferredSetupFollowup:
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_settings_reject_unsupported_ambient_channels(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            guildsettings_cog.discord, "TextChannel", _SetupChannel
+        ):
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            thread = SimpleNamespace(id=77, mention="<#77>")
+
+            for command in (GuildSettingsCog._party_channel, GuildSettingsCog._music_channel):
+                interaction = SimpleNamespace(
+                    guild=guild,
+                    guild_id=guild.id,
+                    channel=thread,
+                    response=RecordingResponse(),
+                    followup=RecordingFollowup(),
+                )
+                await command.callback(cog, interaction, None)
+                self.assertIn("텍스트 채널", interaction.response.messages[0][0][0])
+                self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
+
+            self.assertIsNone(settings.get_party_channel(guild.id))
+            self.assertIsNone(settings.get_music_channel(guild.id))
+
+            explicit = _SetupChannel(88, "explicit")
+            for command in (GuildSettingsCog._party_channel, GuildSettingsCog._music_channel):
+                interaction = SimpleNamespace(
+                    guild=guild,
+                    guild_id=guild.id,
+                    channel=thread,
+                    response=RecordingResponse(),
+                    followup=RecordingFollowup(),
+                )
+                await command.callback(cog, interaction, explicit)
+                self.assertIn("지정했습니다", interaction.followup.messages[0][0][0])
+
+            self.assertEqual(settings.get_party_channel(guild.id), explicit.id)
+            self.assertEqual(settings.get_music_channel(guild.id), explicit.id)
+
     async def test_setup_completion_ensures_party_and_music_panels(self):
         party_calls = []
         music_calls = []

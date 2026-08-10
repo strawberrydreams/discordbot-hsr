@@ -158,6 +158,12 @@ class GuildSettingsCog(commands.Cog):
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
+        if not isinstance(target, discord.TextChannel):
+            await inter.response.send_message(
+                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
+                ephemeral=True,
+            )
+            return
         await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
         await self._ensure_panels(inter.guild)
@@ -171,6 +177,12 @@ class GuildSettingsCog(commands.Cog):
         self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
     ):
         target = 채널 or inter.channel
+        if not isinstance(target, discord.TextChannel):
+            await inter.response.send_message(
+                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
+                ephemeral=True,
+            )
+            return
         await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_music_channel, inter.guild_id, target.id)
         await self._ensure_panels(inter.guild)
