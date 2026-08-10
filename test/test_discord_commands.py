@@ -3690,6 +3690,15 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         class RecordingTemporaryFile:
             def __init__(self, fp):
                 self.fp = fp
+
+            @property
+            def name(self):
+                return self.fp.name
+
+            @property
+            def closed(self):
+                return self.fp.closed
+
             def __enter__(self):
                 self.fp.__enter__()
                 return self
@@ -3706,6 +3715,12 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
 
             def fileno(self):
                 return self.fp.fileno()
+
+            def close(self):
+                return self.fp.close()
+
+            def __getattr__(self, name):
+                return getattr(self.fp, name)
 
         def record_named_temporary(*args, **kwargs):
             nonlocal file_descriptor, file_mode
