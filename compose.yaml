@@ -8,8 +8,12 @@ services:
     command: ["python", "-m", "module.main"]
     restart: unless-stopped
     stop_grace_period: 30s
+    ports:
+      # 웹 관리는 container loopback에만 bind한다. host 쪽도 127.0.0.1로 못 박아
+      # 다른 interface에는 노출하지 않는다. 신뢰 경계는 봇을 host에서 직접
+      # 실행할 때와 같다. ADMIN_TOKEN이 없으면 listener 자체가 뜨지 않는다.
+      - "127.0.0.1:8080:8080"
     volumes:
-      # 웹 관리는 container loopback에만 bind하며 ports를 publish하지 않는다.
       - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups

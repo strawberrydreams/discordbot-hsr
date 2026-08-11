@@ -47,7 +47,8 @@ SECURITY_HEADERS = {
 ANNOUNCEMENT_COLOUR_PATTERN = re.compile(r"#[0-9A-Fa-f]{6}\Z")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 PLACEHOLDER_PATTERN = re.compile(
-    r"{{(csrf|notice|error|persona|forbidden_words|games|guild_options|guild_rows)}}"
+    r"{{(csrf|notice|error|persona_prompt|persona_greeting|forbidden_words"
+    r"|games|guild_options|guild_rows)}}"
 )
 # 이 둘만 Python에서 조각마다 html.escape()해 조립한 HTML 단편이다. 나머지 값은
 # 그대로 escape한다. 여기에 새 키를 넣으려면 조립부가 모든 외부 값을 escape하는지
@@ -232,6 +233,27 @@ class WebAdminCog(commands.Cog):
         except UnicodeDecodeError:
             return "", f"{name}: UTF-8로 읽을 수 없습니다."
 
+    @classmethod
+    def _persona_fields(cls) -> tuple[str, str, str]:
+        """(system_prompt, greeting, 읽기 실패 사유)를 돌려준다.
+
+        persona는 문자열 두 개뿐이라 JSON 원문을 그대로 편집하게 하면 따옴표·
+        줄바꿈 이스케이프 실수로 저장이 거부되기만 한다. 화면에서는 값만 다루고
+        JSON 조립은 서버가 한다. 저장 시 config.atomic_write_settings가 같은
+        canonicalizer로 다시 검증하므로 검증 경로는 하나다.
+        """
+        text, problem = cls._settings_text("persona.json")
+        if problem or not text:
+            return "", "", problem
+        # config._canonicalize_settings와 같은 이유로 함수 안에서 import한다.
+        from module.hyacine_chat_cog import canonicalize_persona
+
+        try:
+            persona = canonicalize_persona(json.loads(text), strict=True)
+        except (ValueError, TypeError) as exc:
+            return "", "", f"persona.json: {exc}"
+        return persona["system_prompt"], persona["greeting"], ""
+
     @staticmethod
     def _channel_label(guild, channel_id: int | None) -> str:
         if not channel_id:
@@ -278,10 +300,15 @@ class WebAdminCog(commands.Cog):
         texts: dict[str, str] = {}
         problems: list[str] = []
         for name in config.SETTINGS_FILES:
+            if name == "persona.json":
+                continue
             text, problem = self._settings_text(name)
             texts[name] = text
             if problem:
                 problems.append(problem)
+        persona_prompt, persona_greeting, persona_problem = self._persona_fields()
+        if persona_problem:
+            problems.append(persona_problem)
         guild_rows, guild_options, guild_problem = await self._guild_overview()
         if guild_problem:
             problems.append(guild_problem)
@@ -293,7 +320,8 @@ class WebAdminCog(commands.Cog):
                 "admin_index.html",
                 csrf=csrf,
                 notice=notice,
-                persona=texts["persona.json"],
+                persona_prompt=persona_prompt,
+                persona_greeting=persona_greeting,
                 forbidden_words=texts["forbidden_words.json"],
                 games=texts["games.json"],
                 guild_rows=guild_rows,
@@ -358,7 +386,15 @@ class WebAdminCog(commands.Cog):
         if name not in config.SETTINGS_FILES:
             raise web.HTTPNotFound(text="허용되지 않은 설정 파일입니다.")
         try:
-            document = json.loads(form.get("document", ""))
+            if name == "persona.json":
+                # 화면이 값 두 개만 받으므로 JSON은 여기서 조립한다. 형식 검증은
+                # atomic_write_settings의 canonicalizer가 그대로 수행한다.
+                document = {
+                    "system_prompt": form.get("system_prompt", ""),
+                    "greeting": form.get("greeting", ""),
+                }
+            else:
+                document = json.loads(form.get("document", ""))
             async with self._mutation_lock:
                 await asyncio.to_thread(config.atomic_write_settings, name, document)
                 if name == "forbidden_words.json":

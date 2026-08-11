@@ -107,7 +107,9 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 음악의 `PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다. 외부 사이트 변경으로 yt-dlp가 깨질 수 있으며, 직접 실행은 `.venv/bin/python -m pip install --upgrade yt-dlp` 후 재시작하고 Docker는 `docker compose build --no-cache bot && docker compose up -d --no-deps bot`으로 새 이미지를 만드세요. 콘텐츠 저작권과 해당 서비스 약관 준수는 운영자 책임이며, 어떤 사이트나 콘텐츠의 재생을 보장하지 않습니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 비어 있으면 웹 관리를 시작하지 않습니다. 설정하면 웹 관리는 고정된 `127.0.0.1:8080`에만 bind됩니다. Docker Compose는 이 포트를 publish하지 않으므로 컨테이너 밖에서 접근할 수 없습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다. 필요하다면 별도 보안 설계를 먼저 하세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 비어 있으면 웹 관리를 시작하지 않습니다. 설정하면 웹 관리는 고정된 `127.0.0.1:8080`에만 bind됩니다. Docker Compose는 이 포트를 host의 `127.0.0.1`에만 publish하므로 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열 수 있고, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다. 필요하다면 별도 보안 설계를 먼저 하세요.
+
+웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티·음악 채널과 공지 opt-in 상태를 확인하고, opt-in한 Guild에 공지를 보낼 수 있습니다.
 
 AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도를 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
 

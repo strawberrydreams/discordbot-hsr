@@ -4360,11 +4360,12 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
             "admin_index.html",
             csrf="csrf",
             notice="",
-            persona='{"system_prompt":"{{games}}"}',
+            persona_prompt="{{games}}",
+            persona_greeting="{{games}}",
             forbidden_words='["{{games}}"]',
             games='{"Game":{"max_players":2}}',
         )
-        self.assertEqual(page.count("{{games}}"), 2)
+        self.assertEqual(page.count("{{games}}"), 3)
         self.assertIn("{&quot;Game&quot;:{&quot;max_players&quot;:2}}", page)
 
     async def test_content_length_and_actual_body_bytes_are_bounded(self):
@@ -4441,7 +4442,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         response = await self.client.post(
             "/settings/persona.json",
-            data={"csrf": csrf, "document": json.dumps(document, ensure_ascii=False)},
+            data={"csrf": csrf, "system_prompt": prompt, "greeting": "안녕"},
         )
         self.assertEqual(response.status, 200)
         self.assertIn("새 AI 세션부터 적용", await response.text())
@@ -4449,6 +4450,45 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
             (self.settings_dir / "persona.json").read_text(encoding="utf-8")
         )
         self.assertEqual(saved["system_prompt"], prompt)
+
+    async def test_persona_form_round_trips_quotes_and_newlines_without_json_escaping(self):
+        """persona는 값만 입력받는다. JSON 이스케이프는 운영자 몫이 아니다."""
+        _, csrf = await self._login()
+        prompt = '따옴표 "회색둥이 씨"와 역슬래시 \\ 그리고\n줄바꿈이 들어간 프롬프트'
+        response = await self.client.post(
+            "/settings/persona.json",
+            data={"csrf": csrf, "system_prompt": prompt, "greeting": "안녕하세요~"},
+        )
+        self.assertEqual(response.status, 200)
+        saved = json.loads(
+            (self.settings_dir / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved, {"system_prompt": prompt, "greeting": "안녕하세요~"})
+
+        # 저장한 값이 다음 화면에 그대로 돌아오고, HTML로 새지 않아야 한다.
+        page = await (await self.client.get("/")).text()
+        self.assertIn("따옴표 &quot;회색둥이 씨&quot;", page)
+        self.assertNotIn('"회색둥이 씨"', page)
+
+    async def test_persona_rejects_blank_fields_and_preserves_previous_file(self):
+        _, csrf = await self._login()
+        original = (self.settings_dir / "persona.json").read_bytes()
+        response = await self.client.post(
+            "/settings/persona.json",
+            data={"csrf": csrf, "system_prompt": "prompt", "greeting": ""},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn("저장 실패", await response.text())
+        self.assertEqual((self.settings_dir / "persona.json").read_bytes(), original)
+
+    async def test_unparseable_persona_file_reports_reason_instead_of_defaults(self):
+        """깨진 파일을 코드 기본값으로 덮어 보여주면 운영자가 손실을 눈치채지 못한다."""
+        await self._login()
+        (self.settings_dir / "persona.json").write_text("{not json", encoding="utf-8")
+        page = await (await self.client.get("/")).text()
+        self.assertIn("persona.json", page)
+        self.assertIn("설정을 읽지 못했습니다", page)
+        self.assertNotIn("놀빛 정원", page)
 
 
 class _AnnouncementChannel:

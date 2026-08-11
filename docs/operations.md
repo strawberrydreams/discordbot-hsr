@@ -14,7 +14,7 @@
 
 `/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다. 음악 패널을 쓰려면 해당 음성 채널에서 봇에게 `Connect`, `Speak` 권한도 부여하세요. 음악의 `추가`는 같은 음성 채널에 있는 사용자의 개별 HTTP(S) URL만 받습니다. 요청자 또는 서버 관리자는 건너뛰기·자기 대기열 항목 제거를 할 수 있고, 일시정지·정지는 서버 관리자만 할 수 있습니다. `PyNaCl` 또는 `yt-dlp`가 없으면 음악만 비활성이고 나머지 봇은 동작합니다. 외부 사이트 변경으로 yt-dlp가 실패할 수 있으므로 직접 실행은 `.venv/bin/python -m pip install --upgrade yt-dlp` 후 재시작하고, Docker는 `docker compose build --no-cache bot && docker compose up -d --no-deps bot`으로 이미지를 다시 만드세요. 저작권·서비스 약관 준수와 지원되지 않는 콘텐츠의 책임은 운영자에게 있습니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 고정된 `127.0.0.1:8080`에서 시작하며, Compose는 web port를 publish하지 않습니다. launchd로 실행할 때도 loopback에서만 접근할 수 있습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 고정된 `127.0.0.1:8080`에서 시작하며, Compose는 web port를 host의 `127.0.0.1`에만 publish합니다. launchd로 실행할 때도 loopback에서만 접근할 수 있습니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
 
 웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다.
 

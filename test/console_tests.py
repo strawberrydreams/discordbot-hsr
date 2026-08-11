@@ -603,11 +603,13 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
     backup_service = compose.split("\n  backup:", 1)[1]
     check(
-        "Compose service별 settings mode와 no ports 구조",
+        "Compose service별 settings mode와 loopback 전용 port 구조",
         "      - ./settings:/app/settings\n" in bot_service
         and "      - ./settings:/app/settings:ro\n" not in bot_service
         and "      - ./settings:/app/settings:ro\n" in backup_service
-        and "ports:" not in bot_service
+        # host 쪽 bind를 빠뜨리면 web admin이 모든 interface에 열린다.
+        and '      - "127.0.0.1:8080:8080"\n' in bot_service
+        and "0.0.0.0" not in bot_service
         and "ports:" not in backup_service,
     )
     expected_healthcheck = (
@@ -752,8 +754,13 @@ def test_deployment_contracts():
             ),
         )
         check(
-            "Compose는 web port를 publish하지 않음",
-            all(not service.get("ports") for service in (bot, backup)),
+            "Compose web port는 host loopback에만 publish",
+            not backup.get("ports")
+            and [
+                (port.get("host_ip"), str(port.get("published")), port.get("target"))
+                for port in bot.get("ports", [])
+            ]
+            == [("127.0.0.1", "8080", 8080)],
         )
         check(
             "Compose 로그 크기 제한",
