@@ -3749,9 +3749,10 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
 
 
 class _WebSettingsRepository:
-    def __init__(self, guild_ids=(), channels=None):
+    def __init__(self, guild_ids=(), channels=None, music_channels=None):
         self.guild_ids = list(guild_ids)
         self.channels = dict(channels or {})
+        self.music_channels = dict(music_channels or {})
 
     def list_announcement_guild_ids(self):
         return list(self.guild_ids)
@@ -3762,14 +3763,23 @@ class _WebSettingsRepository:
             raise value
         return value
 
+    def get_music_channel(self, guild_id):
+        value = self.music_channels.get(guild_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_allow_host_announce(self, guild_id):
+        return guild_id in self.guild_ids
+
 
 class _WebBot:
     def __init__(self):
-        self.guilds = {}
+        self.guilds = []
         self.cogs = {}
 
     def get_guild(self, guild_id):
-        return self.guilds.get(guild_id)
+        return next((guild for guild in self.guilds if guild.id == guild_id), None)
 
     def get_cog(self, name):
         return self.cogs.get(name)
@@ -4444,9 +4454,10 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
 class _AnnouncementChannel:
     type = discord.ChannelType.text
 
-    def __init__(self, error=None, allowed=True):
+    def __init__(self, error=None, allowed=True, name="채널"):
         self.error = error
         self.allowed = allowed
+        self.name = name
         self.embeds = []
 
     def permissions_for(self, member):
@@ -4463,8 +4474,10 @@ class _AnnouncementChannel:
 
 
 class _AnnouncementGuild:
-    def __init__(self, channels):
+    def __init__(self, channels, guild_id=0, name="길드"):
         self.channels = channels
+        self.id = guild_id
+        self.name = name
         self.me = object()
 
     def get_channel(self, channel_id):
@@ -4483,14 +4496,14 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         broken = _AnnouncementChannel(error=RuntimeError("discord unavailable"))
         self.repository.guild_ids = [1, 2, 3, 4, 5]
         self.repository.channels = {1: 11, 2: 22, 3: 33, 4: 44, 5: 55}
-        self.bot.guilds = {
-            1: _AnnouncementGuild({11: sent}),
-            2: _AnnouncementGuild({22: forbidden}),
-            3: _AnnouncementGuild({}),
-            4: _AnnouncementGuild({44: broken}),
+        self.bot.guilds = [
+            _AnnouncementGuild({11: sent}, 1),
+            _AnnouncementGuild({22: forbidden}, 2),
+            _AnnouncementGuild({}, 3),
+            _AnnouncementGuild({44: broken}, 4),
             # guild 5 is inaccessible
-            999: _AnnouncementGuild({999: _AnnouncementChannel()}),  # opted out
-        }
+            _AnnouncementGuild({999: _AnnouncementChannel()}, 999),  # opted out
+        ]
         with patch.object(webadmin_cog.logger, "exception") as logged:
             response = await self.client.post(
                 "/announce",
@@ -4517,10 +4530,10 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         delivered = _AnnouncementChannel()
         self.repository.guild_ids = [1, 2]
         self.repository.channels = {1: 11, 2: 22}
-        self.bot.guilds = {
-            1: _AnnouncementGuild({11: _HangingChannel()}),
-            2: _AnnouncementGuild({22: delivered}),
-        }
+        self.bot.guilds = [
+            _AnnouncementGuild({11: _HangingChannel()}, 1),
+            _AnnouncementGuild({22: delivered}, 2),
+        ]
         with patch.object(webadmin_cog, "ANNOUNCE_SEND_TIMEOUT", 0.2), patch.object(
             webadmin_cog.logger, "exception"
         ):
@@ -4543,6 +4556,116 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         page = await response.text()
         self.assertIn("성공 1, 건너뜀 0, 실패 1", page)
         self.assertEqual(len(delivered.embeds), 1)
+
+    async def test_selected_guild_receives_announcement_alone_with_chosen_colour(self):
+        """대상을 고르면 그 길드에만, 고른 색으로 간다."""
+        _, csrf = await self._login()
+        picked = _AnnouncementChannel()
+        other = _AnnouncementChannel()
+        self.repository.guild_ids = [1, 2]
+        self.repository.channels = {1: 11, 2: 22}
+        self.bot.guilds = [
+            _AnnouncementGuild({11: picked}, 1),
+            _AnnouncementGuild({22: other}, 2),
+        ]
+        response = await self.client.post(
+            "/announce",
+            data={
+                "csrf": csrf,
+                "guild_id": "2",
+                "title": "Title",
+                "body": "Body",
+                "color": "#a1b2c3",
+            },
+        )
+        self.assertIn("성공 1, 건너뜀 0, 실패 0", await response.text())
+        self.assertEqual(picked.embeds, [])
+        self.assertEqual(len(other.embeds), 1)
+        self.assertEqual(other.embeds[0].colour, discord.Colour(0xA1B2C3))
+
+    async def test_announcement_to_opted_out_or_malformed_guild_sends_nothing(self):
+        """드롭다운에 없는 길드를 form에 박아 넣어도 옵트인 경계를 넘지 못한다."""
+        _, csrf = await self._login()
+        opted_in = _AnnouncementChannel()
+        opted_out = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11, 999: 999}
+        self.bot.guilds = [
+            _AnnouncementGuild({11: opted_in}, 1),
+            _AnnouncementGuild({999: opted_out}, 999),
+        ]
+        for guild_id, expected in (
+            ("999", "공지를 허용하지 않은 길드입니다."),
+            ("nope", "공지 대상 길드가 올바르지 않습니다."),
+        ):
+            with self.subTest(guild_id=guild_id):
+                response = await self.client.post(
+                    "/announce",
+                    data={
+                        "csrf": csrf,
+                        "guild_id": guild_id,
+                        "title": "Title",
+                        "body": "Body",
+                    },
+                )
+                self.assertIn(expected, await response.text())
+        self.assertEqual(opted_out.embeds, [])
+        self.assertEqual(opted_in.embeds, [])
+
+    async def test_malformed_colour_is_rejected_before_any_guild_is_contacted(self):
+        _, csrf = await self._login()
+        channel = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11}
+        self.bot.guilds = [_AnnouncementGuild({11: channel}, 1)]
+        response = await self.client.post(
+            "/announce",
+            data={
+                "csrf": csrf,
+                "title": "Title",
+                "body": "Body",
+                "color": "red; drop",
+            },
+        )
+        self.assertIn("공지 색상은 #RRGGBB 형식이어야 합니다.", await response.text())
+        self.assertEqual(channel.embeds, [])
+
+    async def test_index_lists_guild_settings_and_offers_only_opted_in_targets(self):
+        """운영자가 공지 대상과 패널 채널을 화면에서 확인할 수 있어야 한다."""
+        await self._login()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11, 2: 22}
+        self.repository.music_channels = {1: 12}
+        party = SimpleNamespace(name="🎮-파티")
+        music = SimpleNamespace(name="🎵-음악")
+        self.bot.guilds = [
+            _AnnouncementGuild({11: party, 12: music}, 1, "공지 켠 길드"),
+            _AnnouncementGuild({}, 2, "<공지 끈 길드>"),
+        ]
+        page = await (await self.client.get("/")).text()
+
+        self.assertIn("#🎮-파티", page)
+        self.assertIn("#🎵-음악", page)
+        # 길드 2는 party_channel_id 22가 있지만 채널이 사라졌고 음악은 미설정이다.
+        self.assertIn("삭제됨 (22)", page)
+        self.assertIn("미설정", page)
+        self.assertIn('<option value="1">공지 켠 길드</option>', page)
+        self.assertNotIn('value="2"', page)
+        # 길드 이름은 운영자가 통제하지 않는 외부 문자열이다.
+        self.assertNotIn("<공지 끈 길드>", page)
+        self.assertIn("&lt;공지 끈 길드&gt;", page)
+
+    async def test_unreadable_guild_settings_surface_instead_of_breaking_the_page(self):
+        await self._login()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: RuntimeError("db unavailable")}
+        self.bot.guilds = [_AnnouncementGuild({}, 1)]
+        with patch.object(webadmin_cog.logger, "exception") as logged:
+            response = await self.client.get("/")
+        page = await response.text()
+        self.assertEqual(response.status, 200)
+        self.assertIn("길드 설정을 읽지 못했습니다", page)
+        logged.assert_called_once()
 
     async def test_announcement_rejects_empty_and_discord_overlimit_text(self):
         _, csrf = await self._login()

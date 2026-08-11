@@ -44,10 +44,15 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
 }
+ANNOUNCEMENT_COLOUR_PATTERN = re.compile(r"#[0-9A-Fa-f]{6}\Z")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 PLACEHOLDER_PATTERN = re.compile(
-    r"{{(csrf|notice|error|persona|forbidden_words|games)}}"
+    r"{{(csrf|notice|error|persona|forbidden_words|games|guild_options|guild_rows)}}"
 )
+# 이 둘만 Python에서 조각마다 html.escape()해 조립한 HTML 단편이다. 나머지 값은
+# 그대로 escape한다. 여기에 새 키를 넣으려면 조립부가 모든 외부 값을 escape하는지
+# 먼저 확인할 것.
+RAW_PLACEHOLDERS = frozenset({"guild_options", "guild_rows"})
 logger = logging.getLogger(__name__)
 
 
@@ -189,10 +194,15 @@ class WebAdminCog(commands.Cog):
     @staticmethod
     def _template(name: str, **values: str) -> str:
         source = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
-        return PLACEHOLDER_PATTERN.sub(
-            lambda match: html.escape(values.get(match.group(1), ""), quote=True),
-            source,
-        )
+
+        def substitute(match: re.Match[str]) -> str:
+            key = match.group(1)
+            value = values.get(key, "")
+            if key in RAW_PLACEHOLDERS:
+                return value
+            return html.escape(value, quote=True)
+
+        return PLACEHOLDER_PATTERN.sub(substitute, source)
 
     def _login_response(self, error: str = "", *, status: int = 200) -> web.Response:
         return web.Response(
@@ -222,7 +232,49 @@ class WebAdminCog(commands.Cog):
         except UnicodeDecodeError:
             return "", f"{name}: UTF-8로 읽을 수 없습니다."
 
-    def _index_response(self, csrf: str, notice: str = "") -> web.Response:
+    @staticmethod
+    def _channel_label(guild, channel_id: int | None) -> str:
+        if not channel_id:
+            return "미설정"
+        channel = guild.get_channel(channel_id)
+        return f"#{channel.name}" if channel is not None else f"삭제됨 ({channel_id})"
+
+    async def _guild_overview(self) -> tuple[str, str, str]:
+        """(길드 현황 표의 행, 공지 대상 option, 읽기 실패 사유)를 돌려준다.
+
+        운영자는 어느 길드가 공지를 허용했고 패널 채널이 어디인지 확인할 수단이
+        없으면 공지를 보내기 전에 대상을 검증할 수 없다.
+
+        ponytail: 길드당 조회 3회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
+        길드가 수백 개로 늘면 전 길드 설정을 한 번에 읽는 repository 메서드를
+        추가한다.
+        """
+        rows: list[str] = []
+        options = ['<option value="">전체 (공지 허용 길드 모두)</option>']
+        for guild in self.bot.guilds:
+            try:
+                party = await run_db(self.settings.get_party_channel, guild.id)
+                music = await run_db(self.settings.get_music_channel, guild.id)
+                allowed = await run_db(self.settings.get_allow_host_announce, guild.id)
+            except Exception:
+                logger.exception("Guild overview lookup failed for guild_id=%s", guild.id)
+                return "", "".join(options), "길드 설정을 읽지 못했습니다."
+            name = html.escape(str(guild.name), quote=True)
+            rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    name,
+                    html.escape(self._channel_label(guild, party), quote=True),
+                    html.escape(self._channel_label(guild, music), quote=True),
+                    "허용" if allowed else "차단",
+                )
+            )
+            if allowed:
+                options.append(f'<option value="{int(guild.id)}">{name}</option>')
+        if not rows:
+            rows.append('<tr><td colspan="4">참여 중인 길드가 없습니다.</td></tr>')
+        return "".join(rows), "".join(options), ""
+
+    async def _index_response(self, csrf: str, notice: str = "") -> web.Response:
         texts: dict[str, str] = {}
         problems: list[str] = []
         for name in config.SETTINGS_FILES:
@@ -230,6 +282,9 @@ class WebAdminCog(commands.Cog):
             texts[name] = text
             if problem:
                 problems.append(problem)
+        guild_rows, guild_options, guild_problem = await self._guild_overview()
+        if guild_problem:
+            problems.append(guild_problem)
         if problems:
             warning = "설정을 읽지 못했습니다 — " + " / ".join(problems)
             notice = f"{notice} {warning}" if notice else warning
@@ -241,6 +296,8 @@ class WebAdminCog(commands.Cog):
                 persona=texts["persona.json"],
                 forbidden_words=texts["forbidden_words.json"],
                 games=texts["games.json"],
+                guild_rows=guild_rows,
+                guild_options=guild_options,
             ),
             content_type="text/html",
             charset="utf-8",
@@ -290,7 +347,7 @@ class WebAdminCog(commands.Cog):
         session = self._session(request)
         if session is None:
             raise web.HTTPFound("/login")
-        return self._index_response(session[1].csrf)
+        return await self._index_response(session[1].csrf)
 
     async def settings_post(self, request: web.Request) -> web.StreamResponse:
         self._require_session(request)
@@ -309,14 +366,14 @@ class WebAdminCog(commands.Cog):
                     if cog is not None:
                         await cog.reload_prohibited_words()
         except (OSError, ValueError, RecursionError) as exc:
-            return self._index_response(csrf, f"저장 실패: {exc}")
+            return await self._index_response(csrf, f"저장 실패: {exc}")
 
         notices = {
             "persona.json": "저장했습니다. 새 AI 세션부터 적용됩니다.",
             "forbidden_words.json": "저장하고 금지어 필터를 다시 불러왔습니다.",
             "games.json": "저장했습니다. 적용하려면 봇을 재시작하세요.",
         }
-        return self._index_response(csrf, notices[name])
+        return await self._index_response(csrf, notices[name])
 
     @staticmethod
     def _sendable_text_channel(guild, channel) -> bool:
@@ -341,18 +398,37 @@ class WebAdminCog(commands.Cog):
         csrf = session.csrf
         title = form.get("title", "").strip()
         body = form.get("body", "").strip()
+        target = form.get("guild_id", "").strip()
+        colour_text = form.get("color", "").strip()
         if not title or len(title) > ANNOUNCEMENT_TITLE_LIMIT:
-            return self._index_response(csrf, "공지 제목은 1~256자여야 합니다.")
+            return await self._index_response(csrf, "공지 제목은 1~256자여야 합니다.")
         if not body or len(body) > ANNOUNCEMENT_BODY_LIMIT:
-            return self._index_response(csrf, "공지 본문은 1~4,096자여야 합니다.")
+            return await self._index_response(csrf, "공지 본문은 1~4,096자여야 합니다.")
+        if target and not target.isdigit():
+            return await self._index_response(csrf, "공지 대상 길드가 올바르지 않습니다.")
+        colour = discord.Colour.default()
+        if colour_text:
+            if not ANNOUNCEMENT_COLOUR_PATTERN.match(colour_text):
+                return await self._index_response(
+                    csrf, "공지 색상은 #RRGGBB 형식이어야 합니다."
+                )
+            colour = discord.Colour(int(colour_text[1:], 16))
 
         success = skipped = failed = 0
         async with self._announce_lock:
             try:
                 guild_ids = await run_db(self.settings.list_announcement_guild_ids)
             except Exception:
-                return self._index_response(csrf, "공지 대상 목록을 읽지 못했습니다.")
-            embed = discord.Embed(title=title, description=body)
+                return await self._index_response(csrf, "공지 대상 목록을 읽지 못했습니다.")
+            if target:
+                # 옵트인 목록이 곧 신뢰 경계다. 드롭다운 표시 여부와 무관하게
+                # 전송 직전에 다시 확인해야 form을 조작한 요청이 통과하지 않는다.
+                if int(target) not in guild_ids:
+                    return await self._index_response(
+                        csrf, "공지를 허용하지 않은 길드입니다."
+                    )
+                guild_ids = [int(target)]
+            embed = discord.Embed(title=title, description=body, colour=colour)
             for guild_id in guild_ids:
                 try:
                     guild = self.bot.get_guild(guild_id)
@@ -372,7 +448,7 @@ class WebAdminCog(commands.Cog):
                     failed += 1
                     logger.exception("Host announcement failed for guild_id=%s", guild_id)
 
-        return self._index_response(
+        return await self._index_response(
             csrf, f"공지 완료: 성공 {success}, 건너뜀 {skipped}, 실패 {failed}"
         )
 
