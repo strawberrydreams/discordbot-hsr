@@ -10,9 +10,8 @@
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
 # ── 멀티 길드 ──
-# 봇은 여러 서버(길드)에 동시에 설치될 수 있다. 포인트·파티·설정은 모두 길드별로
-# 격리되며, 그 격리는 애플리케이션이 아니라 스키마가 보장한다. 모든 테이블의
-# 기본키에 guild_id가 포함되므로 guild_id를 빠뜨린 쿼리는 성립하지 않는다.
+# 포인트·출석·금지어·파티·설정은 스키마의 guild_id로 길드별 격리된다.
+# AI 일일 사용량은 하나의 인스턴스 안에서 유저별 전역이므로 guild_id를 저장하지 않는다.
 #
 # ── 동시성 ──
 # 리포지토리 메서드는 모두 동기(blocking)다. discord.py의 이벤트 루프에서 직접
@@ -52,6 +51,30 @@ def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection
     return conn
 
 
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _prepare_schema(conn: sqlite3.Connection, current: int, label: str) -> int:
+    version = _schema_version(conn)
+    if version > current:
+        raise RuntimeError(
+            f"{label} DB 버전 {version}은 이 코드가 지원하는 {current}보다 높습니다."
+        )
+    return version
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(f"PRAGMA user_version = {version}")
+
+
+def _require_columns(conn: sqlite3.Connection, table: str, expected: set[str]) -> None:
+    actual = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+    if not expected <= actual:
+        missing = ", ".join(sorted(expected - actual))
+        raise RuntimeError(f"지원하지 않는 {table} 스키마입니다. 누락 컬럼: {missing}")
+
+
 async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     """동기 리포지토리 호출을 스레드로 넘겨 이벤트 루프가 막히지 않게 한다.
 
@@ -75,7 +98,7 @@ def _record_ledger(
 # ─────────── 인터페이스 ─────────── #
 
 class AttendanceRepository(ABC):
-    """포인트·출석·금지어 카운트 데이터 접근 인터페이스. 모두 길드 단위로 격리된다."""
+    """길드별 출석/포인트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
 
     @abstractmethod
     def get_points(self, guild_id: int, user_id: int) -> int:
@@ -124,6 +147,20 @@ class AttendanceRepository(ABC):
         """해당 길드의 포인트 상위 유저 [(user_id, points), ...]."""
 
     @abstractmethod
+    def consume_ai_usage(
+        self, user_id: int, usage_date: str, command: str, limit: int
+    ) -> Optional[int]:
+        """인스턴스 전역 일일 사용량을 원자적으로 예약하고 새 count를 반환한다."""
+
+    @abstractmethod
+    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+        """예약한 일일 사용량을 0 아래로 내리지 않고 반환한다."""
+
+    @abstractmethod
+    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+        """인스턴스 전역 일일 사용량을 반환한다."""
+
+    @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
         """봇이 길드에서 제거됐을 때 해당 길드 데이터를 모두 지운다."""
 
@@ -136,8 +173,18 @@ class PartyRepository(ABC):
         """파티가 존재하면 (created_at,)을, 없으면 None을 반환한다."""
 
     @abstractmethod
-    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
-        """파티를 생성한다. 새로 만들었으면 True, 이미 있으면 False."""
+    def create_party(
+        self,
+        guild_id: int,
+        game: str,
+        created_at: int,
+        host_id: Optional[int] = None,
+    ) -> bool:
+        """파티를 생성한다. host_id가 있으면 방장 참가까지 한 트랜잭션에서 처리한다."""
+
+    @abstractmethod
+    def get_party_host(self, guild_id: int, game: str) -> Optional[int]:
+        """저장된 방장 ID를 반환한다. legacy 빈 파티는 None일 수 있다."""
 
     @abstractmethod
     def delete_party(self, guild_id: int, game: str) -> None:
@@ -157,11 +204,11 @@ class PartyRepository(ABC):
         max_players: Optional[int] = None,
     ) -> bool:
         """존재하는 파티에만 참가자를 추가하거나 역할을 갱신한다.
-        정원 초과와 역할 중복은 DB가 거부하며, 그 경우 행을 남기지 않는다."""
+        길드 내 단일 파티, 정원, 역할 중복은 DB가 원자적으로 거부한다."""
 
     @abstractmethod
-    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
-        """참가자를 제거한다."""
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> bool:
+        """참가자를 제거하고 방장 이탈 시 최소 user_id로 이전한다. 파티가 남으면 True."""
 
     @abstractmethod
     def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
@@ -172,28 +219,72 @@ class PartyRepository(ABC):
         """cutoff보다 오래된 파티를 전 길드에서 삭제하고 [(guild_id, game), ...]를 반환한다."""
 
     @abstractmethod
+    def list_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
+        """삭제하지 않고 만료 후보를 반환한다."""
+
+    @abstractmethod
+    def delete_party_if_expired(self, guild_id: int, game: str, cutoff: int) -> bool:
+        """현재 incarnation이 여전히 만료됐을 때만 원자적으로 삭제한다."""
+
+    @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
         """봇이 길드에서 제거됐을 때 해당 길드 데이터를 모두 지운다."""
 
 
 class GuildSettingsRepository(ABC):
-    """길드별 봇 설정. 채널 ID를 환경변수에 박으면 공개 배포가 불가능하므로 DB에 둔다."""
+    """길드별 봇 설정과 영속 패널 정보."""
 
     @abstractmethod
-    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
-        """파티 모집 채널 ID. 미설정이면 None."""
+    def get_party_channel(self, guild_id: int) -> Optional[int]:
+        """파티 패널 채널 ID. 미설정이면 None."""
 
     @abstractmethod
-    def get_event_channel(self, guild_id: int) -> Optional[int]:
-        """이벤트 채널 ID. 미설정이면 None."""
+    def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """파티 패널 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
-    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """파티 모집 채널을 지정한다. None이면 해제."""
+    def get_music_channel(self, guild_id: int) -> Optional[int]:
+        """음악 패널 채널 ID. 미설정이면 None."""
 
     @abstractmethod
-    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """이벤트 채널을 지정한다. None이면 해제."""
+    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """음악 패널 채널을 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
+        """음악 패널 메시지 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
+        """음악 패널 메시지 ID를 지정한다. None이면 해제."""
+
+    @abstractmethod
+    def get_allow_host_announce(self, guild_id: int) -> bool:
+        """파티 호스트 공지를 허용하는지 반환한다."""
+
+    @abstractmethod
+    def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
+        """파티 호스트 공지 허용 여부를 지정한다."""
+
+    @abstractmethod
+    def get_party_panels(self, guild_id: int) -> Dict[str, int]:
+        """게임별 영속 파티 패널 메시지 ID를 반환한다."""
+
+    @abstractmethod
+    def set_party_panel(self, guild_id: int, game: str, message_id: int) -> None:
+        """게임의 영속 파티 패널 메시지 ID를 저장한다."""
+
+    @abstractmethod
+    def delete_party_panel(self, guild_id: int, game: str) -> None:
+        """게임의 영속 파티 패널 정보를 지운다."""
+
+    @abstractmethod
+    def clear_channel(self, guild_id: int, channel_id: int) -> None:
+        """삭제된 채널을 가리키는 설정을 해제한다."""
+
+    @abstractmethod
+    def list_announcement_guild_ids(self) -> List[int]:
+        """호스트 공지를 허용한 길드 ID를 반환한다."""
 
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
@@ -203,6 +294,8 @@ class GuildSettingsRepository(ABC):
 # ─────────── SQLite 구현 ─────────── #
 
 class SQLiteAttendanceRepository(AttendanceRepository):
+    _SCHEMA_VERSION = 2
+
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +303,7 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "attendance")
             c = conn.cursor()
             # (guild_id, user_id)가 기본키다. 같은 사람이 서버마다 별도 잔액을 갖는다.
             c.execute("""
@@ -238,6 +332,31 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                 "CREATE INDEX IF NOT EXISTS idx_ledger_user "
                 "ON point_ledger (guild_id, user_id, id DESC)"
             )
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ai_usage (
+                    user_id INTEGER NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    count INTEGER NOT NULL CHECK (count >= 0),
+                    PRIMARY KEY (user_id, usage_date, command)
+                )
+            """)
+            _require_columns(
+                conn,
+                "users",
+                {"guild_id", "user_id", "points", "last_attendance_date", "forbidden_count"},
+            )
+            _require_columns(
+                conn,
+                "point_ledger",
+                {"id", "guild_id", "user_id", "delta", "reason", "created_at"},
+            )
+            _require_columns(
+                conn,
+                "ai_usage",
+                {"user_id", "usage_date", "command", "count"},
+            )
+            _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
 
     def get_points(self, guild_id: int, user_id: int) -> int:
@@ -249,6 +368,45 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             )
             result = c.fetchone()
             return result[0] if result else 0
+
+    def consume_ai_usage(
+        self, user_id: int, usage_date: str, command: str, limit: int
+    ) -> Optional[int]:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ai_usage (user_id, usage_date, command, count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_id, usage_date, command) DO UPDATE SET count = count + 1
+                WHERE count < ?
+                RETURNING count
+                """,
+                (user_id, usage_date, command, limit),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            return row[0] if row else None
+
+    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                "UPDATE ai_usage SET count = count - 1 "
+                "WHERE user_id = ? AND usage_date = ? AND command = ? AND count > 0",
+                (user_id, usage_date, command),
+            )
+            released = cursor.rowcount > 0
+            conn.commit()
+            return released
+
+    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT count FROM ai_usage "
+                "WHERE user_id = ? AND usage_date = ? AND command = ?",
+                (user_id, usage_date, command),
+            ).fetchone()
+            conn.commit()
+            return row[0] if row else 0
 
     def add_points(
         self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
@@ -367,6 +525,8 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
 
 class SQLitePartyRepository(PartyRepository):
+    _SCHEMA_VERSION = 2
+
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +534,7 @@ class SQLitePartyRepository(PartyRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "party")
             cursor = conn.cursor()
             # 길드당 게임별로 파티 하나.
             cursor.execute("""
@@ -381,6 +542,7 @@ class SQLitePartyRepository(PartyRepository):
                     guild_id INTEGER NOT NULL,
                     game TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
+                    host_id INTEGER,
                     PRIMARY KEY (guild_id, game)
                 )
             """)
@@ -393,11 +555,46 @@ class SQLitePartyRepository(PartyRepository):
                     PRIMARY KEY (guild_id, game, user_id)
                 )
             """)
-            # 역할 중복은 DB가 거부한다. guild_id를 포함해야 서버 간 간섭이 없다.
+            if version < 2 and "host_id" not in {
+                row[1] for row in cursor.execute("PRAGMA table_info(parties)")
+            }:
+                cursor.execute("ALTER TABLE parties ADD COLUMN host_id INTEGER")
+
+            # v1은 한 유저가 여러 게임에 들어갈 수 있었다. game 이름 순으로 하나만 보존한다.
+            if version < 2:
+                cursor.execute("""
+                    DELETE FROM participants
+                    WHERE game != (
+                        SELECT MIN(other.game)
+                        FROM participants AS other
+                        WHERE other.guild_id = participants.guild_id
+                          AND other.user_id = participants.user_id
+                    )
+                """)
+                cursor.execute("""
+                    UPDATE parties
+                    SET host_id = (
+                        SELECT MIN(user_id)
+                        FROM participants
+                        WHERE participants.guild_id = parties.guild_id
+                          AND participants.game = parties.game
+                    )
+                """)
+
+            # 역할과 길드 내 단일 활성 파티는 DB가 최종 판정한다.
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_role
                 ON participants (guild_id, game, role) WHERE role IS NOT NULL
             """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_user
+                ON participants (guild_id, user_id)
+            """)
+            _require_columns(
+                conn, "parties", {"guild_id", "game", "created_at", "host_id"}
+            )
+            _require_columns(conn, "participants", {"guild_id", "game", "user_id", "role"})
+            _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
 
     def get_party(self, guild_id: int, game: str) -> Optional[Tuple[int]]:
@@ -409,15 +606,47 @@ class SQLitePartyRepository(PartyRepository):
             )
             return cursor.fetchone()
 
-    def create_party(self, guild_id: int, game: str, created_at: int) -> bool:
-        with closing(_connect(self.db_path)) as conn:
+    def create_party(
+        self,
+        guild_id: int,
+        game: str,
+        created_at: int,
+        host_id: Optional[int] = None,
+    ) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                "INSERT OR IGNORE INTO parties (guild_id, game, created_at) VALUES (?, ?, ?)",
-                (guild_id, game, created_at),
+                "INSERT OR IGNORE INTO parties (guild_id, game, created_at, host_id) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, game, created_at, host_id),
             )
+            created = cursor.rowcount > 0
+            if created and host_id is not None:
+                cursor.execute(
+                    "INSERT INTO participants (guild_id, game, user_id, role) "
+                    "VALUES (?, ?, ?, NULL)",
+                    (guild_id, game, host_id),
+                )
             conn.commit()
-            return cursor.rowcount > 0
+            return created
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_party_host(self, guild_id: int, game: str) -> Optional[int]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT host_id FROM parties WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            ).fetchone()
+            return row[0] if row else None
 
     def delete_party(self, guild_id: int, game: str) -> None:
         with closing(_connect(self.db_path)) as conn:
@@ -477,6 +706,11 @@ class SQLitePartyRepository(PartyRepository):
                 "INSERT INTO participants (guild_id, game, user_id, role) VALUES (?, ?, ?, ?)",
                 (guild_id, game, user_id, role),
             )
+            cursor.execute(
+                "UPDATE parties SET host_id = COALESCE(host_id, ?) "
+                "WHERE guild_id = ? AND game = ?",
+                (user_id, guild_id, game),
+            )
             conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -488,14 +722,37 @@ class SQLitePartyRepository(PartyRepository):
         finally:
             conn.close()
 
-    def remove_participant(self, guild_id: int, game: str, user_id: int) -> None:
-        with closing(_connect(self.db_path)) as conn:
+    def remove_participant(self, guild_id: int, game: str, user_id: int) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 "DELETE FROM participants WHERE guild_id = ? AND game = ? AND user_id = ?",
                 (guild_id, game, user_id),
             )
+            next_host = cursor.execute(
+                "SELECT MIN(user_id) FROM participants WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            ).fetchone()[0]
+            if next_host is None:
+                cursor.execute(
+                    "DELETE FROM parties WHERE guild_id = ? AND game = ?",
+                    (guild_id, game),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE parties SET host_id = ? "
+                    "WHERE guild_id = ? AND game = ? AND host_id = ?",
+                    (next_host, guild_id, game, user_id),
+                )
             conn.commit()
+            return next_host is not None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_user_party(self, guild_id: int, user_id: int) -> Optional[str]:
         with closing(_connect(self.db_path)) as conn:
@@ -508,20 +765,49 @@ class SQLitePartyRepository(PartyRepository):
             return row[0] if row else None
 
     def delete_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
-        with closing(_connect(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT guild_id, game FROM parties WHERE created_at < ?", (cutoff,)
-            )
-            expired = [(row[0], row[1]) for row in cursor.fetchall()]
+        return [
+            key
+            for key in self.list_expired_parties(cutoff)
+            if self.delete_party_if_expired(key[0], key[1], cutoff)
+        ]
 
-            if expired:
-                cursor.executemany(
-                    "DELETE FROM participants WHERE guild_id = ? AND game = ?", expired
+    def list_expired_parties(self, cutoff: int) -> List[Tuple[int, str]]:
+        with closing(_connect(self.db_path)) as conn:
+            return [
+                (guild_id, game)
+                for guild_id, game in conn.execute(
+                    "SELECT guild_id, game FROM parties WHERE created_at < ?", (cutoff,)
                 )
-                cursor.execute("DELETE FROM parties WHERE created_at < ?", (cutoff,))
-                conn.commit()
-            return expired
+            ]
+
+    def delete_party_if_expired(self, guild_id: int, game: str, cutoff: int) -> bool:
+        conn = _connect(self.db_path, isolation_level=None)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            expired = cursor.execute(
+                "SELECT 1 FROM parties "
+                "WHERE guild_id = ? AND game = ? AND created_at < ?",
+                (guild_id, game, cutoff),
+            ).fetchone()
+            if not expired:
+                conn.rollback()
+                return False
+            cursor.execute(
+                "DELETE FROM participants WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
+            cursor.execute(
+                "DELETE FROM parties WHERE guild_id = ? AND game = ? AND created_at < ?",
+                (guild_id, game, cutoff),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
@@ -532,9 +818,28 @@ class SQLitePartyRepository(PartyRepository):
 
 
 class SQLiteGuildSettingsRepository(GuildSettingsRepository):
-    # 컬럼명은 아래 두 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
-    _RECRUIT = "recruit_channel_id"
-    _EVENT = "event_channel_id"
+    # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
+    _PARTY_CHANNEL = "party_channel_id"
+    _MUSIC_CHANNEL = "music_channel_id"
+    _MUSIC_PANEL_MESSAGE = "music_panel_msg_id"
+    _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
+    _SCHEMA_VERSION = 2
+    _CURRENT_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        _MUSIC_CHANNEL,
+        _MUSIC_PANEL_MESSAGE,
+        _ALLOW_HOST_ANNOUNCE,
+    }
+    _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
+    _GUILD_SETTINGS_COLUMN_ORDER = (
+        "guild_id",
+        _PARTY_CHANNEL,
+        _MUSIC_CHANNEL,
+        _MUSIC_PANEL_MESSAGE,
+        _ALLOW_HOST_ANNOUNCE,
+    )
+    _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -543,14 +848,104 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id INTEGER PRIMARY KEY,
-                    recruit_channel_id INTEGER,
-                    event_channel_id INTEGER
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "settings")
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
-            """)
-            conn.commit()
+            }
+            if "guild_settings" not in tables:
+                if version:
+                    raise RuntimeError("지원하지 않는 guild_settings 스키마입니다.")
+                with conn:
+                    self._create_current_tables(conn)
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                return
+
+            columns = {
+                row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
+            }
+            if version < self._SCHEMA_VERSION and self._LEGACY_COLUMNS <= columns:
+                conn.execute("BEGIN")
+                try:
+                    conn.execute("ALTER TABLE guild_settings RENAME TO guild_settings_v1")
+                    self._create_current_tables(conn)
+                    conn.execute(
+                        """
+                        INSERT INTO guild_settings (guild_id, party_channel_id)
+                        SELECT guild_id, recruit_channel_id FROM guild_settings_v1
+                        """
+                    )
+                    conn.execute("DROP TABLE guild_settings_v1")
+                    self._require_current_contract(conn)
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                except Exception:
+                    conn.rollback()
+                    raise
+                else:
+                    conn.commit()
+                return
+
+            with conn:
+                self._create_party_panels_table(conn)
+                self._require_current_contract(conn)
+                _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    @classmethod
+    def _require_current_contract(cls, conn: sqlite3.Connection) -> None:
+        cls._require_table_contract(
+            conn,
+            "guild_settings",
+            cls._GUILD_SETTINGS_COLUMN_ORDER,
+            ("guild_id",),
+        )
+        cls._require_table_contract(
+            conn,
+            "party_panels",
+            cls._PARTY_PANELS_COLUMN_ORDER,
+            ("guild_id", "game"),
+        )
+
+    @staticmethod
+    def _require_table_contract(
+        conn: sqlite3.Connection,
+        table: str,
+        columns: tuple[str, ...],
+        primary_key: tuple[str, ...],
+    ) -> None:
+        actual = list(conn.execute(f'PRAGMA table_info("{table}")'))
+        actual_columns = tuple(row[1] for row in actual)
+        actual_primary_key = tuple(
+            row[1] for row in sorted(actual, key=lambda row: row[5]) if row[5]
+        )
+        if actual_columns != columns or actual_primary_key != primary_key:
+            raise RuntimeError(f"지원하지 않는 {table} 스키마입니다.")
+
+    @staticmethod
+    def _create_current_tables(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+                    CHECK (allow_host_announce IN (0, 1))
+            )
+        """)
+        SQLiteGuildSettingsRepository._create_party_panels_table(conn)
+
+    @staticmethod
+    def _create_party_panels_table(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            )
+        """)
 
     def _get_column(self, guild_id: int, column: str) -> Optional[int]:
         with closing(_connect(self.db_path)) as conn:
@@ -570,20 +965,85 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             )
             conn.commit()
 
-    def get_recruit_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._RECRUIT)
+    def get_party_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._PARTY_CHANNEL)
 
-    def get_event_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._EVENT)
+    def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._PARTY_CHANNEL, channel_id)
 
-    def set_recruit_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._RECRUIT, channel_id)
+    def get_music_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._MUSIC_CHANNEL)
 
-    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._EVENT, channel_id)
+    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._MUSIC_CHANNEL, channel_id)
+
+    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._MUSIC_PANEL_MESSAGE)
+
+    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._MUSIC_PANEL_MESSAGE, message_id)
+
+    def get_allow_host_announce(self, guild_id: int) -> bool:
+        return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
+
+    def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
+        self._set_column(guild_id, self._ALLOW_HOST_ANNOUNCE, int(allowed))
+
+    def get_party_panels(self, guild_id: int) -> Dict[str, int]:
+        with closing(_connect(self.db_path)) as conn:
+            return {
+                game: message_id
+                for game, message_id in conn.execute(
+                    "SELECT game, message_id FROM party_panels WHERE guild_id = ?",
+                    (guild_id,),
+                )
+            }
+
+    def set_party_panel(self, guild_id: int, game: str, message_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO party_panels (guild_id, game, message_id) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, game) DO UPDATE SET message_id = excluded.message_id
+                """,
+                (guild_id, game, message_id),
+            )
+            conn.commit()
+
+    def delete_party_panel(self, guild_id: int, game: str) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                "DELETE FROM party_panels WHERE guild_id = ? AND game = ?",
+                (guild_id, game),
+            )
+            conn.commit()
+
+    def clear_channel(self, guild_id: int, channel_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE guild_settings
+                SET party_channel_id = CASE WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
+                    music_panel_msg_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_panel_msg_id END,
+                    music_channel_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_channel_id END
+                WHERE guild_id = ? AND (party_channel_id = ? OR music_channel_id = ?)
+                """,
+                (channel_id, channel_id, channel_id, guild_id, channel_id, channel_id),
+            )
+            conn.commit()
+
+    def list_announcement_guild_ids(self) -> List[int]:
+        with closing(_connect(self.db_path)) as conn:
+            return [
+                guild_id
+                for (guild_id,) in conn.execute(
+                    "SELECT guild_id FROM guild_settings WHERE allow_host_announce = 1"
+                )
+            ]
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM party_panels WHERE guild_id = ?", (guild_id,))
             conn.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
             conn.commit()
 

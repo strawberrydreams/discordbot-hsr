@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     volumes:
+      # 웹 관리는 container loopback에만 bind하며 ports를 publish하지 않는다.
       - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
@@ -30,6 +31,7 @@ services:
       # 백업 코드는 온라인 backup API로 읽기만 한다.
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
+      - ./settings:/app/settings:ro
     logging:
       driver: json-file
       options:

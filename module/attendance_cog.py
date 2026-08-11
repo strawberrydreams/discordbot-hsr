@@ -7,6 +7,9 @@ from discord.ext import commands
 
 from module.database import AttendanceRepository, create_attendance_repository, run_db
 
+KST = timezone(timedelta(hours=9))
+
+
 class AttendanceCog(commands.Cog):
     def __init__(self, bot: commands.Bot, repository: Optional[AttendanceRepository] = None):
         self.bot = bot
@@ -17,7 +20,7 @@ class AttendanceCog(commands.Cog):
     #
     # 전부 async다. 리포지토리는 동기 blocking이므로 run_db()로 스레드에 넘긴다.
     # 이벤트 루프에서 직접 호출하면 백업과의 락 경합 때 봇 전체가 멈춘다.
-    # 포인트는 길드별로 격리되므로 guild_id가 첫 인자다.
+    # 포인트는 guild_id로 격리되고 AI 일일 사용량은 인스턴스 전역이다.
 
     async def get_points(self, guild_id: int, user_id: int) -> int:
         """Returns the current points of a user in that guild."""
@@ -39,6 +42,26 @@ class AttendanceCog(commands.Cog):
         """Returns recent point movements [(delta, reason, created_at), ...]."""
         return await run_db(self.db.get_ledger, guild_id, user_id, limit)
 
+    async def reserve_ai_usage(
+        self, user_id: int, command: str, limit: int
+    ) -> Optional[tuple[str, int]]:
+        usage_date = datetime.now(KST).date().isoformat()
+        count = await run_db(
+            self.db.consume_ai_usage, user_id, usage_date, command, limit
+        )
+        return (usage_date, count) if count is not None else None
+
+    async def release_ai_usage(
+        self, user_id: int, usage_date: str, command: str
+    ) -> bool:
+        return await run_db(
+            self.db.release_ai_usage, user_id, usage_date, command
+        )
+
+    async def get_ai_usage(self, user_id: int, command: str) -> int:
+        usage_date = datetime.now(KST).date().isoformat()
+        return await run_db(self.db.get_ai_usage, user_id, usage_date, command)
+
     async def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         """Increments the forbidden word count for a user."""
         await run_db(self.db.increment_forbidden_count, guild_id, user_id)
@@ -58,8 +81,7 @@ class AttendanceCog(commands.Cog):
     @app_commands.guild_only()
     async def _attend(self, inter: discord.Interaction):
         user_id = inter.user.id
-        kst = timezone(timedelta(hours=9))
-        today_str = datetime.now(kst).date().isoformat()
+        today_str = datetime.now(KST).date().isoformat()
 
         reward = random.randint(5000, 30000)
         new_points = await run_db(

@@ -10,6 +10,7 @@
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
 #   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
+#   9. 음악 core·영속 패널 계약
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
@@ -31,6 +32,7 @@ import threading
 import time
 from contextlib import closing, redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dotenv import dotenv_values
@@ -66,6 +68,34 @@ def check(name: str, condition: bool, detail: str = ""):
         print(f"  ❌ {name} {detail}")
 
 
+def _create_legacy_attendance_db(path: pathlib.Path, version: int = 1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(f"""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                last_attendance_date TEXT,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE TABLE point_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            INSERT INTO point_ledger
+                (guild_id, user_id, delta, reason, created_at)
+                VALUES (7, 8, 9000, 'attendance', 1);
+            PRAGMA user_version = {version};
+        """)
+
+
 
 # ─────────── 길드 바인딩 어댑터 ─────────── #
 #
@@ -77,10 +107,17 @@ _TEST_GUILD = 1
 
 
 class _GuildBound:
-    """모든 리포지토리 호출에 고정 guild_id를 앞에 끼워 넣는다."""
+    """길드 단위 리포지토리 호출에 고정 guild_id를 앞에 끼워 넣는다."""
 
     # 길드 인자를 받지 않는 메서드(전 길드 대상 또는 길드 자체가 인자).
-    _UNBOUND = {"delete_expired_parties", "delete_guild"}
+    _UNBOUND = {
+        "consume_ai_usage",
+        "delete_expired_parties",
+        "delete_guild",
+        "get_ai_usage",
+        "list_expired_parties",
+        "release_ai_usage",
+    }
 
     def __init__(self, repo, guild_id=_TEST_GUILD):
         self._repo = repo
@@ -223,6 +260,7 @@ def test_public_env_contract():
         "LIMIT_IMAGE",
     }
     check("공개 env 변수 계약", set(example) == expected)
+    check("관리 토큰 env 예제는 빈 값", example["ADMIN_TOKEN"] == "")
     check(
         "실제 env 파일 ignore",
         all(
@@ -246,6 +284,346 @@ def test_public_env_contract():
         ).returncode
         == 0,
     )
+
+
+def test_web_admin_atomic_settings_contract():
+    import module.config as config
+
+    settings_dir = _TMP_DIR / "web-admin-settings"
+    settings_dir.mkdir()
+    target = settings_dir / "forbidden_words.json"
+    target.write_bytes(b'["old"]\n')
+    with patch.object(config, "SETTINGS_DIR", settings_dir):
+        config.atomic_write_settings("forbidden_words.json", ["new"])
+        check(
+            "관리 설정 정상 원자 교체",
+            json.loads(target.read_text(encoding="utf-8")) == ["new"],
+        )
+        valid_bytes = target.read_bytes()
+        try:
+            config.atomic_write_settings("forbidden_words.json", {})
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(
+            "관리 설정 validation 실패 시 원본 보존",
+            rejected and target.read_bytes() == valid_bytes,
+        )
+
+
+def test_forbidden_word_document_path():
+    public_docs = "\n".join(
+        (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for name in ("README.md", "docs/operations.md")
+    )
+    check("금지어 기준 경로는 settings", "settings/forbidden_words.json" in public_docs)
+    check(
+        "폐기된 금지어 runtime 경로 없음",
+        "runtime/data/forbidden_words.json" not in public_docs,
+    )
+    check("폐기된 금지어 env 없음", "FORBIDDEN_WORDS_FILE" not in public_docs)
+
+
+def test_readme_public_distribution_contract():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    required = (
+        "자가 호스팅 커뮤니티 유틸리티 봇",
+        "자신의 Discord Application과 봇 토큰",
+        "Guild Install만",
+        "`bot`, `applications.commands`",
+        "`View Channel`",
+        "`Send Messages`",
+        "`Read Message History`",
+        "`Embed Links`",
+        "`Attach Files`",
+        "`Message Content`와 `Server Members`",
+        "`Public Bot`을 끄세요",
+        "Portal 설정을 변경하지는 않습니다",
+        "settings/forbidden_words.json",
+        "사용자별 KST 일일 AI 한도",
+        "`LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`",
+        "provider 계정에도 예산 상한",
+        "Docker Compose를 권장",
+        "launchd 선택 사항",
+        "포인트·출석·금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`",
+        "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
+        "`Manage Guild` 권한",
+    )
+    check("README 공개 배포 계약", all(term in readme for term in required))
+    check(
+        "README는 Hyacine 팬 프로젝트 고지 유지",
+        "Hyacine" in readme and "비공식 팬 프로젝트" in readme and "HoYoverse" in readme,
+    )
+    check("README는 타인 호스팅을 약속하지 않음", "다른 사람에게 봇을 호스팅" in readme)
+
+
+def test_operations_document_contract():
+    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    check(
+        "복구는 내장 stage restore를 사용",
+        "stage_restore(Path(sys.argv[1]), Path(sys.argv[2]))" in restore,
+    )
+    check("복구가 stage의 모든 DB를 순회", 'for staged in "$RESTORE_STAGE"/*.db' in restore)
+    check(
+        "복구가 존재한 설정 파일별 확인 교체",
+        "for name in persona.json forbidden_words.json games.json; do" in restore
+        and 'test -f "$staged" || continue' in restore
+        and 'cmp -s "$staged" "settings/$name"' in restore,
+    )
+    check("복구 문서에 긴 DB 수리 one-liner 없음", "verify_database" not in restore)
+    check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
+    check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
+    check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
+    check("AI 한도는 KST 자정 리셋", "매일 KST 자정에 리셋" in operations)
+    check("AI 한도는 포인트와 별도", "포인트와 별도로 적용" in operations)
+    check("provider 계정 예산 안전망 유지", "OpenAI 계정 예산 한도" in operations)
+
+
+def test_final_installation_and_operations_contract():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    public_docs = f"{readme}\n{operations}"
+    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    quick_start = readme.split("## 빠른 시작", 1)[1].split("## 운영 시 주의", 1)[0]
+    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    restore_script = restore.split("```bash", 1)[1].split("```", 1)[0]
+    deployment = operations.split("## 배포", 1)[1].split("## 코드 롤백", 1)[0]
+    docker_deploy = deployment.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+    rollback = operations.split("## 코드 롤백", 1)[1].split("## 호스트 한계", 1)[0]
+    docker_rollback = rollback.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+
+    def ordered(text, *terms):
+        cursor = -1
+        for term in terms:
+            cursor = text.find(term, cursor + 1)
+            if cursor < 0:
+                return False
+        return True
+
+    check(
+        "설치 문서는 세 설정 JSON을 exact copy",
+        """cp settings/persona.example.json settings/persona.json
+cp settings/forbidden_words.example.json settings/forbidden_words.json
+cp settings/games.example.json settings/games.json""" in quick_start,
+    )
+    check(
+        "빠른 시작은 env 작성→copy→build→ownership→up→Guild 설정 순서",
+        ordered(
+            quick_start,
+            "다음 단계로 가기 전에 값을 채웁니다.",
+            "cp settings/persona.example.json settings/persona.json",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "test -z \"$(sudo find settings runtime",
+            "docker compose up -d",
+            "Installation은 **Guild Install만**",
+            "Discord에서 `/설정 시작`을 실행합니다.",
+        ),
+    )
+    check(
+        "Docker quick-start는 host test virtualenv를 build 전에 설치",
+        """python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+docker compose config --quiet
+docker compose build bot""" in quick_start,
+    )
+    check(
+        "설치 ownership은 image UID/GID와 restrictive mode를 exact 검증",
+        r'''BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+BOT_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+sudo chown -R "$BOT_UID:$BOT_GID" settings runtime
+sudo find settings runtime -type d -exec chmod 700 {} +
+sudo find settings runtime -type f -exec chmod 600 {} +
+test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" -o -perm -022 \) -print -quit)"''' in quick_start,
+    )
+    check(
+        "설치는 container에서 settings rw와 runtime rw를 확인 후 up",
+        ordered(
+            quick_start,
+            "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+            "test -r /app/settings/persona.json && test -w /app/settings/persona.json",
+            "test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json",
+            "test -r /app/settings/games.json && test -w /app/settings/games.json",
+            "test -w /app/runtime/data && test -w /app/runtime/backups'",
+            "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+            "test -r /app/settings/persona.json && test ! -w /app/settings/persona.json",
+            "docker compose up -d",
+        ),
+    )
+    check(
+        "현재 설정과 영속 panel 명령 block 유지",
+        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
+    )
+    check(
+        "channel과 voice permission block 유지",
+        """- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
+- `Connect`
+- `Speak`""" in quick_start,
+    )
+    check(
+        "웹 관리는 선택 token·고정 loopback·unsupported remote 경계",
+        "`ADMIN_TOKEN`은 선택 사항입니다." in readme
+        and "고정된 `127.0.0.1:8080`에만 bind됩니다." in readme
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다." in readme
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며" in operations
+        and "port가 아닌 host-scoped" in operations,
+    )
+    check(
+        "공지는 opt-in Guild의 configured party channel만 대상",
+        "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
+    )
+    check(
+        "음악 선택 의존성과 exact yt-dlp 갱신 절차",
+        "`PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다." in readme
+        and ".venv/bin/python -m pip install --upgrade yt-dlp" in readme
+        and "docker compose build --no-cache bot && docker compose up -d --no-deps bot" in readme,
+    )
+    check(
+        "MIT와 무기여 정책을 유지",
+        "MIT License" in readme and "사용자 기여를 받지 않습니다" in readme,
+    )
+    check(
+        "사용자 문서에 폐기된 파티 명령·설정 열 없음",
+        all(
+            term not in public_docs
+            for term in (
+                "/모집",
+                "/파티",
+                "/나가기",
+                "/변경",
+                "recruit_channel_id",
+                "event_channel_id",
+            )
+        ),
+    )
+    check(
+        "백업은 세 DB와 존재한 세 settings를 exact same manifest로 설명",
+        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+    )
+    check(
+        "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
+        ordered(
+            restore_script,
+            "docker compose stop bot backup",
+            "from module.backup import stage_restore",
+            'cp -ip "$staged" "runtime/data/$name"',
+            'cp -ip "$staged" "settings/$name"',
+            "SERVICE_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            'sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime',
+            "sudo find settings runtime -type d -exec chmod 700 {} +",
+            'test -z "$(sudo find settings runtime',
+            "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+            "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+            "docker compose start backup",
+            "docker compose start bot",
+            "BOT_CONTAINER_ID=$(docker compose ps -q bot)",
+            "docker inspect --format '{{.State.Health.Status}}' \"$BOT_CONTAINER_ID\"",
+            "docker compose logs --tail=100 bot",
+        )
+        and "discordbot-hsr-bot-1" not in restore,
+    )
+    check(
+        "복구는 Docker stage 뒤 operator에게 넘기고 restart 전 image user로 복귀",
+        ordered(
+            restore_script,
+            "docker compose run --rm --no-deps -T --entrypoint python backup",
+            'sudo chown -R "$(id -u):$(id -g)" settings runtime',
+            'sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime',
+        ),
+    )
+    trap_contract = (
+        "trap restore_bot_mounts EXIT",
+        "trap 'exit 129' HUP",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
+    )
+    mount_guard_contract = (
+        "restore_bot_mounts() {",
+        'sudo chown -R "$BOT_UID:$BOT_GID" settings runtime',
+        "sudo find settings runtime -type d -exec chmod 700 {} +",
+        "sudo find settings runtime -type f -exec chmod 600 {} +",
+        "verify_bot_mounts() {",
+        'test -z "$(sudo find settings runtime',
+        "docker compose run --rm --no-deps --entrypoint sh bot -c '",
+        "docker compose run --rm --no-deps --entrypoint sh backup -c '",
+    )
+    check(
+        "Docker deploy는 stop→host handoff→Git→restore/verify→trap clear→restart",
+        ordered(
+            docker_deploy,
+            "test -x .venv/bin/python",
+            "docker compose stop bot backup",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "trap restore_bot_mounts EXIT",
+            'sudo chown -R "$HOST_UID:$HOST_GID" settings',
+            "git pull --ff-only",
+            ".venv/bin/python -m test.console_tests",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "restore_bot_mounts",
+            "verify_bot_mounts",
+            "trap - EXIT HUP INT TERM",
+            "docker compose up -d --no-deps bot backup",
+        )
+        and all(term in docker_deploy for term in trap_contract + mount_guard_contract)
+        and 'sudo chown -R "$HOST_UID:$HOST_GID" settings runtime' not in docker_deploy,
+    )
+    check(
+        "Docker rollback은 stop→host handoff→Git→restore/verify→trap clear→restart",
+        ordered(
+            docker_rollback,
+            "test -x .venv/bin/python",
+            "docker compose stop bot backup",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "trap restore_bot_mounts EXIT",
+            'sudo chown -R "$HOST_UID:$HOST_GID" settings',
+            'revert) git revert "$TARGET_COMMIT"',
+            ".venv/bin/python -m test.console_tests",
+            "docker compose build bot",
+            "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
+            "restore_bot_mounts",
+            "verify_bot_mounts",
+            "docker compose run --rm --no-deps backup python -m module.backup verify",
+            "trap - EXIT HUP INT TERM",
+            "docker compose up -d --no-deps bot backup",
+        )
+        and 'checkout) git checkout "$TARGET_COMMIT"' in docker_rollback
+        and all(term in docker_rollback for term in trap_contract + mount_guard_contract)
+        and 'sudo chown -R "$HOST_UID:$HOST_GID" settings runtime' not in docker_rollback,
+    )
+    check(
+        "모든 Docker host venv workflow는 setup과 executable guard에 연결",
+        "이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다." in operations
+        and ordered(docker_deploy, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests")
+        and ordered(docker_rollback, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests"),
+    )
+    bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
+    backup_service = compose.split("\n  backup:", 1)[1]
+    check(
+        "Compose service별 settings mode와 no ports 구조",
+        "      - ./settings:/app/settings\n" in bot_service
+        and "      - ./settings:/app/settings:ro\n" not in bot_service
+        and "      - ./settings:/app/settings:ro\n" in backup_service
+        and "ports:" not in bot_service
+        and "ports:" not in backup_service,
+    )
+    expected_healthcheck = (
+        "HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 "
+        + chr(92)
+        + "\n"
+        + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
+    )
+    check(
+        "Docker runtime은 exact ffmpeg install과 main healthcheck",
+        "apt-get install -y --no-install-recommends ffmpeg" in dockerfile
+        and expected_healthcheck in dockerfile
+        and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
+    )
+
+
 def test_deployment_contracts():
     import plistlib
 
@@ -356,6 +734,28 @@ def test_deployment_contracts():
             ),
         )
         check(
+            "backup 설정 마운트는 읽기 전용",
+            any(
+                str(mount.get("source", "")).endswith("settings")
+                and mount.get("target") == "/app/settings"
+                and mount.get("read_only", False)
+                for mount in backup["volumes"]
+            ),
+        )
+        check(
+            "bot 설정 마운트는 쓰기 가능",
+            any(
+                str(mount.get("source", "")).endswith("settings")
+                and mount.get("target") == "/app/settings"
+                and not mount.get("read_only", False)
+                for mount in bot["volumes"]
+            ),
+        )
+        check(
+            "Compose는 web port를 publish하지 않음",
+            all(not service.get("ports") for service in (bot, backup)),
+        )
+        check(
             "Compose 로그 크기 제한",
             all(
                 service.get("logging", {}).get("driver") == "json-file"
@@ -397,8 +797,8 @@ def test_deployment_contracts():
         },
     )
     check(
-        "newsyslog replacement 로그 owner/group 명시",
-        all(entry[1] == "strawberrydreams:staff" for entry in newsyslog_entries),
+        "newsyslog template owner/group placeholder 명시",
+        all(entry[1] == "__USER__:__GROUP__" for entry in newsyslog_entries),
     )
     working_directory = pathlib.Path(bot_plist["WorkingDirectory"])
     expected_pid_by_log = {
@@ -424,6 +824,96 @@ def test_deployment_contracts():
             for entry in newsyslog_entries
         ),
     )
+
+
+def test_macos_templates_render_portably():
+    import plistlib
+    from deploy.macos.render_templates import render_templates
+
+    template_dir = PROJECT_ROOT / "deploy/macos"
+    template_texts = [
+        (template_dir / name).read_text(encoding="utf-8")
+        for name in (
+            "com.discordbot.hsr.plist.example",
+            "com.discordbot.hsr-backup.plist.example",
+            "com.discordbot.hsr.newsyslog.conf.example",
+        )
+    ]
+    check(
+        "macOS templates have no author-specific values",
+        all(
+            "/Users/strawberrydreams" not in text
+            and "strawberrydreams:staff" not in text
+            for text in template_texts
+        ),
+    )
+
+    project_root = pathlib.Path("/tmp/portable&<clone>#/discordbot-hsr")
+    with tempfile.TemporaryDirectory() as directory:
+        output_dir = pathlib.Path(directory)
+        render_templates(project_root, output_dir, "portable-user", "portable-group")
+        bot_plist = plistlib.loads((output_dir / "com.discordbot.hsr.plist").read_bytes())
+        backup_plist = plistlib.loads(
+            (output_dir / "com.discordbot.hsr-backup.plist").read_bytes()
+        )
+        newsyslog = (output_dir / "com.discordbot.hsr.conf").read_text(encoding="utf-8")
+
+    check(
+        "rendered plist paths use clone root",
+        all(
+            project_root.as_posix() in value
+            for plist in (bot_plist, backup_plist)
+            for value in (
+                plist["ProgramArguments"][0],
+                plist["WorkingDirectory"],
+                plist["StandardOutPath"],
+                plist["StandardErrorPath"],
+            )
+        ),
+    )
+    check(
+        "rendered newsyslog uses clone user and group",
+        "/tmp/portable&<clone>\\#/discordbot-hsr" in newsyslog
+        and "portable-user:portable-group" in newsyslog
+        and not any(
+            placeholder in newsyslog
+            for placeholder in ("__PROJECT_ROOT__", "__USER__", "__GROUP__")
+        ),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        output_dir = pathlib.Path(directory)
+        try:
+            render_templates(
+                pathlib.Path("/tmp/portable clone/discordbot-hsr"),
+                output_dir,
+                "portable-user",
+                "portable-group",
+            )
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check(
+            "newsyslog-incompatible whitespace path rejected before output",
+            rejected and not any(output_dir.iterdir()),
+        )
+
+    collision_cases = (
+        (pathlib.Path("/tmp/__USER__/discordbot-hsr"), "portable-user", "portable-group"),
+        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable__GROUP__", "portable-group"),
+        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable-user", "__PROJECT_ROOT__"),
+    )
+    for index, (root, user, group) in enumerate(collision_cases):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = pathlib.Path(directory)
+            try:
+                render_templates(root, output_dir, user, group)
+                rejected = False
+            except RuntimeError:
+                rejected = True
+            check(
+                f"reserved renderer token input {index + 1} rejected before output",
+                rejected and not any(output_dir.iterdir()),
+            )
 
 
 def test_deployment_contracts_skip_only_compose_when_cli_missing():
@@ -494,16 +984,41 @@ def test_startup_syncs_commands_globally():
     class FakeBot:
         tree = FakeTree()
 
+        def add_view(self, view):
+            events.append("view:setup")
+
+        async def add_cog(self, cog):
+            events.append("cog:guildsettings")
+
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
+            if extension == "module.guildsettings_cog":
+                from module.guildsettings_cog import setup
+
+                await setup(self)
+
+    def verify(*, existing_only=False, allow_legacy=False):
+        events.append("verify:pre" if existing_only and allow_legacy else "verify:post")
 
     with patch.object(main, "DATA_DIR", data_dir), \
-         patch.object(main, "_verify_databases"):
+         patch.object(main, "_verify_databases", side_effect=verify):
         asyncio.run(main.MyBot.setup_hook(FakeBot()))
 
     check("전역으로만 sync", [e for e in events if e.startswith("sync")] == ["sync:global"],
           f"({events})")
     check("sync는 모든 Cog 로드 후", events[-1] == "sync:global", f"({events})")
+    check(
+        "persistent SetupView는 전역 sync 전에 등록",
+        events.index("view:setup") < events.index("sync:global"),
+        f"({events})",
+    )
+    check(
+        "DB 사전 검증·마이그레이션 뒤 사후 검증 후 sync",
+        events.index("verify:pre") < events.index("load:module.guildsettings_cog")
+        < events.index("verify:post")
+        < events.index("sync:global"),
+        f"({events})",
+    )
     check(
         "길드 설정 Cog가 로드 목록에 포함",
         "load:module.guildsettings_cog" in events,
@@ -530,7 +1045,7 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
 
-    def fail_verify(path, tables):
+    def fail_verify(path, tables, **kwargs):
         events.append(f"verify:{path.name}")
         raise RuntimeError("missing production database")
 
@@ -542,6 +1057,58 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
         except RuntimeError:
             check("사전 DB 검증 실패 전파", True)
     check("사전 DB 검증 실패 시 Cog와 sync 미실행", events == ["verify:attendance_data.db"], f"({events})")
+
+
+def test_startup_migrates_legacy_attendance_before_strict_verification():
+    import module.main as main
+
+    data_dir = _TMP_DIR / "legacy-startup-data"
+    attendance_path = data_dir / "attendance_data.db"
+    _create_legacy_attendance_db(attendance_path)
+    SQLitePartyRepository(data_dir / "party_data.db")
+    SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+    events = []
+
+    class FakeBot:
+        class tree:
+            @staticmethod
+            async def sync():
+                events.append("sync")
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+            if extension == "module.attendance_cog":
+                SQLiteAttendanceRepository(attendance_path)
+                events.append("migrate:attendance")
+
+    with patch.object(main, "DATA_DIR", data_dir):
+        try:
+            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            started = True
+        except RuntimeError:
+            started = False
+
+    with closing(sqlite3.connect(attendance_path)) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        points = conn.execute(
+            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        ).fetchone()
+    check("legacy attendance startup reaches repository migration", started)
+    check(
+        "startup migration precedes sync and preserves data",
+        version == 2
+        and "ai_usage" in tables
+        and points == (9000,)
+        and "migrate:attendance" in events
+        and events.index("migrate:attendance") < events.index("sync"),
+        f"(version={version}, events={events})",
+    )
 
 
 def test_startup_cog_failure_stops_postverification_and_sync():
@@ -561,11 +1128,14 @@ def test_startup_cog_failure_stops_postverification_and_sync():
             if extension == main.EXTENSIONS[1][0]:
                 raise RuntimeError("broken cog")
 
-    def verify(path, tables):
+    def verify(path, tables, **kwargs):
         events.append(f"verify:{path.name}")
         return {}
 
-    with patch.object(pathlib.Path, "exists", return_value=True), \
+    with patch.object(main, "available_extensions", return_value=[
+             main.EXTENSIONS[0][0], main.EXTENSIONS[1][0]
+         ]), \
+         patch.object(pathlib.Path, "exists", return_value=True), \
          patch.object(main, "verify_database", side_effect=verify):
         try:
             asyncio.run(main.MyBot.setup_hook(FakeBot()))
@@ -842,14 +1412,14 @@ def test_guild_isolation():
     check("참가 조회는 서버별", parties.get_user_party(A, 1) == "PUBG" and parties.get_user_party(B, 1) is None)
 
     # 설정도 서버별.
-    settings.set_recruit_channel(A, 333)
-    check("설정 분리", settings.get_recruit_channel(A) == 333 and settings.get_recruit_channel(B) is None)
+    settings.set_party_channel(A, 333)
+    check("설정 분리", settings.get_party_channel(A) == 333 and settings.get_party_channel(B) is None)
 
     # 봇이 서버에서 제거되면 그 서버 것만 지운다.
     for repo in (points, parties, settings):
         repo.delete_guild(A)
     check("제거된 서버 데이터 삭제", points.get_points(A, USER) == 0 and parties.get_party(A, "PUBG") is None
-          and settings.get_recruit_channel(A) is None)
+          and settings.get_party_channel(A) is None)
     check("다른 서버는 보존", points.get_points(B, USER) == 910 and parties.get_party(B, "PUBG") is not None)
 
     # 스키마가 경계를 강제하는지 — 모든 기본키에 guild_id가 있어야 한다.
@@ -864,8 +1434,9 @@ def test_guild_isolation():
         in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog._inspect),
     )
     check(
-        "JoinButton은 길드 밖 상호작용을 거부",
-        "guild_id is None" in inspect.getsource(playwith_cog.JoinButton.callback),
+        "파티 패널은 길드 밖 상호작용을 거부",
+        "guild_id is None"
+        in inspect.getsource(playwith_cog.PlayWithCog._reject_invalid_interaction),
     )
 
 
@@ -902,6 +1473,8 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
     with closing(sqlite3.connect(db_path)) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         pk = [row[1] for row in conn.execute("PRAGMA table_info(users)") if row[5]]
+        ai_cols = {row[1] for row in conn.execute("PRAGMA table_info(ai_usage)")}
+        ai_pk = [row[1] for row in conn.execute("PRAGMA table_info(ai_usage)") if row[5]]
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
@@ -910,12 +1483,241 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
                                      "last_attendance_date", "forbidden_count"}, f"({cols})")
     check("복합 기본키 (guild_id, user_id)", pk == ["guild_id", "user_id"], f"({pk})")
     check("원장 테이블 생성", "point_ledger" in tables)
+    check("AI 사용량 테이블 생성", "ai_usage" in tables)
+    check("AI 사용량은 guild_id 없이 전역", ai_cols == {"user_id", "usage_date", "command", "count"})
+    check("AI 사용량 복합 기본키", ai_pk == ["user_id", "usage_date", "command"])
     check("폐기된 luckybox 컬럼 없음", not {"luckybox_count", "last_luckybox_date"} & cols)
 
     # 중복 실행해도 에러가 없어야 함 (멱등성)
     SQLiteAttendanceRepository(db_path)
     check("스키마 재생성 시 에러 없음 (멱등성)", True)
     return _bind(repo)
+
+
+def _user_version(path):
+    with sqlite3.connect(path) as conn:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def test_schema_versions():
+    print("\n[1] SQLite 스키마 버전")
+    attendance_path = _TMP_DIR / "attendance_version.db"
+    party_path = _TMP_DIR / "party_version.db"
+    settings_path = _TMP_DIR / "settings_version.db"
+    SQLiteAttendanceRepository(attendance_path)
+    SQLitePartyRepository(party_path)
+    SQLiteGuildSettingsRepository(settings_path)
+
+    check("attendance 스키마 버전", _user_version(attendance_path) == 2)
+    check("party 스키마 버전", _user_version(party_path) == 2)
+    check("settings 스키마 버전", _user_version(settings_path) == 2)
+
+    for label, repository in (
+        ("attendance", SQLiteAttendanceRepository),
+        ("party", SQLitePartyRepository),
+        ("settings", SQLiteGuildSettingsRepository),
+    ):
+        path = _TMP_DIR / f"future_{label}.db"
+        with sqlite3.connect(path) as conn:
+            conn.execute("PRAGMA user_version = 999")
+        try:
+            repository(path)
+        except RuntimeError:
+            rejected = True
+        else:
+            rejected = False
+        check(f"미래 {label} DB 버전 거부", rejected)
+
+    with sqlite3.connect(attendance_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+        conn.execute("INSERT INTO users VALUES (1, 2, 3, NULL, 0)")
+    SQLiteAttendanceRepository(attendance_path)
+    check(
+        "무버전 attendance 데이터 보존",
+        SQLiteAttendanceRepository(attendance_path).get_points(1, 2) == 3,
+    )
+
+    version_one_path = _TMP_DIR / "attendance_version_one.db"
+    with sqlite3.connect(version_one_path) as conn:
+        conn.executescript("""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                last_attendance_date TEXT,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE TABLE point_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            PRAGMA user_version = 1;
+        """)
+    migrated = SQLiteAttendanceRepository(version_one_path)
+    check("attendance v1에서 v2로 마이그레이션", _user_version(version_one_path) == 2)
+    check("attendance v1 포인트 보존", migrated.get_points(7, 8) == 9_000)
+
+    with sqlite3.connect(party_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+        conn.execute(
+            "INSERT INTO parties (guild_id, game, created_at) VALUES (1, 'LOL', 3)"
+        )
+    SQLitePartyRepository(party_path)
+    check(
+        "무버전 party 데이터 보존",
+        SQLitePartyRepository(party_path).get_party(1, "LOL") == (3,),
+    )
+
+    for legacy_version in (0, 1):
+        legacy_party_path = _TMP_DIR / f"party_v{legacy_version}_to_v2.db"
+        with sqlite3.connect(legacy_party_path) as conn:
+            conn.executescript(f"""
+                CREATE TABLE parties (
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, game)
+                );
+                CREATE TABLE participants (
+                    guild_id INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    role TEXT,
+                    PRIMARY KEY (guild_id, game, user_id)
+                );
+                INSERT INTO parties VALUES (1, 'A', 10), (1, 'B', 20);
+                INSERT INTO participants VALUES
+                    (1, 'B', 7, 'B-role'),
+                    (1, 'A', 7, 'A-role'),
+                    (1, 'A', 8, NULL);
+                PRAGMA user_version = {legacy_version};
+            """)
+        party_v2 = SQLitePartyRepository(legacy_party_path)
+        check(
+            f"party v{legacy_version}에서 v2로 마이그레이션",
+            _user_version(legacy_party_path) == 2,
+        )
+        check(
+            f"party v{legacy_version} 중복 참가를 game 이름 순으로 정리",
+            party_v2.get_user_party(1, 7) == "A"
+            and party_v2.get_participants(1, "B") == {},
+        )
+        check(
+            f"party v{legacy_version} 방장 결정",
+            party_v2.get_party_host(1, "A") == 7,
+        )
+
+    for legacy_version in (0, 1):
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v2.db"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute(
+                "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
+            )
+            conn.execute("INSERT INTO guild_settings VALUES (7, 700, 701)")
+            conn.execute(f"PRAGMA user_version = {legacy_version}")
+        SQLiteGuildSettingsRepository(legacy_path)
+        with sqlite3.connect(legacy_path) as conn:
+            row = conn.execute(
+                "SELECT party_channel_id, music_channel_id, music_panel_msg_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+            ).fetchone()
+            tables = {
+                item[0]
+                for item in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            guild_columns = tuple(
+                row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
+            )
+            panel_info = list(conn.execute("PRAGMA table_info(party_panels)"))
+            panel_columns = tuple(row[1] for row in panel_info)
+            panel_primary_key = tuple(
+                row[1] for row in sorted(panel_info, key=lambda row: row[5]) if row[5]
+            )
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        check(f"settings v{legacy_version} recruit 보존", row == (700, None, None, 0))
+        check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
+        check(
+            f"settings v{legacy_version} 정확한 패널 스키마",
+            guild_columns == (
+                "guild_id",
+                "party_channel_id",
+                "music_channel_id",
+                "music_panel_msg_id",
+                "allow_host_announce",
+            )
+            and panel_columns == ("guild_id", "game", "message_id")
+            and panel_primary_key == ("guild_id", "game"),
+        )
+        check(f"settings v{legacy_version} 버전", version == 2)
+
+    malformed_schemas = {
+        "extra guild_settings column": """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                obsolete INTEGER
+            )
+        """,
+        "wrong party_panels primary key": """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, message_id)
+            )
+        """,
+    }
+    malformed_rejected = []
+    for label, schema in malformed_schemas.items():
+        malformed_path = _TMP_DIR / f"settings_{label.replace(' ', '_')}.db"
+        with sqlite3.connect(malformed_path) as conn:
+            conn.executescript(schema)
+        try:
+            SQLiteGuildSettingsRepository(malformed_path)
+        except RuntimeError:
+            malformed_rejected.append(True)
+        else:
+            malformed_rejected.append(False)
+    check("잘못된 현재 settings 스키마 거부", all(malformed_rejected))
+
+    settings = SQLiteGuildSettingsRepository(_TMP_DIR / "settings_repository.db")
+    settings.set_party_panel(7, "LOL", 70)
+    settings.set_party_panel(7, "LOL", 71)
+    settings.set_party_panel(7, "PUBG", 72)
+    panels_after_upsert = settings.get_party_panels(7)
+    settings.delete_party_panel(7, "LOL")
+    settings.set_party_channel(7, 700)
+    settings.set_music_channel(7, 701)
+    settings.set_music_panel_msg(7, 702)
+    settings.set_allow_host_announce(7, True)
+    settings.set_allow_host_announce(8, True)
+    settings.clear_channel(7, 701)
+    check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
+    check("삭제된 음악 채널은 패널 메시지도 해제", settings.get_party_channel(7) == 700 and settings.get_music_channel(7) is None and settings.get_music_panel_msg(7) is None)
+    settings.set_music_channel(7, 701)
+    settings.set_music_panel_msg(7, 702)
+    settings.clear_channel(7, 700)
+    check("삭제된 파티 채널은 음악 설정을 보존하고 해제", settings.get_party_channel(7) is None and settings.get_music_channel(7) == 701 and settings.get_music_panel_msg(7) == 702)
+    check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
+    settings.delete_guild(7)
+    check("길드 삭제는 설정과 party panel 정리", settings.get_party_panels(7) == {} and settings.get_party_channel(7) is None)
 
 
 def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
@@ -946,6 +1748,40 @@ def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
     final = repo.get_points(user)
     check("동시 차감: 성공 횟수가 잔액과 정확히 일치 (7회)", successes == 7, f"(성공 {successes}회)")
     check("동시 차감: 최종 잔액 0, 음수 아님", final == 0, f"(잔액 {final})")
+
+
+def test_ai_usage_atomicity():
+    print("\n[2] AI 일일 사용량 원자성")
+    repo = SQLiteAttendanceRepository(_TMP_DIR / "ai_usage_atomicity.db")
+    user_id = 200
+    usage_date = "2026-08-04"
+    results = []
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            result = repo.consume_ai_usage(user_id, usage_date, "light", 3)
+            with lock:
+                results.append(result)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    check("AI 사용량 20개 호출 모두 정상 완료", len(results) == 20 and not errors)
+    check("limit=3은 정확히 3번만 성공", sum(result is not None for result in results) == 3)
+    check("light 사용량은 3", repo.get_ai_usage(user_id, usage_date, "light") == 3)
+    check("deep은 light와 분리", repo.consume_ai_usage(user_id, usage_date, "deep", 3) == 1)
+    check("다음 날은 새 한도", repo.consume_ai_usage(user_id, "2026-08-05", "light", 3) == 1)
+    check("예약 반환 3회 성공", all(repo.release_ai_usage(user_id, usage_date, "light") for _ in range(3)))
+    check("0에서 추가 반환 거부", repo.release_ai_usage(user_id, usage_date, "light") is False)
+    check("사용량은 0 아래로 내려가지 않음", repo.get_ai_usage(user_id, usage_date, "light") == 0)
 
 
 def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
@@ -1062,13 +1898,16 @@ def test_party_cog_uses_epoch_seconds():
         created_at = None
         cutoff = None
 
-        def create_party(self, guild_id, game, created_at):
+        def create_party(self, guild_id, game, created_at, host_id=None):
             self.created_at = created_at
             return True
 
-        def delete_expired_parties(self, cutoff):
+        def list_expired_parties(self, cutoff):
             self.cutoff = cutoff
             return []
+
+        def delete_party_if_expired(self, guild_id, game, cutoff):
+            return False
 
     repository = RecordingRepository()
     cog = object.__new__(PlayWithCog)
@@ -1081,6 +1920,26 @@ def test_party_cog_uses_epoch_seconds():
     check(
         "Cog 만료 정리 시 24시간 전 epoch 정수 전달",
         repository.cutoff == 1_999_913_600,
+    )
+
+
+def test_persistent_party_panel_contract():
+    import module.playwith_cog as playwith_cog
+
+    source = inspect.getsource(playwith_cog)
+    check(
+        "구 파티 slash command 제거",
+        all(f'name="{name}"' not in source for name in ("모집", "파티", "나가기", "변경")),
+    )
+    check(
+        "파티 패널 custom_id는 SHA-256 digest 사용",
+        "hashlib.sha256" in source and "_game_key(game)" in source,
+    )
+    check(
+        "파티 패널은 startup/setup/cleanup 복구 경로 제공",
+        all(name in playwith_cog.PlayWithCog.__dict__ for name in (
+            "ensure_panels", "render_game_panel", "on_ready", "on_member_remove"
+        )),
     )
 
 
@@ -1125,12 +1984,20 @@ def test_cog_facade():
     asyncio.run(cog.increment_forbidden_count(G, 42))
     asyncio.run(cog.increment_forbidden_count(G, 42))
     check("forbidden_count 위임", asyncio.run(cog.get_forbidden_count(G, 42)) == 2)
+    kst_now = datetime.datetime(2026, 8, 4, 23, 59, tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+    with patch("module.attendance_cog.datetime") as mocked_datetime:
+        mocked_datetime.now.return_value = kst_now
+        reservation = asyncio.run(cog.reserve_ai_usage(42, "light", 3))
+        check("KST 날짜로 AI 사용량 예약", reservation == ("2026-08-04", 1))
+        check("AI 사용량 조회 위임", asyncio.run(cog.get_ai_usage(42, "light")) == 1)
+        check("AI 사용량 반환 위임", asyncio.run(cog.release_ai_usage(42, "2026-08-04", "light")) is True)
     check(
         "파사드 전체가 코루틴",
         all(
             inspect.iscoroutinefunction(getattr(AttendanceCog, name))
             for name in ("get_points", "add_points", "deduct_points",
-                         "get_ledger", "increment_forbidden_count", "get_forbidden_count")
+                         "get_ledger", "reserve_ai_usage", "release_ai_usage",
+                         "get_ai_usage", "increment_forbidden_count", "get_forbidden_count")
         ),
     )
 
@@ -1174,10 +2041,14 @@ def test_imports():
         "module.config",
         "module.database",
         "module.main",
+        "module.music_cog",
+        "module.panel",
+        "module.guildsettings_cog",
         "module.attendance_cog",
         "module.playwith_cog",
         "module.eventnotice_cog",
         "module.forbiddenfilter_cog",
+        "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
         "module.finance_cog",
@@ -1190,11 +2061,95 @@ def test_imports():
             check(f"import {m}", False, f"({e})")
 
 
+def test_music_core_contract():
+    print("\n[9] 음악 core·영속 패널")
+    import module.main as bot_main
+    import module.music_cog as music_cog
+
+    declared = [
+        line.split("#")[0].strip()
+        for line in (PROJECT_ROOT / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    declared = [line for line in declared if line]
+    check("PyNaCl은 1.5 이상 2 미만으로 고정", "PyNaCl>=1.5,<2" in declared)
+    check(
+        # 외부 사이트가 바뀌면 즉시 최신 yt-dlp로 올라갈 수 있어야 한다.
+        "yt-dlp는 상한도 exact pin도 없음",
+        [line for line in declared if line.lower().startswith("yt-dlp")] == ["yt-dlp"],
+    )
+
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    apt_packages = [
+        token
+        for token in dockerfile.split("apt-get install")[-1].split("&&")[0].split()
+        if not token.startswith("-") and token != "\\"
+    ]
+    check("Dockerfile은 distro 패키지로 ffmpeg만 설치", apt_packages == ["ffmpeg"])
+    check(
+        "apt cache를 이미지에 남기지 않음",
+        "rm -rf /var/lib/apt/lists/*" in dockerfile,
+    )
+
+    # 최상위(들여쓰기 0) import만 본다. `from yt_dlp import YoutubeDL`처럼 형태만 바꾼
+    # 회귀도 잡아야 하므로 문자열 하나가 아니라 import 줄 전체를 훑는다.
+    top_level_imports = [
+        line
+        for line in inspect.getsource(music_cog).splitlines()
+        if (line.startswith("import ") or line.startswith("from "))
+        and ("yt_dlp" in line or "nacl" in line)
+    ]
+    check(
+        "yt-dlp/PyNaCl은 최상위에서 import하지 않음 (미설치 환경에서도 import 가능)",
+        top_level_imports == [],
+        f"({top_level_imports})",
+    )
+    check(
+        "의존성 검사를 가진 확장은 음악뿐",
+        [name for name, _, dep in bot_main.EXTENSIONS if dep is not None]
+        == ["module.music_cog"],
+    )
+
+    with patch.object(music_cog, "find_spec", lambda name, *a, **k: None):
+        reason = music_cog.music_dependency_error()
+    check(
+        "skip 사유에 빠진 package와 설치 안내 포함",
+        reason is not None
+        and "PyNaCl" in reason
+        and "yt-dlp" in reason
+        and "pip install" in reason,
+        f"({reason})",
+    )
+    with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
+        check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
+
+    view = music_cog.MusicPanelView(SimpleNamespace())
+    check("음악 패널 view는 persistent", view.is_persistent())
+    check(
+        "음악 패널 button custom_id 고정",
+        {item.custom_id for item in view.children}
+        == {"music:add", "music:skip", "music:pause", "music:stop", "music:remove"},
+    )
+    check("패널 queue 표시는 10곡", music_cog.MAX_QUEUE_DISPLAY == 10)
+    check("remove select는 25곡", music_cog.MAX_REMOVE_OPTIONS == 25)
+    check(
+        "패널 복구·렌더 interface 존재",
+        all(callable(getattr(music_cog.MusicCog, name, None)) for name in ("ensure_panel", "render_panel")),
+    )
+    source = inspect.getsource(music_cog)
+    check("주기적 음악 progress update 없음", "@tasks.loop" not in source)
+
+    # 재생 엔진의 동작 계약(상태 전이, ffmpeg option, 불변 track)은
+    # test_discord_commands.py의 MusicPlayerStateTests/MusicPanelTests가 실행해 검증한다.
+
+
 def test_backup_round_trip():
     import module.backup as backup
 
     backup.DATA_DIR = _TMP_DIR
     backup.BACKUP_DIR = _TMP_DIR / "backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(_TEST_GUILD, 77, 1234)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
@@ -1208,6 +2163,494 @@ def test_backup_round_trip():
     check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
     backup.restore_test(manifest)
     check("백업 복구 테스트", True)
+
+
+def test_settings_backup_round_trip():
+    import module.backup as backup
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        data_dir = root / "data"
+        backup_dir = root / "backups"
+        settings_dir = root / "settings"
+        stage = root / "stage"
+        data_dir.mkdir()
+        settings_dir.mkdir()
+        SQLiteAttendanceRepository(data_dir / "attendance_data.db")
+        SQLitePartyRepository(data_dir / "party_data.db")
+        SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+        expected = {
+            "persona.json": b'{"system_prompt":"p","greeting":"g"}\n',
+            "forbidden_words.json": b'["x"]\n',
+            "games.json": b'{"Game":{"max_players":2,"roles":[]}}\n',
+        }
+        for name, content in expected.items():
+            (settings_dir / name).write_bytes(content)
+
+        with (
+            patch.object(backup, "DATA_DIR", data_dir),
+            patch.object(backup, "BACKUP_DIR", backup_dir),
+            patch.object(backup, "SETTINGS_DIR", settings_dir),
+            patch.object(backup, "BACKUP_INTERVAL_SECONDS", 21600),
+            patch.object(backup, "BACKUP_RETENTION_DAYS", 30),
+        ):
+            manifest = backup.create_backup_set(
+                datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+            )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            backup.stage_restore(manifest, stage)
+
+            empty_settings = root / "empty-settings"
+            empty_settings.mkdir()
+            with patch.object(backup, "SETTINGS_DIR", empty_settings):
+                missing_manifest = backup.create_backup_set(
+                    datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
+                )
+            missing_document = json.loads(
+                missing_manifest.read_text(encoding="utf-8")
+            )
+
+            historical_document = json.loads(manifest.read_text(encoding="utf-8"))
+            historical_document.pop("settings")
+            historical_manifest = backup_dir / "historical-db-only-manifest.json"
+            historical_manifest.write_text(
+                json.dumps(historical_document), encoding="utf-8"
+            )
+            historical_stage = root / "historical-stage"
+            try:
+                historical_verified = backup.verify_backup_set(historical_manifest)
+                backup.stage_restore(historical_manifest, historical_stage)
+                historical_ok = bool(historical_verified) and not (
+                    historical_stage / "settings"
+                ).exists()
+            except RuntimeError:
+                historical_ok = False
+
+            corruption_results = []
+            for field, value in (
+                ("size", document["settings"][0]["size"] + 1),
+                ("sha256", "0" * 64),
+            ):
+                invalid_document = json.loads(json.dumps(document))
+                invalid_document["settings"][0][field] = value
+                invalid_manifest = backup_dir / f"invalid-settings-{field}.json"
+                invalid_manifest.write_text(
+                    json.dumps(invalid_document), encoding="utf-8"
+                )
+                invalid_stage = root / f"invalid-settings-{field}"
+                try:
+                    backup.stage_restore(invalid_manifest, invalid_stage)
+                    rejected = False
+                except RuntimeError:
+                    rejected = True
+                corruption_results.append(rejected and not invalid_stage.exists())
+
+            invalid_settings = (
+                ("설정 상위 경로 거부", "../persona.json"),
+                ("설정 source 중복 거부", document["settings"][0]["source"]),
+                ("허용되지 않은 설정 거부", "secret.json"),
+            )
+            invalid_results = []
+            for index, (_, source) in enumerate(invalid_settings):
+                invalid_document = json.loads(json.dumps(document))
+                invalid_document["settings"].append(
+                    {
+                        "source": source,
+                        "backup": document["settings"][1]["backup"],
+                        "size": document["settings"][1]["size"],
+                        "sha256": document["settings"][1]["sha256"],
+                    }
+                )
+                invalid_manifest = backup_dir / f"invalid-setting-source-{index}.json"
+                invalid_manifest.write_text(
+                    json.dumps(invalid_document), encoding="utf-8"
+                )
+                try:
+                    backup.verify_backup_set(invalid_manifest)
+                    invalid_results.append(False)
+                except RuntimeError:
+                    invalid_results.append(True)
+
+            unrelated_backup = backup_dir / "unrelated-settings-backup.json"
+            unrelated_backup.write_bytes(b"unrelated")
+            unrelated_document = json.loads(json.dumps(document))
+            unrelated_document["settings"] = [
+                {
+                    "source": "persona.json",
+                    "backup": unrelated_backup.name,
+                    "size": unrelated_backup.stat().st_size,
+                    "sha256": backup._sha256(unrelated_backup),
+                }
+            ]
+            unrelated_manifest = backup_dir / "20260809T000000Z-manifest.json"
+            unrelated_manifest.write_text(
+                json.dumps(unrelated_document), encoding="utf-8"
+            )
+            try:
+                backup.verify_backup_set(unrelated_manifest)
+                unrelated_backup_rejected = False
+            except RuntimeError:
+                unrelated_backup_rejected = True
+
+            symlink_stage = root / "symlink-stage"
+            outside_settings = root / "outside-settings"
+            symlink_stage.mkdir()
+            outside_settings.mkdir()
+            (symlink_stage / "settings").symlink_to(
+                outside_settings, target_is_directory=True
+            )
+            try:
+                backup.stage_restore(manifest, symlink_stage)
+                stage_symlink_rejected = False
+            except RuntimeError:
+                stage_symlink_rejected = True
+
+            stage_race = root / "stage-directory-race"
+            stage_race_outside = root / "stage-race-outside"
+            detached_settings = root / "detached-settings"
+            stage_race_outside.mkdir()
+            real_open = backup.os.open
+            swapped_stage = False
+
+            def swap_stage_before_destination(path, *args, **kwargs):
+                nonlocal swapped_stage
+                if (
+                    not swapped_stage
+                    and kwargs.get("dir_fd") is not None
+                    and path == "persona.json"
+                ):
+                    settings_path = stage_race / "settings"
+                    settings_path.rename(detached_settings)
+                    settings_path.symlink_to(
+                        stage_race_outside, target_is_directory=True
+                    )
+                    swapped_stage = True
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(backup.os, "open", side_effect=swap_stage_before_destination):
+                try:
+                    backup.stage_restore(manifest, stage_race)
+                    stage_race_safe = (
+                        swapped_stage
+                        and not (stage_race_outside / "persona.json").exists()
+                        and all(
+                            (detached_settings / name).read_bytes() == content
+                            for name, content in expected.items()
+                        )
+                    )
+                except RuntimeError:
+                    stage_race_safe = False
+
+            race_source = root / "race-source.json"
+            race_original = root / "race-original.json"
+            race_target = root / "race-target.json"
+            race_copy = root / "race-copy.json"
+            race_source.write_bytes(b"regular")
+            race_target.write_bytes(b"outside")
+            real_open = backup.os.open
+
+            def replace_source_before_open(path, *args, **kwargs):
+                if pathlib.Path(path) == race_source:
+                    race_source.replace(race_original)
+                    race_source.symlink_to(race_target)
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(backup.os, "open", side_effect=replace_source_before_open):
+                try:
+                    backup._copy_setting(race_source, race_copy)
+                    race_rejected = False
+                except RuntimeError:
+                    race_rejected = True
+
+            symlink_settings = root / "symlink-settings"
+            symlink_settings.mkdir()
+            target = root / "settings-target.json"
+            target.write_bytes(expected["persona.json"])
+            (symlink_settings / "persona.json").symlink_to(target)
+            with patch.object(backup, "SETTINGS_DIR", symlink_settings):
+                try:
+                    backup.create_backup_set(
+                        datetime.datetime(2026, 8, 7, tzinfo=datetime.timezone.utc)
+                    )
+                    symlink_rejected = False
+                except RuntimeError:
+                    symlink_rejected = True
+
+            directory_settings = root / "directory-settings"
+            directory_settings.mkdir()
+            (directory_settings / "persona.json").mkdir()
+            with patch.object(backup, "SETTINGS_DIR", directory_settings):
+                try:
+                    backup.create_backup_set(
+                        datetime.datetime(2026, 8, 8, tzinfo=datetime.timezone.utc)
+                    )
+                    directory_rejected = False
+                except RuntimeError:
+                    directory_rejected = True
+
+            expired_manifest = backup.create_backup_set(
+                datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+            )
+            expired_document = json.loads(expired_manifest.read_text(encoding="utf-8"))
+            deleted = backup.prune_backups(
+                datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+            )
+
+        check("설정 백업 대상 목록", backup.SETTINGS_FILES == tuple(expected))
+        check(
+            "manifest 설정 3개",
+            {item["source"] for item in document["settings"]} == set(expected),
+        )
+        check(
+            "설정 stage byte 보존",
+            all(
+                (stage / "settings" / name).read_bytes() == content
+                for name, content in expected.items()
+            ),
+        )
+        check(
+            "설정 파일이 없어도 빈 manifest 백업 성공",
+            missing_document["settings"] == [],
+        )
+        check("DB-only historical manifest 복구", historical_ok)
+        check("설정 크기와 checksum은 stage 전 거부", all(corruption_results))
+        check("안전하지 않거나 중복된 설정 manifest 거부", all(invalid_results))
+        check("설정 backup은 source별 canonical 이름만 허용", unrelated_backup_rejected)
+        check(
+            "symlink 설정 stage는 stage 밖에 쓰지 않고 거부",
+            stage_symlink_rejected and not (outside_settings / "persona.json").exists(),
+        )
+        check("설정 stage 교체 race는 stage 밖에 쓰지 않음", stage_race_safe)
+        check(
+            "설정 source 교체 symlink race 거부",
+            race_rejected
+            and not race_copy.exists()
+            and race_target.read_bytes() == b"outside",
+        )
+        check("설정 symlink 백업 거부", symlink_rejected)
+        check("설정 디렉터리 백업 거부", directory_rejected)
+        check(
+            "설정 포함 만료 backup set 정리",
+            deleted == 1
+            and not expired_manifest.exists()
+            and all(
+                not (backup_dir / item["backup"]).exists()
+                for item in expired_document["settings"]
+            ),
+        )
+
+
+def test_setting_source_inspection_failure_closes_descriptor():
+    import module.backup as backup
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        source = root / "persona.json"
+        source.write_text("{}", encoding="utf-8")
+        opened = []
+        real_open = backup.os.open
+
+        def recording_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        with patch.object(backup.os, "open", side_effect=recording_open), patch.object(
+            backup.os, "fstat", side_effect=OSError("inspection failed")
+        ):
+            try:
+                backup._copy_setting(source, root / "copy.json")
+                failure = None
+            except RuntimeError as exc:
+                failure = exc
+
+        try:
+            os.fstat(opened[0])
+            closed = False
+        except OSError:
+            closed = True
+
+    check(
+        "설정 source 검사 실패를 RuntimeError로 연결",
+        failure is not None and isinstance(failure.__cause__, OSError),
+    )
+    check("설정 source 검사 실패 시 descriptor 종료", closed)
+
+
+def test_legacy_backup_restore_and_prune():
+    import module.backup as backup
+
+    root = _TMP_DIR / "legacy-backup-lifecycle"
+    data_dir = root / "data"
+    backup_dir = root / "backups"
+    backup.DATA_DIR = data_dir
+    backup.BACKUP_DIR = backup_dir
+    backup.BACKUP_RETENTION_DAYS = 30
+    timestamp = "20260101T000000Z"
+    _create_legacy_attendance_db(data_dir / "attendance_data.db")
+    party_path = data_dir / "party_data.db"
+    settings_path = data_dir / "guild_settings.db"
+    SQLitePartyRepository(party_path).create_party(
+        _TEST_GUILD, "LOL", 2_000_000_000
+    )
+    with closing(sqlite3.connect(settings_path)) as conn:
+        conn.execute(
+            "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
+        )
+        conn.execute("INSERT INTO guild_settings VALUES (7, 700, 701)")
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    with closing(sqlite3.connect(party_path)) as conn:
+        conn.execute("PRAGMA user_version = 0")
+    backup_dir.mkdir(parents=True)
+
+    items = []
+    for source_name, current_tables in backup.DATABASES.items():
+        source = data_dir / source_name
+        copied = backup_dir / f"{timestamp}-{source_name}"
+        backup._backup_one(source, copied)
+        tables = (
+            {"users", "point_ledger"}
+            if source_name == "attendance_data.db"
+            else {"guild_settings"}
+            if source_name == "guild_settings.db"
+            else current_tables
+        )
+        with closing(sqlite3.connect(copied)) as conn:
+            counts = {
+                table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                for table in sorted(tables)
+            }
+        items.append(
+            {
+                "source": source_name,
+                "backup": copied.name,
+                "size": copied.stat().st_size,
+                "sha256": backup._sha256(copied),
+                "tables": counts,
+            }
+        )
+
+    manifest = backup_dir / f"{timestamp}-manifest.json"
+    manifest.write_text(
+        json.dumps({"created_at": "2026-01-01T00:00:00+00:00", "databases": items}),
+        encoding="utf-8",
+    )
+    try:
+        verified = backup.verify_backup_set(manifest)
+    except RuntimeError:
+        verified = None
+    check(
+        "historical v1 attendance backup verifies with base tables",
+        verified is not None
+        and verified["attendance_data.db"] == {"point_ledger": 1, "users": 1},
+    )
+    legacy_v0 = root / "legacy-v0-attendance.db"
+    shutil.copy2(data_dir / "attendance_data.db", legacy_v0)
+    with closing(sqlite3.connect(legacy_v0)) as conn:
+        conn.execute("PRAGMA user_version = 0")
+    try:
+        v0_counts = backup.verify_database(
+            legacy_v0,
+            backup.DATABASES["attendance_data.db"],
+            source_name="attendance_data.db",
+            allow_legacy=True,
+        )
+    except RuntimeError:
+        v0_counts = None
+    check(
+        "historical v0 attendance accepts only its base-table contract",
+        v0_counts == {"point_ledger": 1, "users": 1},
+    )
+
+    stage_restore = getattr(backup, "stage_restore", None)
+    check("historical restore stages through migration API", stage_restore is not None)
+    if stage_restore is None:
+        return
+
+    invalid_document = json.loads(manifest.read_text(encoding="utf-8"))
+    invalid_document["databases"][0]["sha256"] = "0" * 64
+    invalid_manifest = backup_dir / "invalid-manifest.json"
+    invalid_manifest.write_text(json.dumps(invalid_document), encoding="utf-8")
+    invalid_stage = root / "invalid-stage"
+    try:
+        stage_restore(invalid_manifest, invalid_stage)
+        checksum_rejected = False
+    except RuntimeError:
+        checksum_rejected = True
+    check(
+        "checksum failure precedes any staged mutation",
+        checksum_rejected and not invalid_stage.exists(),
+    )
+
+    stage = root / "stage"
+    try:
+        stage_restore(manifest, stage)
+        staged = True
+    except RuntimeError:
+        staged = False
+    check("all staged legacy databases reach the current contract", staged)
+    if not staged:
+        return
+    staged_attendance = stage / "attendance_data.db"
+    with closing(sqlite3.connect(staged_attendance)) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        points = conn.execute(
+            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        ).fetchone()
+    check(
+        "staged historical attendance migrates before installation",
+        version == 2 and "ai_usage" in tables and points == (9000,),
+    )
+    staged_settings = stage / "guild_settings.db"
+    with closing(sqlite3.connect(staged_settings)) as conn:
+        settings_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        settings_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        party_channel = conn.execute(
+            "SELECT party_channel_id FROM guild_settings WHERE guild_id = 7"
+        ).fetchone()
+    check(
+        "staged historical settings migrates to the panel contract",
+        settings_version == 2
+        and "party_panels" in settings_tables
+        and party_channel == (700,),
+    )
+    future = root / "future-attendance.db"
+    shutil.copy2(staged_attendance, future)
+    with closing(sqlite3.connect(future)) as conn:
+        conn.execute("PRAGMA user_version = 999")
+    try:
+        backup.verify_database(
+            future,
+            backup.DATABASES["attendance_data.db"],
+            source_name="attendance_data.db",
+            allow_legacy=True,
+        )
+        future_rejected = False
+    except RuntimeError:
+        future_rejected = True
+    check("historical verification rejects future schemas", future_rejected)
+
+    deleted = backup.prune_backups(
+        datetime.datetime(2026, 8, 4, tzinfo=datetime.timezone.utc)
+    )
+    check(
+        "expired valid historical backup is pruned",
+        deleted == 1
+        and not manifest.exists()
+        and all(not (backup_dir / item["backup"]).exists() for item in items),
+    )
 
 
 def test_invalid_backup_settings_prevent_creation():
@@ -1246,6 +2689,7 @@ def test_invalid_retention_prevents_pruning():
     for value in (0, -1):
         backup.DATA_DIR = _TMP_DIR / f"invalid-prune-data-{value}"
         backup.BACKUP_DIR = _TMP_DIR / f"invalid-prune-backups-{value}"
+        backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
         backup.BACKUP_INTERVAL_SECONDS = 21600
         backup.BACKUP_RETENTION_DAYS = 30
         SQLiteAttendanceRepository(
@@ -1645,6 +3089,7 @@ def test_backup_same_timestamp_rejected():
 
     backup.DATA_DIR = _TMP_DIR / "collision_data"
     backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     attendance = SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     )
@@ -1672,6 +3117,7 @@ def test_prune_requires_timestamp_bound_filenames():
 
     backup.DATA_DIR = _TMP_DIR / "retention_data"
     backup.BACKUP_DIR = _TMP_DIR / "retention_backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     backup.BACKUP_RETENTION_DAYS = 30
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
@@ -1702,6 +3148,7 @@ def test_backup_publication_is_synced():
 
     backup.DATA_DIR = _TMP_DIR / "durability_data"
     backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
+    backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     SQLiteAttendanceRepository(
         backup.DATA_DIR / "attendance_data.db"
     ).add_points(_TEST_GUILD, 1, 100)
@@ -1776,7 +3223,11 @@ def test_corrupt_backup_rejected():
     corrupt = _TMP_DIR / "corrupt.db"
     corrupt.write_bytes(b"not-a-sqlite-database")
     try:
-        backup.verify_database(corrupt, {"users"})
+        backup.verify_database(
+            corrupt,
+            {"users"},
+            source_name="attendance_data.db",
+        )
         check("손상 백업 거부", False)
     except RuntimeError:
         check("손상 백업 거부", True)
@@ -1831,12 +3282,19 @@ if __name__ == "__main__":
         test_config_validation()
         test_split_env_loading()
         test_public_env_contract()
+        test_web_admin_atomic_settings_contract()
+        test_forbidden_word_document_path()
+        test_readme_public_distribution_contract()
+        test_operations_document_contract()
+        test_final_installation_and_operations_contract()
         test_deployment_contracts()
+        test_macos_templates_render_portably()
         test_deployment_contracts_skip_only_compose_when_cli_missing()
         test_forbidden_words_degrade_gracefully()
         test_forbidden_words_load_logs_to_stdout()
         test_startup_syncs_commands_globally()
         test_startup_preverification_failure_stops_cogs_and_sync()
+        test_startup_migrates_legacy_attendance_before_strict_verification()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
         test_instance_lock_closes_failed_handle()
@@ -1850,16 +3308,23 @@ if __name__ == "__main__":
         test_guild_isolation()
         test_temp_image_lifecycle()
         repo = test_schema_initialization()
+        test_schema_versions()
         test_deduct_points_atomicity(repo)
+        test_ai_usage_atomicity()
         test_attendance_atomicity(repo)
         test_party_repository()
         test_party_capacity_constraint()
         test_party_cog_uses_epoch_seconds()
+        test_persistent_party_panel_contract()
         test_factory()
         test_cog_facade()
         test_channel_sessions()
         test_imports()
+        test_music_core_contract()
         test_backup_round_trip()
+        test_settings_backup_round_trip()
+        test_setting_source_inspection_failure_closes_descriptor()
+        test_legacy_backup_restore_and_prune()
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()
         test_invalid_interval_prevents_loop_entry()

@@ -1,9 +1,14 @@
-import discord
+"""Persistent per-game party panels."""
+
+import asyncio
+import hashlib
+import logging
 import time
 from typing import Optional
-from discord import app_commands
+
+import discord
 from discord.ext import commands, tasks
-from discord.ui import View, Select, Button
+
 from module.config import GAMES
 from module.database import (
     GuildSettingsRepository,
@@ -12,18 +17,78 @@ from module.database import (
     create_party_repository,
     run_db,
 )
+from module.panel import panel_lock, upsert_panel
 
+
+logger = logging.getLogger(__name__)
+PARTY_LIFETIME_SECONDS = 24 * 60 * 60
+MAX_COMPONENTS = 25
 EMBED_FIELD_VALUE_LIMIT = 1_024
-EMBEDS_PER_MESSAGE = 10
-EMBED_TOTAL_LIMIT = 6_000
 
 
-def _bounded_field_value(value: str) -> str:
-    return (
-        value
-        if len(value) <= EMBED_FIELD_VALUE_LIMIT
-        else value[: EMBED_FIELD_VALUE_LIMIT - 1] + "…"
-    )
+def _game_key(game: str) -> str:
+    return hashlib.sha256(game.encode("utf-8")).hexdigest()[:16]
+
+
+def _role_key(role: str) -> str:
+    return hashlib.sha256(role.encode("utf-8")).hexdigest()[:16]
+
+
+def _bounded(value: str, limit: int = EMBED_FIELD_VALUE_LIMIT) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+class PartyPanelButton(discord.ui.Button):
+    def __init__(
+        self,
+        cog: "PlayWithCog",
+        game: str,
+        action: str,
+        role: Optional[str] = None,
+        *,
+        disabled: bool = False,
+    ):
+        labels = {"inactive": "모집 시작", "toggle": "참가 / 나가기"}
+        suffix = _role_key(role) if role is not None else action
+        super().__init__(
+            label=role[:80] if role is not None else labels[action],
+            style=(
+                discord.ButtonStyle.success
+                if action != "role"
+                else discord.ButtonStyle.primary
+            ),
+            custom_id=f"party:{action}:{_game_key(game)}:{suffix}",
+            disabled=disabled,
+        )
+        self.cog = cog
+        self.game = game
+        self.action = action
+        self.role = role
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.cog.handle_panel_click(
+            interaction, self.game, self.action, self.role
+        )
+
+
+class PartyPanelView(discord.ui.View):
+    """One persistent view per game; IDs never contain the raw game name."""
+
+    def __init__(self, cog: "PlayWithCog", game: str, *, active: bool = False):
+        super().__init__(timeout=None)
+        roles = GAMES[game]["roles"]
+        if len(roles) + 1 > MAX_COMPONENTS:
+            return
+        if not roles:
+            self.add_item(PartyPanelButton(cog, game, "toggle"))
+            return
+        self.add_item(
+            PartyPanelButton(cog, game, "inactive", disabled=active)
+        )
+        for role in roles:
+            self.add_item(
+                PartyPanelButton(cog, game, "role", role, disabled=not active)
+            )
 
 
 class PlayWithCog(commands.Cog):
@@ -34,64 +99,40 @@ class PlayWithCog(commands.Cog):
         settings: Optional[GuildSettingsRepository] = None,
     ):
         self.bot = bot
-        # DB 접근은 Repository에 위임 (기본: DB_BACKEND 환경 변수에 따라 생성, 테스트 시 주입 가능)
         self.db = repository or create_party_repository()
         self.settings = settings or create_guild_settings_repository()
+        self.views = {game: PartyPanelView(self, game) for game in GAMES}
+        self._panels_restored = False
+        self._restore_lock = asyncio.Lock()
+        if bot is not None:
+            for view in self.views.values():
+                if view.children:
+                    bot.add_view(view)
         self.cleanup_parties.start()
-        # 영속 View는 봇 전체에서 공유된다. 길드 구분은 상호작용의 guild_id로 한다.
-        self.shared_views = {}
-        for game in GAMES:
-            view = View(timeout=None)
-            view.add_item(JoinButton(self, game))
-            self.shared_views[game] = view
-            if bot is not None:
-                bot.add_view(view)
 
     def cog_unload(self):
         self.cleanup_parties.cancel()
 
-    @commands.Cog.listener()
-    async def on_member_remove(self, member: discord.Member):
-        """서버를 나간 멤버가 파티 자리와 역할을 영구 점유하지 않게 한다."""
-        guild_id = member.guild.id
-        game = await self.get_user_party(guild_id, member.id)
-        if not game:
-            return
-        await self.remove_participant(guild_id, game, member.id)
-        if not await self.get_participants(guild_id, game):
-            await self.delete_party(guild_id, game)
-
-    @commands.Cog.listener()
-    async def on_guild_remove(self, guild: discord.Guild):
-        """봇이 서버에서 제거되면 그 서버의 파티를 남기지 않는다."""
-        await run_db(self.db.delete_guild, guild.id)
-
-    @tasks.loop(minutes=10)
-    async def cleanup_parties(self):
-        # Delete parties older than 24 hours (전 길드 대상)
-        expiration_time = int(time.time()) - 24 * 60 * 60
-        expired = await run_db(self.db.delete_expired_parties, expiration_time)
-        if expired:
-            print(f"Deleted expired parties: {expired}")
-
-    # ── Repository 위임 (UI 컴포넌트에서 사용) ── #
-    #
-    # 동기 리포지토리를 run_db()로 감싸 이벤트 루프를 막지 않는다.
-
-    async def get_party(self, guild_id, game):
+    async def get_active_party(self, guild_id: int, game: str):
         return await run_db(self.db.get_party, guild_id, game)
 
-    async def create_party(self, guild_id, game):
-        return await run_db(self.db.create_party, guild_id, game, int(time.time()))
+    async def create_party(self, guild_id: int, game: str, host_id: Optional[int] = None):
+        return await run_db(
+            self.db.create_party, guild_id, game, int(time.time()), host_id
+        )
 
-    async def delete_party(self, guild_id, game):
+    async def get_party_host(self, guild_id: int, game: str):
+        return await run_db(self.db.get_party_host, guild_id, game)
+
+    async def delete_party(self, guild_id: int, game: str):
         await run_db(self.db.delete_party, guild_id, game)
 
-    async def get_participants(self, guild_id, game):
+    async def get_participants(self, guild_id: int, game: str):
         return await run_db(self.db.get_participants, guild_id, game)
 
-    async def add_participant(self, guild_id, game, user_id, role=None):
-        # 정원은 DB가 최종 판정한다. 파이썬 검사는 친절한 메시지를 위해서만 남긴다.
+    async def add_participant(
+        self, guild_id: int, game: str, user_id: int, role: Optional[str] = None
+    ):
         return await run_db(
             self.db.add_participant,
             guild_id,
@@ -101,342 +142,255 @@ class PlayWithCog(commands.Cog):
             GAMES[game]["max_players"],
         )
 
-    async def remove_participant(self, guild_id, game, user_id):
-        await run_db(self.db.remove_participant, guild_id, game, user_id)
+    async def remove_participant(self, guild_id: int, game: str, user_id: int):
+        return await run_db(self.db.remove_participant, guild_id, game, user_id)
 
-    async def get_user_party(self, guild_id, user_id):
+    async def get_user_party(self, guild_id: int, user_id: int):
         return await run_db(self.db.get_user_party, guild_id, user_id)
 
-    async def ensure_recruit_channel(self, interaction) -> bool:
-        """모집 채널이 지정돼 있고 현재 채널이 그 채널인지 확인한다.
-
-        미설정 서버에서는 기능을 막고 /설정 안내를 띄운다. 아무 채널에서나
-        열어주면 서버마다 다른 규칙을 강제할 수 없다.
-        """
-        configured = await run_db(self.settings.get_recruit_channel, interaction.guild_id)
-        if configured is None:
-            await interaction.response.send_message(
-                "⚙️ 모집 채널이 아직 지정되지 않았습니다.\n"
-                "서버 관리자가 `/설정 모집채널`로 먼저 지정해 주세요.",
-                ephemeral=True,
-            )
-            return False
-        if interaction.channel_id != configured:
-            await interaction.response.send_message(
-                f"❌ 이 명령어는 <#{configured}> 에서만 사용할 수 있습니다.", ephemeral=True
-            )
-            return False
-        return True
-
-    @app_commands.command(name="모집", description="게임별 파티 모집 메시지를 생성합니다.")
-    @app_commands.guild_only()
-    async def 모집(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
-        # Find games that don't have an active party
-        available_games = []
-        for game in GAMES:
-            if not await self.get_party(interaction.guild_id, game):
-                available_games.append(game)
-
-        embed = discord.Embed(
-            title="🎮 파티 생성",
-            description="게임을 선택하여 파티를 생성합니다.\n이미 생성된 파티는 다시 만들 수 없습니다.",
-            color=discord.Color.blue()
-        )
-
-        if not available_games:
-            embed.description = "⚠️ 모든 게임에 대해 파티가 이미 생성되어 있습니다."
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        view = View()
-        view.add_item(GameSelect(self, available_games))
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @app_commands.command(name="나가기", description="현재 참가 중인 파티에서 나갑니다.")
-    @app_commands.guild_only()
-    async def 나가기(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
+    async def _reject_invalid_interaction(self, interaction: discord.Interaction) -> bool:
+        guild = interaction.guild
         guild_id = interaction.guild_id
-        user_id = interaction.user.id
-        game = await self.get_user_party(guild_id, user_id)
-
-        if not game:
-            await interaction.response.send_message("❌ 참가 중인 파티가 없습니다.", ephemeral=True)
-            return
-
-        await self.remove_participant(guild_id, game, user_id)
-
-        participants = await self.get_participants(guild_id, game)
-        if not participants:
-            await self.delete_party(guild_id, game)
-            await interaction.response.send_message(
-                f"👋 {interaction.user.mention} 님이 `{game}` 파티에서 나갔습니다.\n💨 `{game}` 파티가 해산되었습니다.")
-        else:
-            await interaction.response.send_message(f"👋 {interaction.user.mention} 님이 `{game}` 파티에서 나갔습니다.")
-
-    @app_commands.command(name="파티", description="현재 모집 중인 파티 현황 확인")
-    @app_commands.guild_only()
-    async def 파티(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
-        guild_id = interaction.guild_id
-        embeds = []
-
-        for game, info in GAMES.items():
-            if not await self.get_party(guild_id, game):
-                continue
-
-            participants = await self.get_participants(guild_id, game)
-
-            role_members = {}
-            player_lines = []
-
-            for uid, role in participants.items():
-                member = interaction.guild.get_member(uid)
-                if member:
-                    display_name = member.mention
-                    role_lower = role.strip().lower() if role else None
-                    if role_lower:
-                        player_lines.append(f"- {display_name} ({role_lower})")
-                        role_members.setdefault(role_lower, []).append(display_name)
-                    else:
-                        player_lines.append(f"- {display_name}")
-
-            embed = discord.Embed(
-                title=f"{game} 파티 현황",
-                description=f"현재 인원: {len(player_lines)} / {info['max_players']}",
-                color=discord.Color.teal()
-            )
-            if player_lines:
-                embed.add_field(
-                    name="👥 참가자",
-                    value=_bounded_field_value("\n".join(player_lines)),
-                    inline=False,
-                )
-
-            if info["roles"]:
-                role_lines = []
-                for role in info["roles"]:
-                    key = role.strip().lower()
-                    members = role_members.get(key, [])
-                    role_lines.append(f"{role}: {', '.join(members) if members else ''}")
-                embed.add_field(
-                    name="🧙 역할 현황",
-                    value=_bounded_field_value("\n".join(role_lines)),
-                    inline=False,
-                )
-
-            embeds.append(embed)
-
-        if embeds:
-            batches = []
-            for embed in embeds:
-                if (
-                    not batches
-                    or len(batches[-1]) == EMBEDS_PER_MESSAGE
-                    or sum(map(len, batches[-1])) + len(embed) > EMBED_TOTAL_LIMIT
-                ):
-                    batches.append([])
-                batches[-1].append(embed)
-            await interaction.response.send_message(embeds=batches[0])
-            for batch in batches[1:]:
-                await interaction.followup.send(embeds=batch)
-        else:
-            await interaction.response.send_message("📭 현재 모집 중인 파티가 없습니다.")
-
-    @app_commands.command(name="변경", description="현재 참가 중인 파티에서 역할을 변경합니다.")
-    @app_commands.guild_only()
-    async def 변경(self, interaction: discord.Interaction):
-        if not await self.ensure_recruit_channel(interaction):
-            return
-
-        user_id = interaction.user.id
-        game = await self.get_user_party(interaction.guild_id, user_id)
-
-        if not game:
-            await interaction.response.send_message("❌ 현재 참가 중인 파티가 없습니다.", ephemeral=True)
-            return
-
-        roles = GAMES[game]["roles"]
-        if not roles:
-            await interaction.response.send_message(f"⚠️ `{game}` 파티에는 역할 개념이 없습니다.", ephemeral=True)
-            return
-
-        view = View()
-        view.add_item(RoleUpdateSelect(self, game, user_id))
-        await interaction.response.send_message(f"🎯 `{game}` 파티에서 변경할 역할을 선택하세요:", view=view, ephemeral=True)
-
-# UI Components
-class GameSelect(Select):
-    def __init__(self, cog, game_options):
-        self.cog = cog
-        options = [
-            discord.SelectOption(label=game, description=f"{game} 파티 모집", value=game)
-            for game in game_options
-        ]
-        super().__init__(placeholder="게임을 선택하세요", options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_game = self.values[0]
-        # 드롭다운 선택 사이에 사용자 대기 시간이 있어 두 사람이 같은 게임을 고를 수 있다.
-        if not await self.cog.create_party(interaction.guild_id, selected_game):
-            await interaction.response.send_message(
-                f"⚠️ `{selected_game}` 파티는 이미 생성되어 있습니다.", ephemeral=True
-            )
-            return
-        await send_party_embed(self.cog, interaction, selected_game)
-
-async def send_party_embed(cog, interaction, game):
-    info = GAMES[game]
-    participants = await cog.get_participants(interaction.guild_id, game)
-
-    embed = discord.Embed(
-        title=f"{game} 파티 모집",
-        description=f"최대 인원: {info['max_players']}명\n현재 참가자: {len(participants)}명",
-        color=discord.Color.green()
-    )
-    if info["roles"]:
-        embed.add_field(
-            name="역할 목록",
-            value=_bounded_field_value(", ".join(info["roles"])),
-            inline=False,
-        )
-
-    view = cog.shared_views[game]
-
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, view=view)
-    else:
-        await interaction.response.send_message(embed=embed, view=view)
-
-class JoinButton(Button):
-    def __init__(self, cog, game):
-        super().__init__(
-            label="참가하기",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"party:join:{game}",
-        )
-        self.cog = cog
-        self.game = game
-
-    async def callback(self, interaction: discord.Interaction):
-        game = self.game
-        user_id = interaction.user.id
-        guild_id = interaction.guild_id
-
-        # 영속 버튼은 custom_id만으로 동작하므로 길드 밖에서도 눌릴 수 있다.
-        if guild_id is None:
+        if guild is None or guild_id is None:
             await interaction.response.send_message(
                 "❌ 이 버튼은 서버 안에서만 사용할 수 있습니다.", ephemeral=True
             )
+            return True
+        if guild.id != guild_id or guild.get_member(interaction.user.id) is None:
+            await interaction.response.send_message(
+                "❌ 현재 서버 멤버만 이 패널을 사용할 수 있습니다.", ephemeral=True
+            )
+            return True
+
+        return False
+
+    async def _is_current_panel(self, interaction: discord.Interaction, game: str) -> bool:
+        panels = await run_db(self.settings.get_party_panels, interaction.guild_id)
+        message = getattr(interaction, "message", None)
+        return message is not None and panels.get(game) == message.id
+
+    async def handle_panel_click(
+        self,
+        interaction: discord.Interaction,
+        game: str,
+        action: str,
+        role: Optional[str] = None,
+    ) -> None:
+        if await self._reject_invalid_interaction(interaction):
             return
 
-        if not await self.cog.get_party(guild_id, game):
-            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
-            return
-
-        current_party = await self.cog.get_user_party(guild_id, user_id)
-
-        if current_party:
-            await interaction.response.send_message("⚠️ 이미 다른 파티에 참가 중입니다. 먼저 나가주세요.", ephemeral=True)
-            return
-
-        participants = await self.cog.get_participants(guild_id, game)
-        if len(participants) >= GAMES[game]["max_players"]:
-            await interaction.response.send_message("⚠️ 파티가 가득 찼습니다.", ephemeral=True)
-            return
-
-        if GAMES[game]["roles"]:
-            view = View()
-            view.add_item(RoleSelect(self.cog, game, GAMES[game]["roles"]))
-            await interaction.response.send_message("🎯 역할을 선택하세요:", view=view, ephemeral=True)
-        else:
-            if not await self.cog.add_participant(guild_id, game, user_id):
-                await interaction.response.send_message(
-                    "❌ 참가하지 못했어요. 파티가 종료되었거나 자리가 찼습니다.", ephemeral=True
+        guild_id = interaction.guild_id
+        user_id = interaction.user.id
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with panel_lock(guild_id, f"party:{game}"):
+            if not await self._is_current_panel(interaction, game):
+                await interaction.followup.send(
+                    "❌ 현재 서버의 최신 파티 패널이 아닙니다.", ephemeral=True
                 )
                 return
-            await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 참가했습니다!", ephemeral=False)
 
-class RoleSelect(Select):
-    def __init__(self, cog, game, roles):
-        options = [discord.SelectOption(label=role, value=role) for role in roles]
-        super().__init__(placeholder="역할을 선택하세요", options=options, min_values=1, max_values=1)
-        self.cog = cog
-        self.game = game
+            party = await self.get_active_party(guild_id, game)
+            participants = await self.get_participants(guild_id, game) if party else {}
+            current_game = await self.get_user_party(guild_id, user_id)
 
-    async def callback(self, interaction: discord.Interaction):
-        game = self.game
-        role = self.values[0].strip().lower()
-        user_id = interaction.user.id
-        guild_id = interaction.guild_id
+            if action == "inactive":
+                if party is not None:
+                    result = "⚠️ 이미 활성 모집이 있습니다. 역할 버튼을 사용하세요."
+                elif await self.create_party(guild_id, game, user_id):
+                    result = (
+                        f"✅ `{game}` 모집을 시작했습니다. "
+                        f"방장은 {interaction.user.mention}입니다."
+                    )
+                else:
+                    current_game = await self.get_user_party(guild_id, user_id)
+                    result = (
+                        f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+                        if current_game
+                        else "⚠️ 다른 사용자가 먼저 모집을 시작했습니다."
+                    )
+            elif action == "role" and party is None:
+                result = "⚠️ 먼저 모집 시작 버튼을 눌러 주세요."
+            elif current_game and current_game != game:
+                result = f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+            elif party is None:
+                if await self.create_party(guild_id, game, user_id):
+                    result = (
+                        f"✅ `{game}` 모집을 시작했습니다. "
+                        f"방장은 {interaction.user.mention}입니다."
+                    )
+                else:
+                    result = "⚠️ 모집을 시작하지 못했습니다. 다시 시도해 주세요."
+            elif current_game == game and participants.get(user_id) == role:
+                await self.remove_participant(guild_id, game, user_id)
+                result = f"👋 `{game}` 파티에서 나갔습니다."
+            else:
+                if await self.add_participant(guild_id, game, user_id, role):
+                    result = f"✅ `{game}` 파티 역할을 `{role or '참가'}`(으)로 정했습니다."
+                else:
+                    current_game = await self.get_user_party(guild_id, user_id)
+                    result = (
+                        f"⚠️ 이미 `{current_game}` 파티에 참가 중입니다."
+                        if current_game and current_game != game
+                        else "⚠️ 파티가 가득 찼거나 선택한 역할이 이미 찼습니다."
+                    )
 
-        if not await self.cog.get_party(guild_id, game):
-            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
-            return
+            await self.render_game_panel(guild_id, game)
+        await interaction.followup.send(result, ephemeral=True)
 
-        participants = await self.cog.get_participants(guild_id, game)
-        if len(participants) >= GAMES[game]["max_players"]:
-            await interaction.response.send_message("⚠️ 파티가 이미 가득 찼어요!", ephemeral=True)
-            return
-
-        current_party = await self.cog.get_user_party(guild_id, user_id)
-        if current_party:
-            await interaction.response.send_message("⚠️ 이미 다른 파티에 참가 중입니다. 먼저 나가주세요.", ephemeral=True)
-            return
-
-        # Check if role is taken
-        for uid, assigned_role in participants.items():
-            if assigned_role == role:
-                await interaction.response.send_message(f"⚠️ `{role}` 역할은 이미 다른 참가자가 선택했습니다.", ephemeral=True)
-                return
-
-        if not await self.cog.add_participant(guild_id, game, user_id, role):
-            await interaction.response.send_message(
-                "❌ 참가하지 못했어요. 파티가 종료되었거나 자리·역할이 이미 찼습니다.", ephemeral=True
+    async def _current_panel(self, guild: discord.Guild, game: str):
+        info = GAMES[game]
+        if len(info["roles"]) + 1 > MAX_COMPONENTS:
+            return (
+                discord.Embed(
+                    title=f"⚠️ {game} 파티 패널 비활성",
+                    description="역할 수가 Discord 버튼 25개 한도를 넘습니다. games.json을 수정하고 재시작하세요.",
+                    color=discord.Color.red(),
+                ),
+                None,
             )
-            return
-        await interaction.response.send_message(f"✅ {interaction.user.mention} 님이 `{game}` 파티에 역할 `{role}`로 참가했어요!", ephemeral=False)
 
-class RoleUpdateSelect(Select):
-    def __init__(self, cog, game, user_id):
-        options = [discord.SelectOption(label=role, value=role) for role in GAMES[game]["roles"]]
-        super().__init__(placeholder="새 역할을 선택하세요", options=options, min_values=1, max_values=1)
-        self.cog = cog
-        self.game = game
-        self.user_id = user_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ 상호작용 불가", ephemeral=True)
-            return
-
-        role = self.values[0].strip().lower()
-        game = self.game
-        guild_id = interaction.guild_id
-
-        if not await self.cog.get_party(guild_id, game):
-            await interaction.response.send_message("❌ 모집이 종료된 파티입니다.", ephemeral=True)
-            return
-
-        participants = await self.cog.get_participants(guild_id, game)
-        for uid, assigned_role in participants.items():
-            if uid != self.user_id and assigned_role == role:
-                await interaction.response.send_message(f"⚠️ `{role}` 역할은 이미 다른 참가자가 선택했습니다.", ephemeral=True)
-                return
-
-        if not await self.cog.add_participant(guild_id, game, self.user_id, role):
-            await interaction.response.send_message(
-                "❌ 역할을 바꾸지 못했어요. 파티가 종료되었거나 역할이 이미 찼습니다.", ephemeral=True
+        party = await self.get_active_party(guild.id, game)
+        participants = await self.get_participants(guild.id, game) if party else {}
+        if not party:
+            return (
+                discord.Embed(
+                    title=f"🎮 {game}",
+                    description="현재 모집이 없습니다. 아래 버튼을 눌러 모집을 시작하세요.",
+                    color=discord.Color.dark_grey(),
+                ),
+                PartyPanelView(self, game),
             )
+
+        created_at = int(party[0])
+        host_id = await self.get_party_host(guild.id, game)
+        host = guild.get_member(host_id) if host_id is not None else None
+        host_text = host.mention if host else (f"<@{host_id}>" if host_id else "없음")
+        embed = discord.Embed(
+            title=f"🎮 {game} 파티 모집",
+            description=(
+                f"방장: {host_text}\n"
+                f"현재 인원: {len(participants)} / {info['max_players']}\n"
+                f"만료: <t:{created_at + PARTY_LIFETIME_SECONDS}:R>"
+            ),
+            color=discord.Color.green(),
+        )
+        if info["roles"]:
+            role_members = {assigned: uid for uid, assigned in participants.items()}
+            lines = [
+                f"{role}: <@{role_members[role]}>" if role in role_members else f"{role}: 비어 있음"
+                for role in info["roles"]
+            ]
+            unassigned = [f"<@{uid}>" for uid, assigned in participants.items() if assigned is None]
+            if unassigned:
+                lines.append("역할 미정: " + ", ".join(unassigned))
+            embed.add_field(name="역할별 자리", value=_bounded("\n".join(lines)), inline=False)
+        return embed, PartyPanelView(self, game, active=True)
+
+    async def render_game_panel(self, guild_id: int, game: str) -> None:
+        if game not in GAMES or self.bot is None:
             return
-        await interaction.response.send_message(f"🔄 역할이 `{role}`(으)로 변경되었습니다!", ephemeral=True)
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+        channel_id = await run_db(self.settings.get_party_channel, guild_id)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return
+
+        panels = await run_db(self.settings.get_party_panels, guild_id)
+        embed, view = await self._current_panel(guild, game)
+        try:
+            message = await upsert_panel(
+                channel, panels.get(game), embed=embed, view=view
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning("파티 패널을 갱신하지 못했습니다: guild=%s game=%s", guild_id, game)
+            return
+        if panels.get(game) != message.id:
+            await run_db(self.settings.set_party_panel, guild_id, game, message.id)
+
+    async def ensure_panels(self, guild: discord.Guild) -> None:
+        channel_id = await run_db(self.settings.get_party_channel, guild.id)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return
+
+        stored = await run_db(self.settings.get_party_panels, guild.id)
+        for game, message_id in stored.items():
+            if game in GAMES:
+                continue
+            async with panel_lock(guild.id, f"party:{game}"):
+                latest = await run_db(self.settings.get_party_panels, guild.id)
+                if latest.get(game) != message_id:
+                    continue
+                try:
+                    message = await channel.fetch_message(message_id)
+                    bot_user = getattr(self.bot, "user", None)
+                    if bot_user is not None and message.author.id == bot_user.id:
+                        await message.delete()
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.warning(
+                        "오래된 파티 패널을 정리하지 못했습니다: guild=%s game=%s",
+                        guild.id,
+                        game,
+                    )
+                    continue
+                latest = await run_db(self.settings.get_party_panels, guild.id)
+                if latest.get(game) == message_id:
+                    await run_db(self.settings.delete_party_panel, guild.id, game)
+
+        for game in GAMES:
+            async with panel_lock(guild.id, f"party:{game}"):
+                await self.render_game_panel(guild.id, game)
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._panels_restored or self.bot is None:
+            return
+        async with self._restore_lock:
+            if self._panels_restored:
+                return
+            failed = False
+            for guild in self.bot.guilds:
+                try:
+                    await self.ensure_panels(guild)
+                except Exception:
+                    failed = True
+                    logger.exception("파티 패널 startup 복구 실패: guild=%s", guild.id)
+            self._panels_restored = not failed
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        guild_id = member.guild.id
+        game = await self.get_user_party(guild_id, member.id)
+        if not game:
+            return
+        async with panel_lock(guild_id, f"party:{game}"):
+            await self.remove_participant(guild_id, game, member.id)
+            await self.render_game_panel(guild_id, game)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        await run_db(self.db.delete_guild, guild.id)
+
+    @tasks.loop(minutes=10)
+    async def cleanup_parties(self):
+        cutoff = int(time.time()) - PARTY_LIFETIME_SECONDS
+        candidates = await run_db(self.db.list_expired_parties, cutoff)
+        expired = []
+        for guild_id, game in candidates:
+            async with panel_lock(guild_id, f"party:{game}"):
+                deleted = await run_db(
+                    self.db.delete_party_if_expired, guild_id, game, cutoff
+                )
+                if deleted:
+                    expired.append((guild_id, game))
+                    await self.render_game_panel(guild_id, game)
+        if expired:
+            print(f"Deleted expired parties: {expired}")
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayWithCog(bot))

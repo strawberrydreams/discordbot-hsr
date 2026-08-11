@@ -1,4 +1,4 @@
-/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/bot.log          strawberrydreams:staff  640  7  10240  *  JC  /Users/strawberrydreams/coding/discordbot-hsr/runtime/data/.bot.pid        1
-/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/bot-error.log    strawberrydreams:staff  640  7  10240  *  JC  /Users/strawberrydreams/coding/discordbot-hsr/runtime/data/.bot.pid        1
-/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup.log       strawberrydreams:staff  640  7  10240  *  JC  /Users/strawberrydreams/coding/discordbot-hsr/runtime/backups/.backup.pid  1
-/Users/strawberrydreams/coding/discordbot-hsr/runtime/logs/backup-error.log strawberrydreams:staff  640  7  10240  *  JC  /Users/strawberrydreams/coding/discordbot-hsr/runtime/backups/.backup.pid  1
+__PROJECT_ROOT__/runtime/logs/bot.log          __USER__:__GROUP__  640  7  10240  *  JC  __PROJECT_ROOT__/runtime/data/.bot.pid        1
+__PROJECT_ROOT__/runtime/logs/bot-error.log    __USER__:__GROUP__  640  7  10240  *  JC  __PROJECT_ROOT__/runtime/data/.bot.pid        1
+__PROJECT_ROOT__/runtime/logs/backup.log       __USER__:__GROUP__  640  7  10240  *  JC  __PROJECT_ROOT__/runtime/backups/.backup.pid  1
+__PROJECT_ROOT__/runtime/logs/backup-error.log __USER__:__GROUP__  640  7  10240  *  JC  __PROJECT_ROOT__/runtime/backups/.backup.pid  1

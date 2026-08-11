@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL
+from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL, LIMIT_IMAGE
 
 # 평균 출석 수입(17,500 P/일) 기준 이틀에 1회.
 IMAGE_COST = 30_000
@@ -73,14 +73,17 @@ class HyacineImageCog(commands.Cog):
             return
 
         cost = IMAGE_COST
-        if not await attendance_cog.deduct_points(
-            inter.guild_id, inter.user.id, cost, "image"
-        ):
-            current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
-            await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
+        reservation = await attendance_cog.reserve_ai_usage(
+            inter.user.id, "image", LIMIT_IMAGE
+        )
+        if reservation is None:
+            await inter.response.send_message(
+                "오늘 사용 횟수를 모두 사용했어요.", ephemeral=True
+            )
             return
+        usage_date, _ = reservation
 
-        charged = True
+        charged = False
         refunded = False
         refund_attempted = False
         refund_failed = False
@@ -88,6 +91,20 @@ class HyacineImageCog(commands.Cog):
         filepath = None
         uploaded = False
         file = None
+        api_started = False
+
+        async def release_usage():
+            if not api_started:
+                try:
+                    await attendance_cog.release_ai_usage(
+                        inter.user.id, usage_date, "image"
+                    )
+                except Exception:
+                    print(
+                        "❌ [hyacine_image] 일일 사용량 반환 실패 "
+                        f"(user={inter.user.id}, command=image)"
+                    )
+                    traceback.print_exc()
 
         async def refund_points() -> bool:
             nonlocal refund_attempted, refund_failed, refunded
@@ -110,6 +127,14 @@ class HyacineImageCog(commands.Cog):
             return True
 
         try:
+            if not await attendance_cog.deduct_points(
+                inter.guild_id, inter.user.id, cost, "image"
+            ):
+                current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
+                await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
+                return
+            charged = True
+
             await inter.response.defer()
 
             # 1. Request Image Generation
@@ -117,6 +142,9 @@ class HyacineImageCog(commands.Cog):
 
             # Gemini 이미지 모델(Nano Banana)은 generate_images가 아닌 generate_content를 사용
             # Run blocking SDK call in executor
+            # ponytail: API 호출이 시작되면 실패해도 일일 한도를 소비한다.
+            # provider 사용량 대조가 필요해질 때 request ID 원장을 추가한다.
+            api_started = True
             response = await loop.run_in_executor(
                 None,
                 lambda: self.client.models.generate_content(
@@ -203,6 +231,7 @@ class HyacineImageCog(commands.Cog):
             except Exception:
                 print(f"⚠️ [hyacine_image] 오류 메시지 전송 실패 (user={inter.user.id})")
         finally:
+            await release_usage()
             if file is not None:
                 file.close()
             if filepath and not uploaded:
