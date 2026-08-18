@@ -15,7 +15,6 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.music_cog import music_dependency_error
 from module.panel import drop_panel_locks, panel_lock
 
 
@@ -43,11 +42,9 @@ class SetupView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        party, music = await self.cog._ensure_bot_channels(guild)
+        party = await self.cog._ensure_bot_channels(guild)
         await interaction.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}"
-            f"{self.cog._music_disabled_notice()}",
-            ephemeral=True,
+            f"✅ 봇 채널을 준비했습니다: {party.mention}", ephemeral=True
         )
 
 
@@ -87,38 +84,23 @@ class GuildSettingsCog(commands.Cog):
                 view=self.setup_view,
             )
 
-    async def _ensure_bot_channels(
-        self, guild: discord.Guild
-    ) -> tuple[discord.TextChannel, discord.TextChannel]:
+    async def _ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
         async with panel_lock(guild.id, "setup"):
-            channels = await self.ensure_bot_channels(guild)
+            channel = await self.ensure_bot_channels(guild)
             await self._ensure_panels(guild)
-            return channels
+            return channel
 
     async def _ensure_panels(self, guild: discord.Guild) -> None:
         get_cog = getattr(self.bot, "get_cog", None)
         play_cog = get_cog("PlayWithCog") if get_cog else None
         if play_cog is not None:
             await play_cog.ensure_panels(guild)
-        music_cog = get_cog("MusicCog") if get_cog else None
-        if music_cog is not None:
-            await music_cog.ensure_panel(guild)
 
-    @staticmethod
-    def _music_disabled_notice() -> str:
-        reason = music_dependency_error()
-        return f"\n⚠️ 음악 기능 비활성: {reason}" if reason else ""
-
-    async def ensure_bot_channels(
-        self, guild: discord.Guild
-    ) -> tuple[discord.TextChannel, discord.TextChannel]:
+    async def ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
         party_id = await run_db(self.settings.get_party_channel, guild.id)
-        music_id = await run_db(self.settings.get_music_channel, guild.id)
         party = guild.get_channel(party_id) if party_id else None
-        music = guild.get_channel(music_id) if music_id else None
-
-        if party and music:
-            return party, music
+        if party:
+            return party
 
         category = discord.utils.get(guild.categories, name="🤖 봇")
         if category is None:
@@ -134,22 +116,16 @@ class GuildSettingsCog(commands.Cog):
             }
             category = await guild.create_category("🤖 봇", overwrites=overwrites)
 
-        if party is None:
-            party = await guild.create_text_channel("🎮-파티", category=category)
-            await run_db(self.settings.set_party_channel, guild.id, party.id)
-        if music is None:
-            music = await guild.create_text_channel("🎵-음악", category=category)
-            await run_db(self.settings.set_music_channel, guild.id, music.id)
-        return party, music
+        party = await guild.create_text_channel("🎮-파티", category=category)
+        await run_db(self.settings.set_party_channel, guild.id, party.id)
+        return party
 
-    @설정.command(name="시작", description="봇 전용 파티·음악 채널을 만듭니다.")
+    @설정.command(name="시작", description="봇 전용 파티 채널을 만듭니다.")
     async def _start(self, inter: discord.Interaction):
         await inter.response.defer(ephemeral=True)
-        party, music = await self._ensure_bot_channels(inter.guild)
+        party = await self._ensure_bot_channels(inter.guild)
         await inter.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}, {music.mention}"
-            f"{self._music_disabled_notice()}",
-            ephemeral=True,
+            f"✅ 봇 채널을 준비했습니다: {party.mention}", ephemeral=True
         )
 
     @설정.command(name="파티채널", description="파티 패널을 표시할 채널을 지정합니다.")
@@ -171,27 +147,6 @@ class GuildSettingsCog(commands.Cog):
             f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
 
-    @설정.command(name="음악채널", description="음악 패널을 표시할 채널을 지정합니다.")
-    @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _music_channel(
-        self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
-    ):
-        target = 채널 or inter.channel
-        if not isinstance(target, discord.TextChannel):
-            await inter.response.send_message(
-                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
-                ephemeral=True,
-            )
-            return
-        await inter.response.defer(ephemeral=True)
-        await run_db(self.settings.set_music_channel, inter.guild_id, target.id)
-        await self._ensure_panels(inter.guild)
-        await inter.followup.send(
-            f"✅ 음악 패널 채널을 {target.mention} 으로 지정했습니다."
-            f"{self._music_disabled_notice()}",
-            ephemeral=True,
-        )
-
     @설정.command(name="공지허용", description="파티 호스트 공지를 허용하거나 차단합니다.")
     @app_commands.describe(허용="허용하면 호스트 공지를 받습니다.")
     async def _allow_host_announce(self, inter: discord.Interaction, 허용: bool):
@@ -203,7 +158,6 @@ class GuildSettingsCog(commands.Cog):
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show(self, inter: discord.Interaction):
         party = await run_db(self.settings.get_party_channel, inter.guild_id)
-        music = await run_db(self.settings.get_music_channel, inter.guild_id)
         allow_host_announce = await run_db(
             self.settings.get_allow_host_announce, inter.guild_id
         )
@@ -212,12 +166,6 @@ class GuildSettingsCog(commands.Cog):
         embed.add_field(
             name="파티 패널 채널",
             value=f"<#{party}>" if party else "미지정 — `/설정 파티채널`",
-            inline=False,
-        )
-        embed.add_field(
-            name="음악 패널 채널",
-            value=(f"<#{music}>" if music else "미지정 — `/설정 음악채널`")
-            + self._music_disabled_notice(),
             inline=False,
         )
         embed.add_field(

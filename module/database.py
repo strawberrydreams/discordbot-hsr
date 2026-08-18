@@ -243,22 +243,6 @@ class GuildSettingsRepository(ABC):
         """파티 패널 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
-    def get_music_channel(self, guild_id: int) -> Optional[int]:
-        """음악 패널 채널 ID. 미설정이면 None."""
-
-    @abstractmethod
-    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """음악 패널 채널을 지정한다. None이면 해제."""
-
-    @abstractmethod
-    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
-        """음악 패널 메시지 ID. 미설정이면 None."""
-
-    @abstractmethod
-    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
-        """음악 패널 메시지 ID를 지정한다. None이면 해제."""
-
-    @abstractmethod
     def get_allow_host_announce(self, guild_id: int) -> bool:
         """파티 호스트 공지를 허용하는지 반환한다."""
 
@@ -820,23 +804,25 @@ class SQLitePartyRepository(PartyRepository):
 class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _PARTY_CHANNEL = "party_channel_id"
-    _MUSIC_CHANNEL = "music_channel_id"
-    _MUSIC_PANEL_MESSAGE = "music_panel_msg_id"
     _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 3
     _CURRENT_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
-        _MUSIC_CHANNEL,
-        _MUSIC_PANEL_MESSAGE,
         _ALLOW_HOST_ANNOUNCE,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
+    # v2는 music_channel_id/music_panel_msg_id를 더 갖고 있었다.
+    _V2_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        "music_channel_id",
+        "music_panel_msg_id",
+        _ALLOW_HOST_ANNOUNCE,
+    }
     _GUILD_SETTINGS_COLUMN_ORDER = (
         "guild_id",
         _PARTY_CHANNEL,
-        _MUSIC_CHANNEL,
-        _MUSIC_PANEL_MESSAGE,
         _ALLOW_HOST_ANNOUNCE,
     )
     _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
@@ -867,30 +853,54 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
             }
             if version < self._SCHEMA_VERSION and self._LEGACY_COLUMNS <= columns:
-                conn.execute("BEGIN")
-                try:
-                    conn.execute("ALTER TABLE guild_settings RENAME TO guild_settings_v1")
-                    self._create_current_tables(conn)
-                    conn.execute(
-                        """
-                        INSERT INTO guild_settings (guild_id, party_channel_id)
-                        SELECT guild_id, recruit_channel_id FROM guild_settings_v1
-                        """
-                    )
-                    conn.execute("DROP TABLE guild_settings_v1")
-                    self._require_current_contract(conn)
-                    _set_schema_version(conn, self._SCHEMA_VERSION)
-                except Exception:
-                    conn.rollback()
-                    raise
-                else:
-                    conn.commit()
+                # v1: recruit_channel_id → party_channel_id
+                self._rebuild_guild_settings(
+                    conn,
+                    "guild_settings_v1",
+                    """
+                    INSERT INTO guild_settings (guild_id, party_channel_id)
+                    SELECT guild_id, recruit_channel_id FROM guild_settings_v1
+                    """,
+                )
+                return
+
+            if version < self._SCHEMA_VERSION and self._V2_COLUMNS <= columns:
+                # v2: 음악 기능이 사라져 music_channel_id/music_panel_msg_id를 버린다.
+                # SQLite DROP COLUMN 대신 v1과 같은 rename-and-copy를 쓴다.
+                self._rebuild_guild_settings(
+                    conn,
+                    "guild_settings_v2",
+                    """
+                    INSERT INTO guild_settings
+                        (guild_id, party_channel_id, allow_host_announce)
+                    SELECT guild_id, party_channel_id, allow_host_announce
+                    FROM guild_settings_v2
+                    """,
+                )
                 return
 
             with conn:
                 self._create_party_panels_table(conn)
                 self._require_current_contract(conn)
                 _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    def _rebuild_guild_settings(
+        self, conn: sqlite3.Connection, staging: str, copy_sql: str
+    ) -> None:
+        """현재 스키마로 테이블을 다시 만들고 옮긴다. 실패하면 원본을 되돌린다."""
+        conn.execute("BEGIN")
+        try:
+            conn.execute(f"ALTER TABLE guild_settings RENAME TO {staging}")
+            self._create_current_tables(conn)
+            conn.execute(copy_sql)
+            conn.execute(f"DROP TABLE {staging}")
+            self._require_current_contract(conn)
+            _set_schema_version(conn, self._SCHEMA_VERSION)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
 
     @classmethod
     def _require_current_contract(cls, conn: sqlite3.Connection) -> None:
@@ -928,8 +938,6 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0
                     CHECK (allow_host_announce IN (0, 1))
             )
@@ -971,18 +979,6 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
         self._set_column(guild_id, self._PARTY_CHANNEL, channel_id)
 
-    def get_music_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._MUSIC_CHANNEL)
-
-    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._MUSIC_CHANNEL, channel_id)
-
-    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._MUSIC_PANEL_MESSAGE)
-
-    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._MUSIC_PANEL_MESSAGE, message_id)
-
     def get_allow_host_announce(self, guild_id: int) -> bool:
         return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
 
@@ -1023,12 +1019,10 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.execute(
                 """
                 UPDATE guild_settings
-                SET party_channel_id = CASE WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
-                    music_panel_msg_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_panel_msg_id END,
-                    music_channel_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_channel_id END
-                WHERE guild_id = ? AND (party_channel_id = ? OR music_channel_id = ?)
+                SET party_channel_id = NULL
+                WHERE guild_id = ? AND party_channel_id = ?
                 """,
-                (channel_id, channel_id, channel_id, guild_id, channel_id, channel_id),
+                (guild_id, channel_id),
             )
             conn.commit()
 

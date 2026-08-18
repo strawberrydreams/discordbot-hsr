@@ -13,8 +13,7 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 - 어느 서버 채널에서나 `/이벤트`
 - `/기본대화`, `/고급대화`, `/이미지`
 - 금지어 경고
-- `/설정` — `Manage Guild` 권한이 있는 서버 관리자가 파티·음악 채널과 파티 호스트 공지 수신을 설정
-- 선택 사항인 음악 패널 — URL을 대기열에 넣어 음성 채널에서 재생
+- `/설정` — `Manage Guild` 권한이 있는 서버 관리자가 파티 채널과 파티 호스트 공지 수신을 설정
 
 ## 빠른 시작
 
@@ -89,11 +88,9 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 - `Read Message History`
 - `Embed Links`
 - `Attach Files`
-- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
-- `Connect`
-- `Speak`
+- `Manage Channels` — 봇 전용 category와 파티 채널 생성
 
-설치 후 `Manage Guild` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만 바꿉니다.
+설치 후 `Manage Guild` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만 바꿉니다.
 
 슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 포인트·파티·설정은 자동으로 삭제됩니다.
 
@@ -101,15 +98,11 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 파티 채널에는 `settings/games.json`의 게임별 영속 패널이 하나씩 유지됩니다. 빈 자리 버튼은 참가, 자신의 자리 버튼은 퇴장, 다른 역할 버튼은 역할 변경입니다. 게임·역할 설정을 바꾼 뒤에는 봇을 재시작하세요.
 
-음악 패널의 `추가`를 누른 뒤 개별 HTTP(S) URL을 넣고, 요청자는 봇과 같은 음성 채널에 있어야 합니다. `건너뛰기`와 대기열 제거는 요청자 또는 서버 관리자가 할 수 있고, `일시정지`·`정지`는 서버 관리자만 할 수 있습니다. 재생목록은 지원하지 않습니다.
-
 실제 금지어 목록은 `settings/forbidden_words.json`에 작성합니다. 이 목록은 한 봇 인스턴스에 공통 적용되며, 경고 횟수는 서버별로 집계됩니다.
-
-음악의 `PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다. 외부 사이트 변경으로 yt-dlp가 깨질 수 있으며, 직접 실행은 `.venv/bin/python -m pip install --upgrade yt-dlp` 후 재시작하고 Docker는 `docker compose build --no-cache bot && docker compose up -d --no-deps bot`으로 새 이미지를 만드세요. 콘텐츠 저작권과 해당 서비스 약관 준수는 운영자 책임이며, 어떤 사이트나 콘텐츠의 재생을 보장하지 않습니다.
 
 `ADMIN_TOKEN`은 선택 사항입니다. 비어 있으면 웹 관리를 시작하지 않습니다. 설정하면 웹 관리는 고정된 `127.0.0.1:8080`에만 bind됩니다. Docker Compose는 이 포트를 host의 `127.0.0.1`에만 publish하므로 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열 수 있고, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다. 필요하다면 별도 보안 설계를 먼저 하세요.
 
-웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티·음악 채널과 공지 opt-in 상태를 확인하고, opt-in한 Guild에 공지를 보낼 수 있습니다.
+웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티 채널과 공지 opt-in 상태를 확인하고, opt-in한 Guild에 공지를 보낼 수 있습니다.
 
 AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도를 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
 

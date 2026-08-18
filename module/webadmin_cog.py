@@ -267,7 +267,7 @@ class WebAdminCog(commands.Cog):
         운영자는 어느 길드가 공지를 허용했고 패널 채널이 어디인지 확인할 수단이
         없으면 공지를 보내기 전에 대상을 검증할 수 없다.
 
-        ponytail: 길드당 조회 3회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
+        ponytail: 길드당 조회 2회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
         길드가 수백 개로 늘면 전 길드 설정을 한 번에 읽는 repository 메서드를
         추가한다.
         """
@@ -276,24 +276,22 @@ class WebAdminCog(commands.Cog):
         for guild in self.bot.guilds:
             try:
                 party = await run_db(self.settings.get_party_channel, guild.id)
-                music = await run_db(self.settings.get_music_channel, guild.id)
                 allowed = await run_db(self.settings.get_allow_host_announce, guild.id)
             except Exception:
                 logger.exception("Guild overview lookup failed for guild_id=%s", guild.id)
                 return "", "".join(options), "길드 설정을 읽지 못했습니다."
             name = html.escape(str(guild.name), quote=True)
             rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
                     name,
                     html.escape(self._channel_label(guild, party), quote=True),
-                    html.escape(self._channel_label(guild, music), quote=True),
                     "허용" if allowed else "차단",
                 )
             )
             if allowed:
                 options.append(f'<option value="{int(guild.id)}">{name}</option>')
         if not rows:
-            rows.append('<tr><td colspan="4">참여 중인 길드가 없습니다.</td></tr>')
+            rows.append('<tr><td colspan="3">참여 중인 길드가 없습니다.</td></tr>')
         return "".join(rows), "".join(options), ""
 
     async def _index_response(self, csrf: str, notice: str = "") -> web.Response:

@@ -10,7 +10,6 @@
 #   6. AttendanceCog 파사드 (Repository 주입 및 위임)
 #   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
-#   9. 음악 core·영속 패널 계약
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
@@ -455,13 +454,15 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "현재 설정과 영속 panel 명령 block 유지",
-        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
+        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
     )
     check(
-        "channel과 voice permission block 유지",
-        """- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
-- `Connect`
-- `Speak`""" in quick_start,
+        "channel permission block 유지",
+        "- `Manage Channels` — 봇 전용 category와 파티 채널 생성" in quick_start,
+    )
+    check(
+        "voice permission은 더 이상 요구하지 않음",
+        "`Connect`" not in quick_start and "`Speak`" not in quick_start,
     )
     check(
         "웹 관리는 선택 token·고정 loopback·unsupported remote 경계",
@@ -474,12 +475,6 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     check(
         "공지는 opt-in Guild의 configured party channel만 대상",
         "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
-    )
-    check(
-        "음악 선택 의존성과 exact yt-dlp 갱신 절차",
-        "`PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다." in readme
-        and ".venv/bin/python -m pip install --upgrade yt-dlp" in readme
-        and "docker compose build --no-cache bot && docker compose up -d --no-deps bot" in readme,
     )
     check(
         "MIT와 무기여 정책을 유지",
@@ -619,8 +614,8 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
     )
     check(
-        "Docker runtime은 exact ffmpeg install과 main healthcheck",
-        "apt-get install -y --no-install-recommends ffmpeg" in dockerfile
+        "Docker runtime은 apt 설치 없이 main healthcheck",
+        "apt-get install" not in dockerfile
         and expected_healthcheck in dockerfile
         and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
     )
@@ -1517,7 +1512,7 @@ def test_schema_versions():
 
     check("attendance 스키마 버전", _user_version(attendance_path) == 2)
     check("party 스키마 버전", _user_version(party_path) == 2)
-    check("settings 스키마 버전", _user_version(settings_path) == 2)
+    check("settings 스키마 버전", _user_version(settings_path) == 3)
 
     for label, repository in (
         ("attendance", SQLiteAttendanceRepository),
@@ -1621,7 +1616,7 @@ def test_schema_versions():
         )
 
     for legacy_version in (0, 1):
-        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v2.db"
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v3.db"
         with sqlite3.connect(legacy_path) as conn:
             conn.execute(
                 "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
@@ -1631,7 +1626,7 @@ def test_schema_versions():
         SQLiteGuildSettingsRepository(legacy_path)
         with sqlite3.connect(legacy_path) as conn:
             row = conn.execute(
-                "SELECT party_channel_id, music_channel_id, music_panel_msg_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+                "SELECT party_channel_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
             ).fetchone()
             tables = {
                 item[0]
@@ -1648,29 +1643,25 @@ def test_schema_versions():
                 row[1] for row in sorted(panel_info, key=lambda row: row[5]) if row[5]
             )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        check(f"settings v{legacy_version} recruit 보존", row == (700, None, None, 0))
+        check(f"settings v{legacy_version} recruit 보존", row == (700, 0))
         check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
         check(
             f"settings v{legacy_version} 정확한 패널 스키마",
             guild_columns == (
                 "guild_id",
                 "party_channel_id",
-                "music_channel_id",
-                "music_panel_msg_id",
                 "allow_host_announce",
             )
             and panel_columns == ("guild_id", "game", "message_id")
             and panel_primary_key == ("guild_id", "game"),
         )
-        check(f"settings v{legacy_version} 버전", version == 2)
+        check(f"settings v{legacy_version} 버전", version == 3)
 
     malformed_schemas = {
         "extra guild_settings column": """
             CREATE TABLE guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0,
                 obsolete INTEGER
             )
@@ -1679,8 +1670,6 @@ def test_schema_versions():
             CREATE TABLE guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE party_panels (
@@ -1711,17 +1700,13 @@ def test_schema_versions():
     panels_after_upsert = settings.get_party_panels(7)
     settings.delete_party_panel(7, "LOL")
     settings.set_party_channel(7, 700)
-    settings.set_music_channel(7, 701)
-    settings.set_music_panel_msg(7, 702)
     settings.set_allow_host_announce(7, True)
     settings.set_allow_host_announce(8, True)
     settings.clear_channel(7, 701)
     check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
-    check("삭제된 음악 채널은 패널 메시지도 해제", settings.get_party_channel(7) == 700 and settings.get_music_channel(7) is None and settings.get_music_panel_msg(7) is None)
-    settings.set_music_channel(7, 701)
-    settings.set_music_panel_msg(7, 702)
+    check("무관한 채널 삭제는 파티 설정을 건드리지 않음", settings.get_party_channel(7) == 700)
     settings.clear_channel(7, 700)
-    check("삭제된 파티 채널은 음악 설정을 보존하고 해제", settings.get_party_channel(7) is None and settings.get_music_channel(7) == 701 and settings.get_music_panel_msg(7) == 702)
+    check("삭제된 파티 채널은 해제", settings.get_party_channel(7) is None)
     check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
     settings.delete_guild(7)
     check("길드 삭제는 설정과 party panel 정리", settings.get_party_panels(7) == {} and settings.get_party_channel(7) is None)
@@ -2048,7 +2033,6 @@ def test_imports():
         "module.config",
         "module.database",
         "module.main",
-        "module.music_cog",
         "module.panel",
         "module.guildsettings_cog",
         "module.attendance_cog",
@@ -2065,89 +2049,6 @@ def test_imports():
             check(f"import {m}", True)
         except Exception as e:
             check(f"import {m}", False, f"({e})")
-
-
-def test_music_core_contract():
-    print("\n[9] 음악 core·영속 패널")
-    import module.main as bot_main
-    import module.music_cog as music_cog
-
-    declared = [
-        line.split("#")[0].strip()
-        for line in (PROJECT_ROOT / "requirements.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    declared = [line for line in declared if line]
-    check("PyNaCl은 1.5 이상 2 미만으로 고정", "PyNaCl>=1.5,<2" in declared)
-    check(
-        # 외부 사이트가 바뀌면 즉시 최신 yt-dlp로 올라갈 수 있어야 한다.
-        "yt-dlp는 상한도 exact pin도 없음",
-        [line for line in declared if line.lower().startswith("yt-dlp")] == ["yt-dlp"],
-    )
-
-    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    apt_packages = [
-        token
-        for token in dockerfile.split("apt-get install")[-1].split("&&")[0].split()
-        if not token.startswith("-") and token != "\\"
-    ]
-    check("Dockerfile은 distro 패키지로 ffmpeg만 설치", apt_packages == ["ffmpeg"])
-    check(
-        "apt cache를 이미지에 남기지 않음",
-        "rm -rf /var/lib/apt/lists/*" in dockerfile,
-    )
-
-    # 최상위(들여쓰기 0) import만 본다. `from yt_dlp import YoutubeDL`처럼 형태만 바꾼
-    # 회귀도 잡아야 하므로 문자열 하나가 아니라 import 줄 전체를 훑는다.
-    top_level_imports = [
-        line
-        for line in inspect.getsource(music_cog).splitlines()
-        if (line.startswith("import ") or line.startswith("from "))
-        and ("yt_dlp" in line or "nacl" in line)
-    ]
-    check(
-        "yt-dlp/PyNaCl은 최상위에서 import하지 않음 (미설치 환경에서도 import 가능)",
-        top_level_imports == [],
-        f"({top_level_imports})",
-    )
-    check(
-        "의존성 검사를 가진 확장은 음악뿐",
-        [name for name, _, dep in bot_main.EXTENSIONS if dep is not None]
-        == ["module.music_cog"],
-    )
-
-    with patch.object(music_cog, "find_spec", lambda name, *a, **k: None):
-        reason = music_cog.music_dependency_error()
-    check(
-        "skip 사유에 빠진 package와 설치 안내 포함",
-        reason is not None
-        and "PyNaCl" in reason
-        and "yt-dlp" in reason
-        and "pip install" in reason,
-        f"({reason})",
-    )
-    with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
-        check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
-
-    view = music_cog.MusicPanelView(SimpleNamespace())
-    check("음악 패널 view는 persistent", view.is_persistent())
-    check(
-        "음악 패널 button custom_id 고정",
-        {item.custom_id for item in view.children}
-        == {"music:add", "music:skip", "music:pause", "music:stop", "music:remove"},
-    )
-    check("패널 queue 표시는 10곡", music_cog.MAX_QUEUE_DISPLAY == 10)
-    check("remove select는 25곡", music_cog.MAX_REMOVE_OPTIONS == 25)
-    check(
-        "패널 복구·렌더 interface 존재",
-        all(callable(getattr(music_cog.MusicCog, name, None)) for name in ("ensure_panel", "render_panel")),
-    )
-    source = inspect.getsource(music_cog)
-    check("주기적 음악 progress update 없음", "@tasks.loop" not in source)
-
-    # 재생 엔진의 동작 계약(상태 전이, ffmpeg option, 불변 track)은
-    # test_discord_commands.py의 MusicPlayerStateTests/MusicPanelTests가 실행해 검증한다.
 
 
 def test_backup_round_trip():
@@ -2628,7 +2529,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical settings migrates to the panel contract",
-        settings_version == 2
+        settings_version == 3
         and "party_panels" in settings_tables
         and party_channel == (700,),
     )
@@ -3425,7 +3326,6 @@ if __name__ == "__main__":
         test_cog_facade()
         test_channel_sessions()
         test_imports()
-        test_music_core_contract()
         test_backup_round_trip()
         test_settings_backup_round_trip()
         test_setting_source_inspection_failure_closes_descriptor()
