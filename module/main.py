@@ -35,7 +35,6 @@ EXTENSIONS = (
     ("module.hyacine_chat_cog", ("OPENAI_API_KEY",), None),
     ("module.hyacine_image_cog", ("GOOGLE_API_KEY",), None),
     ("module.attendance_cog", (), None),
-    ("module.finance_cog", (), None),
     ("module.music_cog", (), music_dependency_error),
 )
 

@@ -2058,7 +2058,6 @@ def test_imports():
         "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
-        "module.finance_cog",
     ]
     for m in mods:
         try:
