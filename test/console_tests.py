@@ -3283,6 +3283,105 @@ def test_prune_skips_invalid_utf8_manifest():
     )
 
 
+def _sha256_file(path: pathlib.Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_legacy_export():
+    """삭제 예정 데이터 export가 원본을 건드리지 않고 전부 담아내는지."""
+    print("\n[N] 삭제 예정 데이터 export")
+    from module import export_legacy
+
+    root = _TMP_DIR / "legacy_export_src"
+    root.mkdir(parents=True, exist_ok=True)
+    attendance = root / "attendance_data.db"
+    settings_db = root / "guild_settings.db"
+    _create_legacy_attendance_db(attendance, version=2)
+    with closing(sqlite3.connect(attendance)) as conn:
+        conn.execute("INSERT INTO users VALUES (7, 99, 1234, '2026-08-17', 3)")
+        conn.commit()
+    with closing(sqlite3.connect(settings_db)) as conn:
+        conn.executescript("""
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO guild_settings VALUES (7, 100, 200, 300, 1);
+            PRAGMA user_version = 2;
+        """)
+
+    before = (_sha256_file(attendance), _sha256_file(settings_db))
+    document = export_legacy.build_export(root)
+    sections = document["sections"]
+
+    check("스키마 버전 기록", document["schema_versions"]["attendance_data.db"] == 2)
+    check("users 2행 추출", len(sections["users"]) == 2, f"({sections['users']})")
+    check(
+        "포인트와 최종 출석일 보존",
+        {"guild_id": 7, "user_id": 99, "points": 1234,
+         "last_attendance_date": "2026-08-17"} in sections["users"],
+        f"({sections['users']})",
+    )
+    check("원장 추출", len(sections["point_ledger"]) == 1)
+    check("원장 사유 보존", sections["point_ledger"][0]["reason"] == "attendance")
+    check(
+        "음악 채널 설정 추출",
+        sections["music_settings"] == [
+            {"guild_id": 7, "music_channel_id": 200, "music_panel_msg_id": 300}
+        ],
+        f"({sections['music_settings']})",
+    )
+    check(
+        "export는 원본 DB를 수정하지 않음",
+        before == (_sha256_file(attendance), _sha256_file(settings_db)),
+    )
+
+    # 이미 마이그레이션이 끝난 DB — 사라진 것은 null, 남은 것은 그대로.
+    migrated = _TMP_DIR / "legacy_export_migrated"
+    migrated.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(migrated / "attendance_data.db")) as conn:
+        conn.executescript("""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            PRAGMA user_version = 3;
+        """)
+    migrated_sections = export_legacy.build_export(migrated)["sections"]
+    check("마이그레이션 후 users는 null", migrated_sections["users"] is None)
+    check("마이그레이션 후 원장은 null", migrated_sections["point_ledger"] is None)
+    check("DB 파일이 없으면 null", migrated_sections["music_settings"] is None)
+
+    # 빈 디렉터리에서도 죽지 않는다.
+    empty = _TMP_DIR / "legacy_export_empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    check(
+        "DB가 하나도 없어도 동작",
+        all(
+            rows is None
+            for rows in export_legacy.build_export(empty)["sections"].values()
+        ),
+    )
+
+    destination = _TMP_DIR / "legacy_export_out" / "export.json"
+    export_legacy.write_export(destination, root)
+    written = json.loads(destination.read_text(encoding="utf-8"))
+    check("파일로 기록", written["sections"]["point_ledger"][0]["delta"] == 9000)
+    try:
+        export_legacy.write_export(destination, root)
+        clobbered = True
+    except FileExistsError:
+        clobbered = False
+    check("기존 export 파일을 덮어쓰지 않음", not clobbered)
+
+
 if __name__ == "__main__":
     try:
         test_config_paths()
@@ -3350,6 +3449,7 @@ if __name__ == "__main__":
         test_corrupt_backup_rejected()
         test_malformed_manifest_rejected()
         test_prune_skips_invalid_utf8_manifest()
+        test_legacy_export()
     finally:
         shutil.rmtree(_TMP_DIR, ignore_errors=True)  # 임시 DB 정리
 

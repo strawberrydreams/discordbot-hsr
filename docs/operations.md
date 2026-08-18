@@ -211,6 +211,32 @@ DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도**
 
 `runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
 
+## 삭제 예정 데이터 export
+
+포인트·출석·음악 기능을 제거하는 마이그레이션은 해당 테이블과 컬럼을 되돌릴 수 없게 지웁니다. 마이그레이션이 포함된 버전으로 올리기 **전에** 아래를 실행해 사람이 읽을 수 있는 JSON으로 받아 두세요.
+
+```bash
+.venv/bin/python -m module.export_legacy
+```
+
+Docker에서는 `bot` container에서 실행합니다. 출력이 `runtime/backups/`로 떨어지므로 host에 그대로 남습니다.
+
+```bash
+docker compose run --rm --no-deps bot python -m module.export_legacy
+```
+
+출력 경로를 인자로 지정할 수도 있습니다. 기본값은 `runtime/backups/legacy-export-<UTC timestamp>.json`입니다.
+
+내보내는 항목은 세 가지입니다.
+
+- `users` — 길드·사용자별 포인트 잔액(`points`)과 최종 출석일(`last_attendance_date`)
+- `point_ledger` — 포인트 이동 원장 전체
+- `music_settings` — 길드별 음악 채널·패널 메시지 ID
+
+원본 DB는 읽지도 쓰지도 않습니다. SQLite 온라인 백업 API로 스냅숏을 뜬 뒤 그 사본에서 읽으므로 봇이 켜져 있어도 안전하고, 결과는 특정 시점에서 일관됩니다. 이미 마이그레이션이 끝난 DB에 실행하면 사라진 항목이 `null`로 기록될 뿐 실패하지 않습니다. 기존 파일은 덮어쓰지 않으므로, 같은 경로로 두 번 실행하면 두 번째가 거부됩니다.
+
+`forbidden_count`와 AI 사용량(`ai_usage`)은 삭제 대상이 아니므로 export에 포함되지 않고 마이그레이션 후에도 그대로 남습니다.
+
 ## 검증된 백업으로 실제 복구
 
 복구는 자동화하지 않습니다. 서비스 중지 → manifest 검증과 내장 stage restore → DB 교체 → 존재한 설정 파일별 확인 교체 → 파일 권한 확인 → 서비스 시작 → health/log 확인 순서로 진행합니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 선택하고, 덮어쓰기 전 비상 사본을 보관하세요. `stage_restore`가 manifest의 크기·체크섬·DB 무결성을 검증하고 stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 복사를 거부했다면 서비스를 시작하지 마세요.
