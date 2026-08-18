@@ -18,9 +18,6 @@ from module.config import (
     load_settings_json,
 )
 
-# 가격은 포인트로 감당할 수 있는 횟수를 제한하고, LIMIT_*는 일일 API 요청을 별도로 제한한다.
-LIGHT_COST = 200
-DEEP_COST = 2_000
 
 DEFAULT_PERSONA = {
     "system_prompt": "당신은 놀빛 정원의 따뜻한 의사, 하늘의 백성 히아킨입니다. 사용자를 '회색둥이 씨'라 부르며, 한국어로 정확하고 다정하게 답하세요.",
@@ -185,21 +182,18 @@ class HyacineChatCog(commands.Cog):
         이미지: Optional[discord.Attachment],
         model: str,
         reasoning_effort: str,
-        cost: int,
         usage_command: str,
         daily_limit: int,
     ):
         session = self.get_session(inter.channel_id)
-        attendance_cog = self.bot.get_cog("AttendanceCog") if self.bot else None
-        charged = False
-        refunded = False
+        usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
         api_started = False
 
-        if not attendance_cog:
-            await inter.response.send_message("❌ 출석체크 모듈 오류.", ephemeral=True)
+        if not usage_cog:
+            await inter.response.send_message("❌ 사용량 모듈 오류.", ephemeral=True)
             return
 
-        reservation = await attendance_cog.reserve_ai_usage(
+        reservation = await usage_cog.reserve_ai_usage(
             inter.user.id, usage_command, daily_limit
         )
         if reservation is None:
@@ -212,7 +206,7 @@ class HyacineChatCog(commands.Cog):
         async def release_usage():
             if not api_started:
                 try:
-                    await attendance_cog.release_ai_usage(
+                    await usage_cog.release_ai_usage(
                         inter.user.id, usage_date, usage_command
                     )
                 except Exception:
@@ -222,36 +216,12 @@ class HyacineChatCog(commands.Cog):
                     )
                     traceback.print_exc()
 
-        async def refund_points():
-            nonlocal refunded
-            if not charged or refunded:
-                return refunded
-            try:
-                await attendance_cog.add_points(
-                    inter.guild_id, inter.user.id, cost, f"chat_refund:{model}"
-                )
-            except Exception:
-                print(f"❌ [hyacine_chat] 포인트 환불 실패 (channel={inter.channel_id})")
-                traceback.print_exc()
-                return False
-            refunded = True
-            return True
-
         try:
-            if cost > 0:
-                if not await attendance_cog.deduct_points(
-                    inter.guild_id, inter.user.id, cost, f"chat:{model}"
-                ):
-                    current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
-                    await inter.response.send_message(f"❌ 이 명령은 {cost:,} P가 필요해요! (보유: {current:,} P)", ephemeral=True)
-                    return
-                charged = True
-
             await inter.response.defer()
 
             parts = self.build_user_parts(내용, 이미지)
 
-            # 포인트 차감과 defer()는 락 밖에 둬서 대기 중에도 인터랙션이 만료되지 않게 한다.
+            # defer()는 락 밖에 둬서 대기 중에도 인터랙션이 만료되지 않게 한다.
             async with session.lock:
                 self.trim(session)
 
@@ -276,10 +246,8 @@ class HyacineChatCog(commands.Cog):
                 reply = (resp.output_text or "").strip()
 
                 if not reply.strip():
-                    refund_note = " (포인트 환불됨)" if await refund_points() else ""
                     await inter.followup.send(
                         "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
-                        + refund_note
                     )
                     return
 
@@ -306,13 +274,10 @@ class HyacineChatCog(commands.Cog):
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
             traceback.print_exc()
-            refund_note = " (포인트 환불됨)" if await refund_points() else ""
             if isinstance(exc, openai.RateLimitError):
-                error_message = (
-                    f"⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요.{refund_note}"
-                )
+                error_message = "⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요."
             else:
-                error_message = f"❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요.{refund_note}"
+                error_message = "❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요."
             try:
                 if inter.response.is_done():
                     await inter.followup.send(error_message)
@@ -329,7 +294,7 @@ class HyacineChatCog(commands.Cog):
         inter: discord.Interaction,
         error: app_commands.AppCommandError,
     ):
-        # 쿨다운은 콜백 진입 전에 걸리므로 포인트는 아직 차감되지 않았다.
+        # 쿨다운은 콜백 진입 전에 걸리므로 일일 한도는 아직 예약되지 않았다.
         if isinstance(error, app_commands.CommandOnCooldown):
             await inter.response.send_message(
                 f"⏳ 조금만 쉬어 가요~ {error.retry_after:.0f}초 뒤에 다시 불러 주세요.",
@@ -338,7 +303,7 @@ class HyacineChatCog(commands.Cog):
             return
         raise error
 
-    @app_commands.command(name="기본대화", description="AI와 빠르게 대화합니다. (200 P)")
+    @app_commands.command(name="기본대화", description="AI와 빠르게 대화합니다.")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _light_talk(
@@ -348,10 +313,10 @@ class HyacineChatCog(commands.Cog):
         이미지: Optional[discord.Attachment] = None,
     ):
         await self._run_talk(
-            inter, 내용, 이미지, LIGHT_MODEL, "none", LIGHT_COST, "light", LIMIT_LIGHT
+            inter, 내용, 이미지, LIGHT_MODEL, "none", "light", LIMIT_LIGHT
         )
 
-    @app_commands.command(name="고급대화", description="AI와 깊이 대화합니다. (2,000 P)")
+    @app_commands.command(name="고급대화", description="AI와 깊이 대화합니다.")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _deep_talk(
@@ -361,22 +326,22 @@ class HyacineChatCog(commands.Cog):
         이미지: Optional[discord.Attachment] = None,
     ):
         await self._run_talk(
-            inter, 내용, 이미지, DEEP_MODEL, "medium", DEEP_COST, "deep", LIMIT_DEEP
+            inter, 내용, 이미지, DEEP_MODEL, "medium", "deep", LIMIT_DEEP
         )
 
     @app_commands.command(name="상태", description="이 채널의 현재 상태 확인")
     async def _status(self, inter: discord.Interaction):
         session = self.get_session(inter.channel_id)
-        attendance_cog = self.bot.get_cog("AttendanceCog") if self.bot else None
+        usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
         msg = (
             "- **대화 명령**\n"
-            f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`, {LIGHT_COST:,} P)\n"
-            f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`, {DEEP_COST:,} P)\n"
+            f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`)\n"
+            f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`)\n"
         )
-        if attendance_cog:
-            light = max(0, LIMIT_LIGHT - await attendance_cog.get_ai_usage(inter.user.id, "light"))
-            deep = max(0, LIMIT_DEEP - await attendance_cog.get_ai_usage(inter.user.id, "deep"))
-            image = max(0, LIMIT_IMAGE - await attendance_cog.get_ai_usage(inter.user.id, "image"))
+        if usage_cog:
+            light = max(0, LIMIT_LIGHT - await usage_cog.get_ai_usage(inter.user.id, "light"))
+            deep = max(0, LIMIT_DEEP - await usage_cog.get_ai_usage(inter.user.id, "deep"))
+            image = max(0, LIMIT_IMAGE - await usage_cog.get_ai_usage(inter.user.id, "image"))
             msg += (
                 " \n- **오늘 남은 횟수 (KST)**\n"
                 f"- `/기본대화`: {light}/{LIMIT_LIGHT}회\n"

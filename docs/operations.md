@@ -18,43 +18,23 @@
 
 웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다.
 
-서버 간 데이터는 섞이지 않습니다. 포인트·출석·금지어 카운트·파티·설정은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 잔액은 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
+서버 간 데이터는 섞이지 않습니다. 금지어 카운트·파티·설정은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 카운트는 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
 
-봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 포인트·원장·파티·설정을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
+봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 금지어 카운트·파티·설정을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
 
-### 포인트 경제
+### AI 일일 한도
 
-포인트의 유일한 수입원은 `/출석`입니다(하루 5,000~30,000 P, 평균 17,500 P). 통화를 발행하는 다른 경로를 추가하지 마세요 — 발행처가 둘이면 아래 가격의 근거가 무너집니다. 이 이유로 `/럭키박스`는 제거했습니다.
+| 명령 | 사용자별 KST 일일 한도 |
+|---|---|
+| `/기본대화` | `LIMIT_LIGHT` |
+| `/고급대화` | `LIMIT_DEEP` |
+| `/이미지` | `LIMIT_IMAGE` |
 
-| 명령 | 가격 | 사용자별 KST 일일 한도 | 상수 |
-|---|---|---|---|
-| `/기본대화` | 200 P | `LIMIT_LIGHT` | `hyacine_chat_cog.LIGHT_COST` |
-| `/고급대화` | 2,000 P | `LIMIT_DEEP` | `hyacine_chat_cog.DEEP_COST` |
-| `/이미지` | 30,000 P | `LIMIT_IMAGE` | `hyacine_image_cog.IMAGE_COST` |
+한도는 명령별로 적용되며, 사용자별·봇 인스턴스 전역으로 집계하고 매일 KST 자정에 리셋됩니다. `.env.runtime`의 `LIMIT_LIGHT`·`LIMIT_DEEP`·`LIMIT_IMAGE`로 각 명령의 횟수를 조정하며, `/상태`에서 오늘 남은 횟수를 확인할 수 있습니다. `AI_COOLDOWN_SECONDS`(기본 15초)는 사용자별 연속 호출 속도를 추가로 제한합니다. 값을 바꾼 뒤에는 봇을 재시작하세요.
 
-가격을 조정할 때는 구현 계획(`docs/superpowers/plans/2026-07-30-followup-hardening.md`)의 「포인트 경제 근거」 절을 함께 갱신하세요.
-
-일일 한도는 포인트와 별도로 적용되며, 사용자별·봇 인스턴스 전역으로 집계하고 매일 KST 자정에 리셋됩니다. `.env.runtime`의 `LIMIT_LIGHT`·`LIMIT_DEEP`·`LIMIT_IMAGE`로 각 명령의 횟수를 조정하며, `/상태`에서 오늘 남은 횟수를 확인할 수 있습니다. `AI_COOLDOWN_SECONDS`(기본 15초)는 사용자별 연속 호출 속도를 추가로 제한합니다. 값을 바꾼 뒤에는 봇을 재시작하세요.
+한도는 API 호출이 시작되기 전에 예약되고, 호출 전에 실패하면 반환됩니다. 호출이 시작된 뒤의 실패는 한도를 소비합니다 — provider 쪽에서 이미 비용이 발생했을 수 있기 때문입니다.
 
 **최후의 안전망은 앱이 아니라 OpenAI 계정 예산 한도입니다.** 앱에는 전역 kill switch를 두지 않았으므로, OpenAI 대시보드에서 월 예산 상한을 반드시 설정해 두세요.
-
-### 포인트 원장으로 환불 실패 대조하기
-
-모든 포인트 이동은 `attendance_data.db`의 `point_ledger` 테이블에 append-only로 기록됩니다(`delta`, `reason`, `created_at` epoch 초). 실패한 차감은 기록되지 않습니다. 사용자가 "자동 환불에 실패했습니다. 관리자에게 수동 정산을 요청해 주세요" 안내를 받았다면 다음으로 대조합니다.
-
-```bash
-.venv/bin/python -c '
-from module.database import create_attendance_repository
-import datetime
-GUILD_ID = 000000000000000000  # 대상 서버 ID로 교체
-USER_ID = 000000000000000000  # 대상 사용자 ID로 교체
-repo = create_attendance_repository()
-for delta, reason, at in repo.get_ledger(GUILD_ID, USER_ID, limit=50):
-    print(datetime.datetime.fromtimestamp(at), f"{delta:+,}", reason)
-print("잔액:", repo.get_points(GUILD_ID, USER_ID))'
-```
-
-`chat:<model>` / `image` 차감에 짝이 되는 `chat_refund:<model>` / `image_refund` 행이 없으면 환불이 누락된 것입니다. 원장 합계는 항상 현재 잔액과 일치해야 합니다.
 
 이전 버전의 파티 `created_at` 중 timezone이 없는 값은 Docker가 UTC, launchd가 KST로 기록했을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석합니다. 기존 launchd 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
 
@@ -375,7 +355,7 @@ esac
 )
 ```
 
-이어 Discord에서 `/지갑`, `/랭킹`, `/프로필`과 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
+이어 Discord에서 `/프로필`과 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
 
 ## 배포
 

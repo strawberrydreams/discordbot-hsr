@@ -153,9 +153,9 @@ class ForbiddenFilterCog(commands.Cog):
         )
 
         # Increment forbidden count
-        attendance_cog = self.bot.get_cog("AttendanceCog")
-        if attendance_cog:
-            await attendance_cog.increment_forbidden_count(
+        usage_cog = self.bot.get_cog("UsageCog")
+        if usage_cog:
+            await usage_cog.increment_forbidden_count(
                 message.guild.id, message.author.id
             )
 

@@ -4,13 +4,13 @@
 # Cog들은 Repository 인터페이스만 사용하므로, 외부 DB로 교체해도 Cog 코드는 바뀌지 않는다.
 #
 # 외부 DB(MySQL, Oracle 등)로 교체하는 방법:
-#   1. AttendanceRepository / PartyRepository / GuildSettingsRepository를 상속한
+#   1. UsageRepository / PartyRepository / GuildSettingsRepository를 상속한
 #      구현 클래스를 이 파일에 작성 (SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리)
 #   2. 아래 create_* 팩토리에 분기 추가
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
 # ── 멀티 길드 ──
-# 포인트·출석·금지어·파티·설정은 스키마의 guild_id로 길드별 격리된다.
+# 금지어 카운트·파티·설정은 스키마의 guild_id로 길드별 격리된다.
 # AI 일일 사용량은 하나의 인스턴스 안에서 유저별 전역이므로 guild_id를 저장하지 않는다.
 #
 # ── 동시성 ──
@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import sqlite3
-import time
 from abc import ABC, abstractmethod
 from contextlib import closing
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -84,55 +83,10 @@ async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def _record_ledger(
-    cursor: sqlite3.Cursor, guild_id: int, user_id: int, delta: int, reason: str
-) -> None:
-    """포인트를 실제로 변경한 트랜잭션 안에서만 호출한다."""
-    cursor.execute(
-        "INSERT INTO point_ledger (guild_id, user_id, delta, reason, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (guild_id, user_id, delta, reason, int(time.time())),
-    )
-
-
 # ─────────── 인터페이스 ─────────── #
 
-class AttendanceRepository(ABC):
-    """길드별 출석/포인트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
-
-    @abstractmethod
-    def get_points(self, guild_id: int, user_id: int) -> int:
-        """해당 길드에서의 포인트 잔액. 미등록 유저는 0."""
-
-    @abstractmethod
-    def add_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> None:
-        """포인트를 지급하고 원장에 기록한다."""
-
-    @abstractmethod
-    def deduct_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> bool:
-        """포인트를 차감한다. 잔액 확인과 차감이 원자적으로 수행되어야 한다.
-        성공 시 True(원장 기록), 잔액 부족 시 False(원장 미기록)."""
-
-    @abstractmethod
-    def claim_attendance(
-        self,
-        guild_id: int,
-        user_id: int,
-        reward: int,
-        attendance_date: str,
-        reason: str = "attendance",
-    ) -> Optional[int]:
-        """당일 첫 출석이면 포인트를 지급하고 새 잔액을, 중복이면 None을 반환한다."""
-
-    @abstractmethod
-    def get_ledger(
-        self, guild_id: int, user_id: int, limit: int = 20
-    ) -> List[Tuple[int, str, int]]:
-        """최근 포인트 이동 [(delta, reason, created_at), ...]를 최신순으로 반환한다."""
+class UsageRepository(ABC):
+    """길드별 금지어 카운트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
 
     @abstractmethod
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
@@ -141,10 +95,6 @@ class AttendanceRepository(ABC):
     @abstractmethod
     def get_forbidden_count(self, guild_id: int, user_id: int) -> int:
         """금지어 경고 횟수를 반환한다. 미등록 유저는 0."""
-
-    @abstractmethod
-    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
-        """해당 길드의 포인트 상위 유저 [(user_id, points), ...]."""
 
     @abstractmethod
     def consume_ai_usage(
@@ -277,8 +227,8 @@ class GuildSettingsRepository(ABC):
 
 # ─────────── SQLite 구현 ─────────── #
 
-class SQLiteAttendanceRepository(AttendanceRepository):
-    _SCHEMA_VERSION = 2
+class SQLiteUsageRepository(UsageRepository):
+    _SCHEMA_VERSION = 3
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -287,35 +237,17 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
-            _prepare_schema(conn, self._SCHEMA_VERSION, "attendance")
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "usage")
             c = conn.cursor()
-            # (guild_id, user_id)가 기본키다. 같은 사람이 서버마다 별도 잔액을 갖는다.
+            # (guild_id, user_id)가 기본키다. 금지어 카운트는 서버마다 독립이다.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
-                    points INTEGER NOT NULL DEFAULT 0,
-                    last_attendance_date TEXT,
                     forbidden_count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
-
-            # 모든 포인트 이동을 append-only로 기록한다. 환불 실패 시 대조 근거가 된다.
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS point_ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    delta INTEGER NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
-                )
-            """)
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ledger_user "
-                "ON point_ledger (guild_id, user_id, id DESC)"
-            )
             c.execute("""
                 CREATE TABLE IF NOT EXISTS ai_usage (
                     user_id INTEGER NOT NULL,
@@ -325,16 +257,8 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                     PRIMARY KEY (user_id, usage_date, command)
                 )
             """)
-            _require_columns(
-                conn,
-                "users",
-                {"guild_id", "user_id", "points", "last_attendance_date", "forbidden_count"},
-            )
-            _require_columns(
-                conn,
-                "point_ledger",
-                {"id", "guild_id", "user_id", "delta", "reason", "created_at"},
-            )
+            if version < self._SCHEMA_VERSION:
+                self._drop_point_economy(conn)
             _require_columns(
                 conn,
                 "ai_usage",
@@ -342,16 +266,6 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             )
             _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
-
-    def get_points(self, guild_id: int, user_id: int) -> int:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT points FROM users WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            result = c.fetchone()
-            return result[0] if result else 0
 
     def consume_ai_usage(
         self, user_id: int, usage_date: str, command: str, limit: int
@@ -392,73 +306,39 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             conn.commit()
             return row[0] if row else 0
 
-    def add_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> None:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR IGNORE INTO users (guild_id, user_id, points) VALUES (?, ?, 0)",
-                (guild_id, user_id),
-            )
-            c.execute(
-                "UPDATE users SET points = points + ? WHERE guild_id = ? AND user_id = ?",
-                (amount, guild_id, user_id),
-            )
-            _record_ledger(c, guild_id, user_id, amount, reason)
-            conn.commit()
+    @staticmethod
+    def _drop_point_economy(conn: sqlite3.Connection) -> None:
+        """v3: 포인트 경제를 버린다. users는 금지어 카운트만 남긴다.
 
-    def deduct_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> bool:
-        # 잔액 확인과 차감을 단일 조건부 UPDATE로 처리하여 race condition을 방지한다.
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE users SET points = points - ? "
-                "WHERE guild_id = ? AND user_id = ? AND points >= ?",
-                (amount, guild_id, user_id, amount),
+        컬럼을 빼려면 테이블을 다시 만들어야 한다(guild_settings와 같은 이유로
+        DROP COLUMN을 쓰지 않는다). 마이그레이션 전에 python -m module.export_legacy로
+        잔액과 원장을 JSON으로 받아둘 수 있다.
+        """
+        columns = {row[1] for row in conn.execute('PRAGMA table_info("users")')}
+        if {"points", "last_attendance_date"} & columns:
+            conn.execute("ALTER TABLE users RENAME TO users_v2")
+            conn.execute("""
+                CREATE TABLE users (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO users (guild_id, user_id, forbidden_count) "
+                "SELECT guild_id, user_id, forbidden_count FROM users_v2"
             )
-            charged = c.rowcount > 0
-            if charged:  # 실제로 잔액이 줄었을 때만 기록한다.
-                _record_ledger(c, guild_id, user_id, -amount, reason)
-            conn.commit()
-            return charged
-
-    def claim_attendance(
-        self,
-        guild_id: int,
-        user_id: int,
-        reward: int,
-        attendance_date: str,
-        reason: str = "attendance",
-    ) -> Optional[int]:
-        with closing(_connect(self.db_path)) as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO users (guild_id, user_id, points, last_attendance_date)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                    points = users.points + excluded.points,
-                    last_attendance_date = excluded.last_attendance_date
-                WHERE users.last_attendance_date IS NULL
-                   OR users.last_attendance_date != excluded.last_attendance_date
-                RETURNING points
-                """,
-                (guild_id, user_id, reward, attendance_date),
-            )
-            row = cursor.fetchone()
-            if row:  # 중복 출석은 지급이 없으므로 기록하지 않는다.
-                _record_ledger(cursor, guild_id, user_id, reward, reason)
-            conn.commit()
-            return row[0] if row else None
+            conn.execute("DROP TABLE users_v2")
+        conn.execute("DROP INDEX IF EXISTS idx_ledger_user")
+        conn.execute("DROP TABLE IF EXISTS point_ledger")
 
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute(
-                "INSERT OR IGNORE INTO users (guild_id, user_id, points, forbidden_count) "
-                "VALUES (?, ?, 0, 0)",
+                "INSERT OR IGNORE INTO users (guild_id, user_id, forbidden_count) "
+                "VALUES (?, ?, 0)",
                 (guild_id, user_id),
             )
             c.execute(
@@ -478,33 +358,10 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             result = c.fetchone()
             return result[0] if result else 0
 
-    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT user_id, points FROM users WHERE guild_id = ? "
-                "ORDER BY points DESC LIMIT ?",
-                (guild_id, limit),
-            )
-            return c.fetchall()
-
-    def get_ledger(
-        self, guild_id: int, user_id: int, limit: int = 20
-    ) -> List[Tuple[int, str, int]]:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT delta, reason, created_at FROM point_ledger "
-                "WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
-                (guild_id, user_id, limit),
-            )
-            return c.fetchall()
-
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
-            c.execute("DELETE FROM point_ledger WHERE guild_id = ?", (guild_id,))
             conn.commit()
 
 
@@ -1049,13 +906,13 @@ _UNSUPPORTED_MSG = (
     "module/database.py에 {repo} 구현을 추가하고 팩토리에 분기를 등록하세요."
 )
 
-def create_attendance_repository() -> AttendanceRepository:
+def create_usage_repository() -> UsageRepository:
     if DB_BACKEND == "sqlite":
-        return SQLiteAttendanceRepository(DATA_DIR / "attendance_data.db")
+        return SQLiteUsageRepository(DATA_DIR / "attendance_data.db")
     # 외부 DB 분기 예시:
     # if DB_BACKEND == "mysql":
-    #     return MySQLAttendanceRepository(DB_URL)
-    raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="AttendanceRepository"))
+    #     return MySQLUsageRepository(DB_URL)
+    raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="UsageRepository"))
 
 
 def create_party_repository() -> PartyRepository:

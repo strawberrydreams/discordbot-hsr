@@ -1,14 +1,14 @@
 # Hyacine — Discord Bot HSR
 
-Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 출석·포인트, 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성을 제공합니다. Python 3.12 이상과 SQLite를 사용합니다.
+Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성을 제공합니다. Python 3.12 이상과 SQLite를 사용합니다.
 
 각 운영자가 자신의 Discord Application과 토큰을 만들어 직접 운영합니다. 저장소 소유자는 다른 사람에게 봇을 호스팅하거나 Discord 서버를 대신 관리하지 않습니다. Hyacine은 *Honkai: Star Rail* 비공식 팬 프로젝트이며 HoYoverse와 제휴하거나 승인받지 않았습니다.
 
-포인트·출석·금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`로 서버별 분리됩니다. AI 사용량 한도만 사용자별·봇 인스턴스 전역으로 공유되는 명시적 예외입니다.
+금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`로 서버별 분리됩니다. AI 사용량 한도만 사용자별·봇 인스턴스 전역으로 공유되는 명시적 예외입니다.
 
 ## 주요 기능
 
-- `/출석`, `/지갑`, `/프로필`, `/랭킹`
+- `/프로필` — 서버 가입일과 금지어 경고 횟수
 - 게임별 영속 파티 패널 — 파티 채널에서 버튼으로 모집·참가·역할 변경·나가기
 - 어느 서버 채널에서나 `/이벤트`
 - `/기본대화`, `/고급대화`, `/이미지`
@@ -92,7 +92,7 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 설치 후 `Manage Guild` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만 바꿉니다.
 
-슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 포인트·파티·설정은 자동으로 삭제됩니다.
+슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 금지어 카운트·파티·설정은 자동으로 삭제됩니다.
 
 ### 패널과 선택 기능
 
@@ -104,7 +104,7 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티 채널과 공지 opt-in 상태를 확인하고, opt-in한 Guild에 공지를 보낼 수 있습니다.
 
-AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도를 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
+AI 명령은 사용자별 KST 일일 AI 한도를 명령별로 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
 
 일반 운영에는 Docker Compose를 권장합니다. macOS에서 Docker 대신 LaunchAgent를 직접 관리해야 하는 고급 운영자만 [launchd 선택 사항](docs/operations.md#macos-launchagent)을 따르세요. launchd와 Docker를 동시에 실행하지 마세요. 백업·복구 절차도 [운영 가이드](docs/operations.md)를 따르세요.
 
@@ -112,7 +112,6 @@ AI 명령은 포인트 비용과 **별도로** 사용자별 KST 일일 AI 한도
 
 - `.env.secrets`, `.env.runtime`, `runtime/`은 Git에 추가하지 마세요. `git add -f`도 사용하지 않습니다.
 - 운영 백엔드는 SQLite만 지원합니다.
-- 포인트 잔액은 서버별로 독립입니다. A 서버에서 번 포인트를 B 서버에서 쓸 수 없습니다.
 - plain HTTP 관리자 세션 cookie는 포트가 아니라 host에 묶입니다. localhost 웹 관리를 켠 OS 사용자/loopback host 경계의 모든 로컬 서비스·프로세스를 신뢰할 수 있을 때만 `ADMIN_TOKEN`을 설정하세요.
 
 ## 라이선스와 기여

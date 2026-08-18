@@ -32,7 +32,7 @@ EXTENSIONS = (
     ("module.forbiddenfilter_cog", ()),
     ("module.hyacine_chat_cog", ("OPENAI_API_KEY",)),
     ("module.hyacine_image_cog", ("GOOGLE_API_KEY",)),
-    ("module.attendance_cog", ()),
+    ("module.usage_cog", ()),
 )
 
 ENV_VALUES = {

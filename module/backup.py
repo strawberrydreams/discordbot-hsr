@@ -26,18 +26,18 @@ from module.config import (
 )
 from module.database import (
     SQLITE_TIMEOUT_SECONDS,
-    SQLiteAttendanceRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
+    SQLiteUsageRepository,
 )
 
 DATABASES = {
-    "attendance_data.db": {"users", "point_ledger", "ai_usage"},
+    "attendance_data.db": {"users", "ai_usage"},
     "party_data.db": {"parties", "participants"},
     "guild_settings.db": {"guild_settings", "party_panels"},
 }
 _SQLITE_REPOSITORIES = {
-    "attendance_data.db": SQLiteAttendanceRepository,
+    "attendance_data.db": SQLiteUsageRepository,
     "party_data.db": SQLitePartyRepository,
     "guild_settings.db": SQLiteGuildSettingsRepository,
 }

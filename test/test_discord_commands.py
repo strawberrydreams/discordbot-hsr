@@ -26,9 +26,9 @@ from discord.ext import commands
 import module.config as config
 import module.guildsettings_cog as guildsettings_cog
 import module.main as bot_main
-from module.attendance_cog import AttendanceCog, KST
+from module.usage_cog import UsageCog, KST
 from module.database import (
-    SQLiteAttendanceRepository,
+    SQLiteUsageRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
 )
@@ -101,7 +101,7 @@ class ConditionalExtensionTest(unittest.TestCase):
             "module.guildsettings_cog",
             "module.playwith_cog",
             "module.forbiddenfilter_cog",
-            "module.attendance_cog",
+            "module.usage_cog",
         ):
             self.assertIn(required, names)
 
@@ -192,17 +192,11 @@ class FakeInteraction:
         self.message = SimpleNamespace(id=message_id) if message_id is not None else None
 
 
-class RecordingAttendance:
-    def __init__(self, refund_error=None, reserve_result=("2026-08-04", 1), deduct_result=True, usage=None):
-        self.deductions = []
-        self.refunds = []
-        self.refund_attempts = []
-        self.reasons = []
+class RecordingUsage:
+    def __init__(self, reserve_result=("2026-08-04", 1), usage=None):
         self.reservations = []
         self.releases = []
-        self.refund_error = refund_error
         self.reserve_result = reserve_result
-        self.deduct_result = deduct_result
         self.usage = usage or {}
 
     async def reserve_ai_usage(self, user_id, command, limit):
@@ -216,21 +210,6 @@ class RecordingAttendance:
     async def get_ai_usage(self, user_id, command):
         return self.usage.get(command, 0)
 
-    async def deduct_points(self, guild_id, user_id, amount, reason="unspecified"):
-        self.deductions.append((user_id, amount))
-        self.reasons.append(reason)
-        return self.deduct_result
-
-    async def get_points(self, guild_id, user_id):
-        return 0
-
-    async def add_points(self, guild_id, user_id, amount, reason="unspecified"):
-        self.reasons.append(reason)
-        self.refund_attempts.append((user_id, amount))
-        if self.refund_error:
-            raise self.refund_error
-        self.refunds.append((user_id, amount))
-
 
 class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -238,8 +217,8 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.google_key.start()
         self.addCleanup(self.google_key.stop)
 
-    async def test_daily_limit_stops_before_points_and_provider(self):
-        attendance = RecordingAttendance(reserve_result=None)
+    async def test_daily_limit_stops_before_the_provider_call(self):
+        attendance = RecordingUsage(reserve_result=None)
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
         provider_calls = []
@@ -255,22 +234,11 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
             attendance.reservations,
             [(123, "image", config.LIMIT_IMAGE)],
         )
-        self.assertEqual(attendance.deductions, [])
         self.assertEqual(provider_calls, [])
         self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
 
-    async def test_insufficient_points_releases_reserved_slot(self):
-        attendance = RecordingAttendance(deduct_result=False)
-        interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-        self.assertIn("포인트가 부족", interaction.response.messages[-1][0][0])
-
-    async def test_defer_failure_refunds_points_and_releases_slot(self):
-        attendance = RecordingAttendance()
+    async def test_defer_failure_releases_the_reserved_slot(self):
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
 
@@ -283,110 +251,10 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await HyacineImageCog._image.callback(cog, interaction, "test")
 
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
         self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-
-    async def test_defer_and_refund_failures_request_manual_reconciliation_once(self):
-        attendance = RecordingAttendance(
-            refund_error=RuntimeError("database unavailable")
-        )
-        interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        async def fail_defer():
-            raise RuntimeError("defer transport failed")
-
-        interaction.response.defer = fail_defer
-        escaped = None
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            try:
-                await HyacineImageCog._image.callback(cog, interaction, "test")
-            except Exception as exc:
-                escaped = exc
-
-        self.assertIsNone(escaped)
-        self.assertEqual(attendance.refund_attempts, [(123, 30_000)])
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-        messages = interaction.response.messages + interaction.followup.messages
-        self.assertTrue(messages)
-        message = messages[-1][0][0]
-        self.assertIn("자동 환불에 실패", message)
-        self.assertIn("관리자", message)
-        self.assertIn("수동 정산", message)
-
-    async def test_generation_exception_refunds_once_when_error_message_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        def fail_generation(**_):
-            raise RuntimeError("provider failed")
-
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(generate_content=fail_generation)
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
-        self.assertEqual(attendance.releases, [])
-
-    async def test_empty_image_response_refunds_only_once_when_error_message_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(
-                generate_content=lambda **_: SimpleNamespace(parts=[])
-            )
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
-
-    async def test_generated_image_is_not_refunded_when_discord_upload_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
-        part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(
-                generate_content=lambda **_: SimpleNamespace(parts=[part])
-            )
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [])
-        self.assertIn(
-            "이미지는 생성되었지만 Discord 전송에 실패했습니다.",
-            interaction.followup.messages[-1][0][0],
-        )
-        self.assertNotIn("환불", interaction.followup.messages[-1][0][0])
 
     async def test_long_prompt_is_truncated_in_embed(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
         temp_dir = tempfile.TemporaryDirectory()
@@ -415,7 +283,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["contents"], [prompt])
 
     async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         interaction.followup = RecordingFollowup(fail_on_call=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
@@ -437,7 +305,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(pathlib.Path(temp_dir.name).iterdir()), [])
 
 
-class DisappearingAttendanceBot:
+class DisappearingUsageBot:
     def __init__(self, attendance):
         self.attendance = attendance
         self.calls = 0
@@ -452,7 +320,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
-        self.attendance = RecordingAttendance()
+        self.attendance = RecordingUsage()
         self.cog = HyacineChatCog(
             bot=SimpleNamespace(get_cog=lambda _: self.attendance)
         )
@@ -479,8 +347,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
-                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 200, "light", config.LIMIT_LIGHT),
-                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000, "deep", config.LIMIT_DEEP),
+                (basic, "기본 대화", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", "deep", config.LIMIT_DEEP),
             ],
         )
 
@@ -499,7 +367,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
                 return self.counts[command]
 
         repository = RecordingUsageRepository()
-        attendance = AttendanceCog(bot=None, repository=repository)
+        attendance = UsageCog(bot=None, repository=repository)
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
         self.cog.get_session(1).last_usage = {
@@ -509,7 +377,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 46,
         }
 
-        with patch("module.attendance_cog.datetime") as mocked_datetime:
+        with patch("module.usage_cog.datetime") as mocked_datetime:
             mocked_datetime.now.return_value = datetime(2026, 8, 5, 0, 1, tzinfo=KST)
             await HyacineChatCog._status.callback(self.cog, interaction)
 
@@ -552,8 +420,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("46", message)
         self.assertIn("확인할 수 없어요", message)
 
-    async def test_daily_limit_stops_before_points_and_provider(self):
-        attendance = RecordingAttendance(reserve_result=None)
+    async def test_daily_limit_stops_before_the_provider_call(self):
+        attendance = RecordingUsage(reserve_result=None)
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
         provider_calls = []
@@ -566,23 +434,30 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.cog._run_talk(
-            interaction, "test", None, "gpt-5.6-terra", "none", 200,
+            interaction, "test", None, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
 
-        self.assertEqual(attendance.deductions, [])
         self.assertEqual(provider_calls, [])
         self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
 
-    async def test_insufficient_points_releases_reserved_slot(self):
-        attendance = RecordingAttendance(deduct_result=False)
+    async def test_pre_api_failure_releases_the_reserved_slot(self):
+        """API 호출 전에 실패하면 일일 한도를 돌려준다."""
+        attendance = RecordingUsage()
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
 
-        await self.cog._run_talk(
-            interaction, "test", None, "gpt-5.6-terra", "none", 200,
-            "light", config.LIMIT_LIGHT,
-        )
+        async def fail_defer():
+            raise RuntimeError("defer transport failed")
+
+        interaction.response.defer = fail_defer
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "test", None, "gpt-5.6-terra", "none",
+                "light", config.LIMIT_LIGHT,
+            )
 
         self.assertEqual(attendance.releases, [(123, "2026-08-04", "light")])
 
@@ -607,7 +482,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             responses=SimpleNamespace(create=response)
         )
         await self.cog._run_talk(
-            interaction, "", attachment, "gpt-5.6-terra", "none", 0,
+            interaction, "", attachment, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
 
@@ -616,98 +491,6 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             attachment.url, repr(list(self.cog.get_session(1).history))
         )
 
-    async def test_pre_api_exception_refunds_with_the_original_attendance_cog(self):
-        attendance = RecordingAttendance()
-        bot = DisappearingAttendanceBot(attendance)
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = bot
-
-        def fail_before_api(*args):
-            raise RuntimeError("attachment processing failed")
-
-        self.cog.build_user_parts = fail_before_api
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.deductions, [(123, 2_000)])
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(bot.calls, 1)
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
-        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_empty_response_refunds_charged_points(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def empty_response(**kwargs):
-            return SimpleNamespace(output_text="")
-
-        self.cog.client = SimpleNamespace(
-            responses=SimpleNamespace(create=empty_response)
-        )
-
-        with patch("module.hyacine_chat_cog.traceback.print_exc"):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_refund_note_is_omitted_when_refund_fails(self):
-        attendance = RecordingAttendance(refund_error=RuntimeError("database unavailable"))
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def empty_response(**kwargs):
-            return SimpleNamespace(output_text="")
-
-        self.cog.client = SimpleNamespace(
-            responses=SimpleNamespace(create=empty_response)
-        )
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertNotIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_failed_defer_refunds_and_uses_initial_response(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def fail_defer():
-            raise RuntimeError("defer transport failed")
-
-        interaction.response.defer = fail_defer
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
-        self.assertEqual(interaction.followup.messages, [])
-        self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
-
-
 class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
@@ -715,7 +498,7 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.openai_key.stop)
 
     async def test_same_channel_calls_do_not_interleave_history(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         cog = HyacineChatCog(bot=SimpleNamespace(get_cog=lambda _: attendance))
         # 첫 호출의 응답이 두 번째보다 늦게 끝나도록 지연시킨다.
         delays = {"first": 0.05, "second": 0.0}
@@ -732,8 +515,8 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(responses=SimpleNamespace(create=delayed))
 
         await asyncio.gather(
-            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
-            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
+            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
         )
 
         roles = [m["role"] for m in cog.get_session(1).history if m["role"] != "system"]
@@ -795,8 +578,8 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(model_label, descriptions)
 
     async def test_cooldown_notice_is_ephemeral_and_charges_nothing(self):
-        attendance = RecordingAttendance()
-        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
+        attendance = RecordingUsage()
+        cog = HyacineChatCog(bot=DisappearingUsageBot(attendance))
         interaction = FakeInteraction(channel_id=1)
         error = discord.app_commands.CommandOnCooldown(
             discord.app_commands.Cooldown(1, 15), 7.4
@@ -807,85 +590,24 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = interaction.response.messages[-1]
         self.assertIs(kwargs.get("ephemeral"), True)
         self.assertIn("7초", args[0])
-        self.assertEqual(attendance.deductions, [])
-
-    async def test_rate_limit_error_gets_its_own_notice_and_refund(self):
-        attendance = RecordingAttendance()
-        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
-        interaction = FakeInteraction(channel_id=1)
-
-        async def rate_limited(**kwargs):
-            raise openai.RateLimitError(
-                "rate limited",
-                response=httpx.Response(
-                    429, request=httpx.Request("POST", "https://api.openai.com")
-                ),
-                body=None,
-            )
-
-        cog.client = SimpleNamespace(responses=SimpleNamespace(create=rate_limited))
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        message = interaction.followup.messages[-1][0][0]
-        self.assertIn("요청이 몰려", message)
-        self.assertIn("포인트 환불됨", message)
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(attendance.releases, [])
-
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         root = pathlib.Path(self.temp_dir.name)
-        self.attendance = AttendanceCog(
+        self.usage = UsageCog(
             bot=None,
-            repository=SQLiteAttendanceRepository(root / "attendance.db"),
+            repository=SQLiteUsageRepository(root / "usage.db"),
         )
         self.party_repository = SQLitePartyRepository(root / "party.db")
         with patch("discord.ext.tasks.Loop.start"):
             self.play = PlayWithCog(bot=None, repository=self.party_repository)
 
-    async def test_attendance_wallet_and_profile_successes_are_ephemeral(self):
-        for command in (
-            AttendanceCog._attend,
-            AttendanceCog._wallet,
-            AttendanceCog._profile,
-        ):
-            interaction = FakeInteraction(channel_id=1)
-            await command.callback(self.attendance, interaction)
-            self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
-
-    async def test_attendance_balance_matches_db_and_duplicate_only_responds_duplicate(self):
-        self.attendance.db.add_points(TEST_GUILD_ID, FakeUser.id, 2_000)
-
-        success = FakeInteraction(channel_id=1)
-        with patch("module.attendance_cog.random.randint", return_value=7_000):
-            await AttendanceCog._attend.callback(self.attendance, success)
-
-        success_args, success_kwargs = success.response.messages[0]
-        self.assertEqual(success_args, ())
-        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
-        self.assertEqual(success_kwargs["embed"].fields[0].value, "9,000 P")
-
-        duplicate = FakeInteraction(channel_id=1)
-        with patch("module.attendance_cog.random.randint", return_value=30_000):
-            await AttendanceCog._attend.callback(self.attendance, duplicate)
-
-        duplicate_args, duplicate_kwargs = duplicate.response.messages[0]
-        self.assertEqual(len(duplicate.response.messages), 1)
-        self.assertEqual(len(duplicate_args), 1)
-        self.assertIn("이미 출석", duplicate_args[0])
-        self.assertNotIn("embed", duplicate_kwargs)
-        self.assertIs(duplicate_kwargs.get("ephemeral"), True)
-        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
+    async def test_profile_success_is_ephemeral(self):
+        interaction = FakeInteraction(channel_id=1)
+        await UsageCog._profile.callback(self.usage, interaction)
+        self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
 
     async def test_legacy_party_slash_commands_are_removed(self):
         for command in ("모집", "파티", "나가기", "변경"):
@@ -1832,38 +1554,6 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
 
 
-class RankingCommandTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        repository = SQLiteAttendanceRepository(
-            pathlib.Path(self.temp_dir.name) / "attendance.db"
-        )
-        repository.add_points(TEST_GUILD_ID, 1, 500)
-        repository.add_points(TEST_GUILD_ID, 2, 400)
-        self.cog = AttendanceCog(bot=None, repository=repository)
-
-    async def test_guild_nickname_wins_and_cache_miss_hides_the_raw_id(self):
-        class PartialGuild:
-            def get_member(self, user_id):
-                return (
-                    SimpleNamespace(display_name="서버 닉네임")
-                    if user_id == 1
-                    else None
-                )
-
-        interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
-
-        await AttendanceCog._ranking.callback(self.cog, interaction)
-
-        names = [
-            field.name for field in interaction.response.messages[0][1]["embed"].fields
-        ]
-        self.assertIn("서버 닉네임", names[0])
-        self.assertIn("알 수 없는 유저", names[1])
-        self.assertNotIn("2", names[1].replace("2️⃣", ""))
-
-
 class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.counter = RecordingForbiddenCounts()
@@ -2189,7 +1879,7 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                attendance = RecordingAttendance()
+                attendance = RecordingUsage()
                 cog = HyacineChatCog(
                     bot=SimpleNamespace(get_cog=lambda _: attendance)
                 )
@@ -2217,11 +1907,11 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     responses=SimpleNamespace(create=response)
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=1), "old", None, "test-model", "none", 0,
+                    FakeInteraction(channel_id=1), "old", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=2), "new", None, "test-model", "none", 0,
+                    FakeInteraction(channel_id=2), "new", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
                 old_hello = FakeInteraction(channel_id=1)
