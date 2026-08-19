@@ -201,6 +201,14 @@ class GuildSettingsRepository(ABC):
         """파티 호스트 공지 허용 여부를 지정한다."""
 
     @abstractmethod
+    def get_forbidden_filter_enabled(self, guild_id: int) -> bool:
+        """금지어 필터를 켜 두었는지 반환한다. 미설정 길드는 켜짐."""
+
+    @abstractmethod
+    def set_forbidden_filter_enabled(self, guild_id: int, enabled: bool) -> None:
+        """금지어 필터 사용 여부를 지정한다."""
+
+    @abstractmethod
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
         """게임별 영속 파티 패널 메시지 ID를 반환한다."""
 
@@ -662,14 +670,18 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _PARTY_CHANNEL = "party_channel_id"
     _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
-    _SCHEMA_VERSION = 3
+    _FORBIDDEN_FILTER = "forbidden_filter_enabled"
+    _SCHEMA_VERSION = 4
     _CURRENT_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
+        _FORBIDDEN_FILTER,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
-    # v2는 music_channel_id/music_panel_msg_id를 더 갖고 있었다.
+    # v2는 음악 컬럼 둘을 더 갖고 있었다. v3는 v4에서 토글만 빠진 모양이다.
+    # 옮겨 담는 컬럼이 양쪽 다 같으므로 한 분기로 처리한다. 부분집합이 아니라
+    # 정확히 일치할 때만 받는다 — 모르는 컬럼이 붙은 DB는 계약 위반으로 거부한다.
     _V2_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
@@ -677,10 +689,16 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         "music_panel_msg_id",
         _ALLOW_HOST_ANNOUNCE,
     }
+    _V3_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        _ALLOW_HOST_ANNOUNCE,
+    }
     _GUILD_SETTINGS_COLUMN_ORDER = (
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
+        _FORBIDDEN_FILTER,
     )
     _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
@@ -721,17 +739,22 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 )
                 return
 
-            if version < self._SCHEMA_VERSION and self._V2_COLUMNS <= columns:
-                # v2: 음악 기능이 사라져 music_channel_id/music_panel_msg_id를 버린다.
+            if version < self._SCHEMA_VERSION and columns in (
+                self._V2_COLUMNS,
+                self._V3_COLUMNS,
+            ):
+                # v2: 음악 컬럼을 버린다. v3: forbidden_filter_enabled를 더한다.
+                # 옮겨 담는 컬럼이 같아 한 분기로 충분하다. 새 컬럼은 DEFAULT 1이
+                # 채우므로 기존 서버의 금지어 필터는 켜진 상태 그대로 넘어온다.
                 # SQLite DROP COLUMN 대신 v1과 같은 rename-and-copy를 쓴다.
                 self._rebuild_guild_settings(
                     conn,
-                    "guild_settings_v2",
+                    "guild_settings_old",
                     """
                     INSERT INTO guild_settings
                         (guild_id, party_channel_id, allow_host_announce)
                     SELECT guild_id, party_channel_id, allow_host_announce
-                    FROM guild_settings_v2
+                    FROM guild_settings_old
                     """,
                 )
                 return
@@ -796,7 +819,9 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0
-                    CHECK (allow_host_announce IN (0, 1))
+                    CHECK (allow_host_announce IN (0, 1)),
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
+                    CHECK (forbidden_filter_enabled IN (0, 1))
             )
         """)
         SQLiteGuildSettingsRepository._create_party_panels_table(conn)
@@ -841,6 +866,19 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
         self._set_column(guild_id, self._ALLOW_HOST_ANNOUNCE, int(allowed))
+
+    def get_forbidden_filter_enabled(self, guild_id: int) -> bool:
+        # 미등록 길드는 행이 없다. 기본값은 켜짐이라 _get_column의 falsy 처리에
+        # 기댈 수 없으므로 여기서만 직접 읽는다.
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                f"SELECT {self._FORBIDDEN_FILTER} FROM guild_settings WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+            return True if row is None else bool(row[0])
+
+    def set_forbidden_filter_enabled(self, guild_id: int, enabled: bool) -> None:
+        self._set_column(guild_id, self._FORBIDDEN_FILTER, int(enabled))
 
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
         with closing(_connect(self.db_path)) as conn:

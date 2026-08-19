@@ -963,7 +963,7 @@ def test_forbidden_words_load_logs_to_stdout():
 
     check(
         "금지어 로드 로그가 stdout에 기록",
-        output.getvalue().strip() == "📥 금지어 1개 로드",
+        output.getvalue().strip() == "📥 금지어 1개 로드 (허용 0개)",
     )
 
 
@@ -1443,7 +1443,7 @@ def test_schema_versions():
 
     check("usage 스키마 버전", _user_version(attendance_path) == 3)
     check("party 스키마 버전", _user_version(party_path) == 2)
-    check("settings 스키마 버전", _user_version(settings_path) == 3)
+    check("settings 스키마 버전", _user_version(settings_path) == 4)
 
     for label, repository in (
         ("attendance", SQLiteUsageRepository),
@@ -1547,7 +1547,7 @@ def test_schema_versions():
         )
 
     for legacy_version in (0, 1):
-        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v3.db"
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v4.db"
         with sqlite3.connect(legacy_path) as conn:
             conn.execute(
                 "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
@@ -1558,6 +1558,9 @@ def test_schema_versions():
         with sqlite3.connect(legacy_path) as conn:
             row = conn.execute(
                 "SELECT party_channel_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+            ).fetchone()
+            forbidden_default = conn.execute(
+                "SELECT forbidden_filter_enabled FROM guild_settings WHERE guild_id = 7"
             ).fetchone()
             tables = {
                 item[0]
@@ -1575,6 +1578,10 @@ def test_schema_versions():
             )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         check(f"settings v{legacy_version} recruit 보존", row == (700, 0))
+        check(
+            f"settings v{legacy_version} 금지어 필터 기본 켜짐",
+            forbidden_default == (1,),
+        )
         check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
         check(
             f"settings v{legacy_version} 정확한 패널 스키마",
@@ -1582,11 +1589,85 @@ def test_schema_versions():
                 "guild_id",
                 "party_channel_id",
                 "allow_host_announce",
+                "forbidden_filter_enabled",
             )
             and panel_columns == ("guild_id", "game", "message_id")
             and panel_primary_key == ("guild_id", "game"),
         )
-        check(f"settings v{legacy_version} 버전", version == 3)
+        check(f"settings v{legacy_version} 버전", version == 4)
+
+    # v2(음악 컬럼 보유)와 v3(토글만 없음) 모두 v4로 올라오고, 기존 서버의
+    # 금지어 필터는 켜진 상태 그대로여야 한다. 마이그레이션이 조용히 동작을
+    # 바꾸면 안 된다.
+    settings_upgrade_schemas = {
+        2: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 800, 801, 1);
+        """,
+        3: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 1);
+            INSERT INTO party_panels VALUES (7, 'LOL', 900);
+        """,
+    }
+    for old_version, schema in settings_upgrade_schemas.items():
+        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v4.db"
+        with sqlite3.connect(upgrade_path) as conn:
+            conn.executescript(schema)
+            conn.execute(f"PRAGMA user_version = {old_version}")
+        repository = SQLiteGuildSettingsRepository(upgrade_path)
+        with sqlite3.connect(upgrade_path) as conn:
+            columns = tuple(
+                row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
+            )
+        check(
+            f"settings v{old_version}에서 v4로 마이그레이션",
+            _user_version(upgrade_path) == 4
+            and columns == (
+                "guild_id",
+                "party_channel_id",
+                "allow_host_announce",
+                "forbidden_filter_enabled",
+            ),
+            f"({_user_version(upgrade_path)}, {columns})",
+        )
+        check(
+            f"settings v{old_version} 기존 설정 보존",
+            repository.get_party_channel(7) == 700
+            and repository.get_allow_host_announce(7) is True,
+        )
+        check(
+            f"settings v{old_version} 금지어 필터는 켜진 채로 넘어옴",
+            repository.get_forbidden_filter_enabled(7) is True,
+        )
+
+    # 미등록 길드도 켜짐이 기본이다. 행이 없다고 필터가 꺼지면 안 된다.
+    toggle = SQLiteGuildSettingsRepository(_TMP_DIR / "settings_toggle.db")
+    check("미등록 길드 금지어 필터 기본 켜짐", toggle.get_forbidden_filter_enabled(11))
+    toggle.set_forbidden_filter_enabled(11, False)
+    check("금지어 필터 끄기 반영", toggle.get_forbidden_filter_enabled(11) is False)
+    toggle.set_forbidden_filter_enabled(11, True)
+    check("금지어 필터 다시 켜기 반영", toggle.get_forbidden_filter_enabled(11) is True)
+    check(
+        "금지어 필터 토글은 다른 길드에 번지지 않음",
+        toggle.get_forbidden_filter_enabled(12),
+    )
 
     malformed_schemas = {
         "extra guild_settings column": """
@@ -1594,6 +1675,7 @@ def test_schema_versions():
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1,
                 obsolete INTEGER
             )
         """,
@@ -1601,7 +1683,8 @@ def test_schema_versions():
             CREATE TABLE guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                allow_host_announce INTEGER NOT NULL DEFAULT 0
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE party_panels (
                 guild_id INTEGER NOT NULL,
@@ -1887,6 +1970,7 @@ def test_imports():
         "module.playwith_cog",
         "module.eventnotice_cog",
         "module.forbiddenfilter_cog",
+        "module.greeting_cog",
         "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
@@ -2416,7 +2500,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical settings migrates to the panel contract",
-        settings_version == 3
+        settings_version == 4
         and "party_panels" in settings_tables
         and party_channel == (700,),
     )

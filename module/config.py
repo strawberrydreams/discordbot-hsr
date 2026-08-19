@@ -122,9 +122,9 @@ def _validate_settings_document(name: str, document: object) -> object:
         canonicalize_persona(document, strict=True)
         return document
     elif name == "forbidden_words.json":
-        from module.forbiddenfilter_cog import canonicalize_forbidden_words
+        from module.forbiddenfilter_cog import canonicalize_forbidden_document
 
-        return canonicalize_forbidden_words(document, strict=True)
+        return canonicalize_forbidden_document(document, strict=True)
     elif name == "games.json":
         _canonicalize_games(document, strict=True)
         return document

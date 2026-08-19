@@ -46,9 +46,8 @@ class ChannelSession:
     """채널 하나의 대화 상태 (히스토리, 사용량).
     채널별로 분리하여 다른 채널의 대화 내용이 섞이지 않도록 한다."""
 
-    def __init__(self, system_prompt: str, greeting: str):
+    def __init__(self, system_prompt: str):
         self.system_prompt = system_prompt
-        self.greeting = greeting
         self.history: deque[Dict[str, Any]] = deque(
             [{"role": "system", "content": system_prompt}],
             maxlen=120
@@ -69,9 +68,7 @@ class HyacineChatCog(commands.Cog):
         self.MAX_ASSISTANT_DEEP = 16_000 # Stricter limit for GPT-5.5 Thinking
         self.DISCORD_LIMIT = 2000
 
-        persona = load_persona()
-        self.system_prompt = persona["system_prompt"]
-        self.greeting = persona["greeting"]
+        self.system_prompt = load_persona()["system_prompt"]
 
         # 채널 ID -> ChannelSession (채널별 대화 기억 슬롯)
         self.sessions: OrderedDict[int, ChannelSession] = OrderedDict()
@@ -80,10 +77,8 @@ class HyacineChatCog(commands.Cog):
         """채널의 세션을 가져오거나 새로 만든다."""
         session = self.sessions.pop(channel_id, None)
         if session is None:
-            persona = load_persona()
-            self.system_prompt = persona["system_prompt"]
-            self.greeting = persona["greeting"]
-            session = ChannelSession(self.system_prompt, self.greeting)
+            self.system_prompt = load_persona()["system_prompt"]
+            session = ChannelSession(self.system_prompt)
         self.sessions[channel_id] = session
         while len(self.sessions) > self.MAX_CHANNEL_SESSIONS:
             # 응답 대기 중인 세션을 버리면 코루틴이 고아 객체에 append해 턴이 유실된다.
@@ -357,13 +352,6 @@ class HyacineChatCog(commands.Cog):
                 f"직전 토큰: {session.last_usage.get('total_tokens')}\n"
             )
         await inter.response.send_message(msg)
-
-    @app_commands.command(name="인사", description="가벼운 인삿말")
-    async def _hello(self, interaction: discord.Interaction):
-        session = self.get_session(interaction.channel_id)
-        await interaction.response.send_message(
-            f"{interaction.user.mention}, {session.greeting}"
-        )
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HyacineChatCog(bot))

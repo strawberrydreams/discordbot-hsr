@@ -155,11 +155,29 @@ class GuildSettingsCog(commands.Cog):
             f"✅ 파티 호스트 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
         )
 
+    @설정.command(name="금지어", description="이 서버에서 금지어 필터를 켜거나 끕니다.")
+    @app_commands.describe(사용="끄면 이 서버에서만 금지어에 반응하지 않습니다.")
+    async def _forbidden_filter(self, inter: discord.Interaction, 사용: bool):
+        await run_db(
+            self.settings.set_forbidden_filter_enabled, inter.guild_id, 사용
+        )
+        # 필터는 메시지마다 DB를 때리지 않으려고 값을 캐시한다. 여기서 무효화하지
+        # 않으면 다음 재시작까지 옛 설정으로 동작한다.
+        filter_cog = self.bot.get_cog("ForbiddenFilterCog") if self.bot else None
+        if filter_cog is not None:
+            filter_cog.invalidate_guild(inter.guild_id)
+        await inter.response.send_message(
+            f"✅ 금지어 필터를 {'켰' if 사용 else '껐'}습니다.", ephemeral=True
+        )
+
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show(self, inter: discord.Interaction):
         party = await run_db(self.settings.get_party_channel, inter.guild_id)
         allow_host_announce = await run_db(
             self.settings.get_allow_host_announce, inter.guild_id
+        )
+        forbidden_filter = await run_db(
+            self.settings.get_forbidden_filter_enabled, inter.guild_id
         )
 
         embed = discord.Embed(title="⚙️ 이 서버의 봇 설정", color=discord.Color.blurple())
@@ -171,6 +189,11 @@ class GuildSettingsCog(commands.Cog):
         embed.add_field(
             name="파티 호스트 공지",
             value="허용" if allow_host_announce else "차단",
+            inline=False,
+        )
+        embed.add_field(
+            name="금지어 필터",
+            value="켜짐" if forbidden_filter else "꺼짐",
             inline=False,
         )
         await inter.response.send_message(embed=embed, ephemeral=True)

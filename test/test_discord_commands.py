@@ -40,6 +40,7 @@ from module.playwith_cog import PlayWithCog
 from module.panel import drop_panel_locks, panel_lock, upsert_panel
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
+import module.greeting_cog as greeting_cog
 import module.backup as backup
 import module.webadmin_cog as webadmin_cog
 
@@ -1115,15 +1116,17 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeMessage:
-    def __init__(self, content, guild_id=None):
+    def __init__(self, content, guild_id=None, channel_id=1, author_is_bot=False):
         self.content = content
-        self.author = SimpleNamespace(bot=False, id=FakeUser.id, mention=FakeUser.mention)
+        self.author = SimpleNamespace(
+            bot=author_is_bot, id=FakeUser.id, mention=FakeUser.mention
+        )
         self.guild = (
             None
             if guild_id is None
             else SimpleNamespace(id=guild_id)
         )
-        self.channel = SimpleNamespace(send=self._send)
+        self.channel = SimpleNamespace(id=channel_id, send=self._send)
         self.sent = []
 
     async def _send(self, text):
@@ -1138,16 +1141,30 @@ class RecordingForbiddenCounts:
         self.counts.append(user_id)
 
 
-def make_forbidden_cog(counter, words=("나쁜말",)):
+class RecordingFilterSettings:
+    """금지어 on/off만 기억하는 GuildSettingsRepository 대역."""
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.reads = 0
+
+    def get_forbidden_filter_enabled(self, guild_id):
+        self.reads += 1
+        return self.enabled
+
+
+def make_forbidden_cog(counter, words=("나쁜말",), document=None, settings=None):
     with tempfile.TemporaryDirectory() as directory:
         pathlib.Path(directory, "forbidden_words.json").write_text(
-            json.dumps(list(words)), encoding="utf-8"
+            json.dumps(list(words) if document is None else document),
+            encoding="utf-8",
         )
         with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)), patch(
             "module.forbiddenfilter_cog.print"
         ):
             cog = forbiddenfilter_cog.ForbiddenFilterCog(
-                SimpleNamespace(get_cog=lambda _: counter)
+                SimpleNamespace(get_cog=lambda name: counter),
+                settings or RecordingFilterSettings(),
             )
     return cog
 
@@ -1161,7 +1178,9 @@ class ForbiddenFilterDegradesTest(unittest.TestCase):
     def test_cog_constructs_without_word_file(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                cog = forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+                cog = forbiddenfilter_cog.ForbiddenFilterCog(
+                    bot=None, settings=RecordingFilterSettings()
+                )
         self.assertIsNone(cog._find_match("아무 말이나"))
 
 
@@ -1318,15 +1337,18 @@ class _SetupGuild:
 
 
 class _SetupBot:
-    def __init__(self, play_cog=None):
+    def __init__(self, play_cog=None, filter_cog=None):
         self.views = []
         self.play_cog = play_cog
+        self.filter_cog = filter_cog
 
     def add_view(self, view):
         self.views.append(view)
 
     def get_cog(self, name):
-        return self.play_cog if name == "PlayWithCog" else None
+        if name == "PlayWithCog":
+            return self.play_cog
+        return self.filter_cog if name == "ForbiddenFilterCog" else None
 
 
 class _DeferredSetupResponse:
@@ -1346,6 +1368,90 @@ class _DeferredSetupFollowup:
 
     async def send(self, *args, **kwargs):
         self.events.append(("followup", args, kwargs))
+
+
+class ForbiddenFilterSettingCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_toggle_persists_and_invalidates_the_filter_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            invalidated = []
+            filter_cog = SimpleNamespace(invalidate_guild=invalidated.append)
+            cog = GuildSettingsCog(_SetupBot(filter_cog=filter_cog), settings)
+
+            self.assertTrue(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+
+            self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+            self.assertEqual(invalidated, [TEST_GUILD_ID])
+            self.assertIn("껐", interaction.response.messages[0][0][0])
+
+            await GuildSettingsCog._forbidden_filter.callback(
+                cog, SimpleNamespace(guild_id=TEST_GUILD_ID, response=RecordingResponse()), True
+            )
+            self.assertTrue(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+    async def test_show_reports_the_filter_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            settings.set_forbidden_filter_enabled(TEST_GUILD_ID, False)
+
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._show.callback(cog, interaction)
+
+        embed = interaction.response.messages[0][1]["embed"]
+        field = next(f for f in embed.fields if f.name == "금지어 필터")
+        self.assertEqual(field.value, "꺼짐")
+
+    async def test_toggle_survives_a_missing_filter_cog(self):
+        """금지어 확장이 로드되지 않은 인스턴스에서도 설정은 저장돼야 한다."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+            self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+
+class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
+    def test_greeting_loads_without_any_ai_key(self):
+        env = {"ADMIN_TOKEN": "t", "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
+        with patch.object(bot_main, "ENV_VALUES", env):
+            names = bot_main.available_extensions()
+        self.assertIn("module.greeting_cog", names)
+        self.assertNotIn("module.hyacine_chat_cog", names)
+
+    async def test_greeting_reads_the_current_persona(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "persona.json").write_text(
+                json.dumps({"greeting": "첫 인사"}), encoding="utf-8"
+            )
+            cog = greeting_cog.GreetingCog(bot=None)
+            interaction = FakeInteraction(channel_id=1)
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                await greeting_cog.GreetingCog._hello.callback(cog, interaction)
+                (pathlib.Path(directory) / "persona.json").write_text(
+                    json.dumps({"greeting": "바뀐 인사"}), encoding="utf-8"
+                )
+                later = FakeInteraction(channel_id=1)
+                await greeting_cog.GreetingCog._hello.callback(cog, later)
+
+        self.assertIn("첫 인사", interaction.response.messages[0][0][0])
+        self.assertIn("바뀐 인사", later.response.messages[0][0][0])
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
@@ -1554,6 +1660,182 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
+    """채널 버킷은 5개/5초다. 연타에 응답을 그대로 내보내면 레이트리밋에 걸린다."""
+
+    async def test_burst_answers_once_but_counts_every_hit(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        messages = [FakeMessage("나쁜말", guild_id=TEST_GUILD_ID) for _ in range(5)]
+
+        for message in messages:
+            await cog.on_message(message)
+
+        self.assertEqual([len(m.sent) for m in messages], [1, 0, 0, 0, 0])
+        self.assertEqual(counter.counts, [FakeUser.id] * 5)
+
+    async def test_cooldown_is_per_channel(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=1)
+        other = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=2)
+
+        await cog.on_message(first)
+        await cog.on_message(other)
+
+        self.assertEqual(len(first.sent), 1)
+        self.assertEqual(len(other.sent), 1)
+
+    async def test_window_expiry_lets_the_next_hit_answer(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(first)
+
+        # 창이 지난 상황을 시계 대신 마지막 응답 시각으로 만든다.
+        cog._last_response[(TEST_GUILD_ID, 1)] -= (
+            forbiddenfilter_cog.RESPONSE_COOLDOWN_SECONDS + 1
+        )
+        later = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(later)
+
+        self.assertEqual(len(later.sent), 1)
+
+    async def test_leaving_a_guild_drops_its_process_state(self):
+        cog = make_forbidden_cog(RecordingForbiddenCounts())
+        await cog.on_message(FakeMessage("나쁜말", guild_id=TEST_GUILD_ID))
+        await cog.on_message(FakeMessage("나쁜말", guild_id=99, channel_id=3))
+
+        await cog.on_guild_remove(SimpleNamespace(id=TEST_GUILD_ID))
+
+        self.assertEqual(list(cog._last_response), [(99, 3)])
+        self.assertNotIn(TEST_GUILD_ID, cog._enabled_cache)
+
+    async def test_bot_messages_are_never_screened(self):
+        """봇 응답이 다시 걸리면 봇끼리 핑퐁이 돈다. 회귀 방지."""
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, author_is_bot=True)
+
+        await cog.on_message(message)
+
+        self.assertEqual(message.sent, [])
+        self.assertEqual(counter.counts, [])
+
+
+class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
+    """배열(구형)과 객체(신형) 두 형태를 모두 받는다."""
+
+    def test_legacy_array_keeps_working(self):
+        policy = forbiddenfilter_cog.canonicalize_forbidden_policy(["Bad", " ", 1])
+        self.assertEqual(policy.words, ["bad", "1"])
+        self.assertEqual(policy.template, forbiddenfilter_cog.DEFAULT_TEMPLATE)
+        self.assertEqual(policy.allow, [])
+
+    def test_object_form_reads_template_and_allow(self):
+        policy = forbiddenfilter_cog.canonicalize_forbidden_policy(
+            {"words": ["시장"], "template": "{mention} 금지: {word}", "allow": ["시장님"]}
+        )
+        self.assertEqual((policy.words, policy.allow), (["시장"], ["시장님"]))
+        self.assertEqual(policy.template, "{mention} 금지: {word}")
+
+    def test_document_canonicalization_preserves_shape(self):
+        self.assertEqual(
+            forbiddenfilter_cog.canonicalize_forbidden_document(["A"]), ["a"]
+        )
+        self.assertEqual(
+            forbiddenfilter_cog.canonicalize_forbidden_document({"words": ["A"]}),
+            {
+                "words": ["a"],
+                "template": forbiddenfilter_cog.DEFAULT_TEMPLATE,
+                "allow": [],
+            },
+        )
+
+    def test_strict_rejects_malformed_objects(self):
+        for invalid in ({}, {"words": "not a list"}, {"words": [], "template": ""},
+                        {"words": [], "allow": "no"}, "string"):
+            with self.subTest(document=invalid), self.assertRaises(ValueError):
+                forbiddenfilter_cog.canonicalize_forbidden_policy(invalid, strict=True)
+
+    async def test_template_substitutes_only_two_placeholders(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter,
+            document={
+                "words": ["나쁜말"],
+                "template": "{mention}: {word} / {bot.token} {0}",
+            },
+        )
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        # {mention}·{word}만 치환되고 나머지 중괄호는 문자 그대로 남는다.
+        self.assertEqual(message.sent, ["<@123>: 나쁜말 / {bot.token} {0}"])
+
+    async def test_allow_list_beats_a_substring_hit(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter, document={"words": ["시장"], "allow": ["시장님"]}
+        )
+        allowed = FakeMessage("시장님 안녕하세요", guild_id=TEST_GUILD_ID)
+        caught = FakeMessage("시장 갑니다", guild_id=TEST_GUILD_ID, channel_id=2)
+
+        await cog.on_message(allowed)
+        await cog.on_message(caught)
+
+        self.assertEqual(allowed.sent, [])
+        self.assertEqual(len(caught.sent), 1)
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+    async def test_allow_list_still_catches_a_hit_outside_it(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter, document={"words": ["시장"], "allow": ["시장님"]}
+        )
+        message = FakeMessage("시장님과 시장 사람들", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+
+class ForbiddenGuildToggleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_guild_is_not_screened(self):
+        counter = RecordingForbiddenCounts()
+        settings = RecordingFilterSettings(enabled=False)
+        cog = make_forbidden_cog(counter, settings=settings)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        self.assertEqual(message.sent, [])
+        self.assertEqual(counter.counts, [])
+
+    async def test_setting_is_read_once_per_guild_then_cached(self):
+        settings = RecordingFilterSettings()
+        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+
+        for _ in range(3):
+            await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
+
+        self.assertEqual(settings.reads, 1)
+
+    async def test_invalidate_guild_forces_a_reread(self):
+        settings = RecordingFilterSettings()
+        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+        await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
+
+        cog.invalidate_guild(TEST_GUILD_ID)
+        settings.enabled = False
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(message)
+
+        self.assertEqual(settings.reads, 2)
+        self.assertEqual(message.sent, [])
+
+
 class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.counter = RecordingForbiddenCounts()
@@ -1570,10 +1852,15 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reload_prepares_off_loop_then_publishes_state(self):
         pattern = forbiddenfilter_cog._build_pattern(["새금지어"])
+        policy = forbiddenfilter_cog.ForbiddenPolicy(
+            words=["새금지어"],
+            template=forbiddenfilter_cog.DEFAULT_TEMPLATE,
+            allow=[],
+        )
         with patch.object(
             forbiddenfilter_cog.asyncio,
             "to_thread",
-            AsyncMock(return_value=(["새금지어"], pattern)),
+            AsyncMock(return_value=(policy, pattern, None)),
         ) as to_thread, patch("module.forbiddenfilter_cog.print"):
             loaded = await self.cog.reload_prohibited_words()
         to_thread.assert_awaited_once_with(forbiddenfilter_cog._load_prohibited_pattern)
@@ -1837,7 +2124,6 @@ class PersonaExternalizationTest(unittest.TestCase):
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
                 cog = HyacineChatCog(bot=None)
         self.assertEqual(cog.system_prompt, "테스트 프롬프트")
-        self.assertEqual(cog.greeting, "테스트 인사")
 
     def test_missing_persona_keys_fall_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1847,7 +2133,6 @@ class PersonaExternalizationTest(unittest.TestCase):
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
                 cog = HyacineChatCog(bot=None)
         self.assertEqual(cog.system_prompt, "프롬프트만")
-        self.assertTrue(cog.greeting)
 
     def test_missing_system_prompt_keeps_hyacine_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1859,7 +2144,6 @@ class PersonaExternalizationTest(unittest.TestCase):
 
         self.assertIn("히아킨", cog.system_prompt)
         self.assertIn("회색둥이 씨", cog.system_prompt)
-        self.assertEqual(cog.greeting, "테스트 인사")
 
     def test_constructors_take_no_nickname(self):
         with self.assertRaises(TypeError):
@@ -1888,7 +2172,6 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"system_prompt": "new prompt", "greeting": "new greeting"}),
                     encoding="utf-8",
                 )
-                self.assertEqual(cog.greeting, "old greeting")
                 new_session = cog.get_session(2)
 
                 captured_instructions = []
@@ -1914,19 +2197,9 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     FakeInteraction(channel_id=2), "new", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
-                old_hello = FakeInteraction(channel_id=1)
-                new_hello = FakeInteraction(channel_id=2)
-                await HyacineChatCog._hello.callback(cog, old_hello)
-                await HyacineChatCog._hello.callback(cog, new_hello)
-
         self.assertEqual(old_session.system_prompt, "old prompt")
         self.assertEqual(new_session.system_prompt, "new prompt")
-        self.assertEqual(old_session.greeting, "old greeting")
-        self.assertEqual(new_session.greeting, "new greeting")
-        self.assertEqual(cog.greeting, "new greeting")
         self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
-        self.assertIn("old greeting", old_hello.response.messages[0][0][0])
-        self.assertIn("new greeting", new_hello.response.messages[0][0][0])
 
 
 class _WebSettingsRepository:
