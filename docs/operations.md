@@ -10,7 +10,7 @@
 
 슬래시 명령은 전역으로 등록됩니다. 봇이 어느 서버에 초대될지 미리 알 수 없으므로 길드 한정 동기화를 쓰지 않습니다. 전역 등록은 Discord 쪽 전파에 최대 1시간이 걸릴 수 있습니다.
 
-채널 지정은 환경변수가 아니라 서버별 설정입니다. 각 서버 관리자가 `/설정 시작`으로 봇 채널을 만들거나 `/설정 파티채널`, `/설정 공지허용`으로 값을 `guild_settings.db`에 저장하고 `/설정 확인`으로 볼 수 있습니다. 파티 모집은 파티 채널의 게임별 영속 패널 버튼으로 시작·참가·역할 변경·나가기를 처리합니다. `settings/games.json`을 바꾸면 새 게임 구성과 패널을 반영하도록 봇을 재시작해야 합니다. `/이벤트`는 어느 서버 채널에서나 사용할 수 있습니다.
+채널 지정은 환경변수가 아니라 서버별 설정입니다. 각 서버 관리자가 `/설정 시작`으로 봇 채널을 만들거나 `/설정 파티채널`, `/설정 공지허용`, `/설정 금지어`로 값을 `guild_settings.db`에 저장하고 `/설정 확인`으로 볼 수 있습니다. 파티 모집은 파티 채널의 게임별 영속 패널 버튼으로 시작·참가·역할 변경·나가기를 처리합니다. `settings/games.json`을 바꾸면 새 게임 구성과 패널을 반영하도록 봇을 재시작해야 합니다. `/이벤트`는 어느 서버 채널에서나 사용할 수 있습니다.
 
 `/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다.
 
@@ -18,9 +18,9 @@
 
 웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다.
 
-서버 간 데이터는 섞이지 않습니다. 금지어 카운트·파티·설정은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 카운트는 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
+서버 간 데이터는 섞이지 않습니다. 금지어 카운트·파티·설정·게임 UID 등록은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 카운트는 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
 
-봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 금지어 카운트·파티·설정을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
+봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 금지어 카운트·파티·설정·게임 UID 등록을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
 
 ### AI 일일 한도
 
@@ -39,6 +39,24 @@
 이전 버전의 파티 `created_at` 중 timezone이 없는 값은 Docker가 UTC, launchd가 KST로 기록했을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석합니다. 기존 launchd 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
 
 파티 DB v2는 방장을 저장하고 한 사용자의 서버 내 활성 파티를 하나로 제한합니다. 업그레이드 전 중복 참가 데이터가 있으면 게임 이름 오름차순의 첫 파티만 보존하고, 기존 파티의 방장은 남은 참가자 중 가장 작은 사용자 ID로 결정합니다. 배포 전 백업 절차를 먼저 수행하세요.
+
+### 금지어 필터
+
+필터는 길드별로 켜고 끕니다. 기본값은 켜짐이며, `guild_settings` 스키마 v4의 `forbidden_filter_enabled`에 저장됩니다. v2·v3 DB는 기동 시 자동으로 v4가 되고 기존 서버는 켜진 상태를 유지합니다. `/설정 금지어`로 바꾼 값은 즉시 반영됩니다 — 필터가 메시지마다 DB를 조회하지 않도록 값을 프로세스에 캐시하고, 설정 명령이 그 캐시를 무효화합니다.
+
+같은 채널에서 연달아 적발되면 응답은 10초에 한 번만 나갑니다. 채널 메시지 버킷이 5개/5초라 연타에 응답을 그대로 내보내면 레이트리밋에 걸립니다. 창 안의 적발도 `forbidden_count`에는 전부 집계됩니다.
+
+`settings/forbidden_words.json`은 단어 배열이거나 `words`·`template`·`allow`를 담은 객체입니다. 형식은 README를 참고하세요. 웹 관리에서 저장하면 들어온 형태를 그대로 유지합니다.
+
+### 프로필 카드
+
+`profile_data.db`의 `game_uids` 테이블이 `(guild_id, user_id, game)`별 UID를 보관합니다. 백업·복구 경로에 다른 DB와 함께 포함됩니다.
+
+게임 데이터 파일은 첫 조회 때 프로세스 작업 디렉터리 기준 `.enka_py/`로 내려받습니다. Compose는 이 경로를 `./runtime/enka`에 bind mount하므로 container를 다시 만들어도 재다운로드하지 않습니다. 이 디렉터리는 봇 UID로 쓰기 가능해야 합니다.
+
+카드 이미지에는 한국어 글리프가 있는 폰트가 필요합니다. Docker 이미지는 `fonts-noto-cjk`를 설치합니다. launchd 등으로 직접 운영하면서 폰트를 찾지 못하면 카드가 텍스트 임베드로 나가므로, 이미지 카드를 쓰려면 `.env.runtime`의 `CARD_FONT_PATH`에 폰트 파일 경로를 지정하세요.
+
+Enka Network가 느리거나 점검 중이면 이 명령만 실패하고 다른 기능은 그대로 동작합니다. 전송 실패가 3회 연속이면 해당 게임 조회를 60초 쉬었다가 재개합니다. 조회 결과는 UID별로 5분 캐시합니다.
 
 ### 기존 설치 금지어 파일 마이그레이션
 
@@ -183,7 +201,7 @@ docker compose run --rm --no-deps backup python -m module.backup verify
 docker compose run --rm --no-deps backup python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
 
 DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도** `-shm`/`-wal` 파일을 만들 수 있어야 하므로, Docker `backup` 서비스의 `./runtime/data` 마운트는 `:ro`가 아니라 쓰기 가능해야 합니다. `:ro`로 되돌리면 봇이 정지한 상태(= `-shm` 부재)에서만 백업이 `attempt to write a readonly database`로 실패하고, `module.backup loop`이 예외를 삼켜 조용히 재시도만 반복합니다. 백업 코드는 SQLite 온라인 백업 API로 읽기만 하므로 rw 마운트가 데이터를 바꾸지는 않습니다.
 
@@ -355,7 +373,7 @@ esac
 )
 ```
 
-이어 Discord에서 `/프로필`과 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
+이어 Discord에서 `/프로필`, `/프로필카드`, 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
 
 ## 배포
 

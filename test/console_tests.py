@@ -497,8 +497,8 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         ),
     )
     check(
-        "백업은 세 DB와 존재한 세 settings를 exact same manifest로 설명",
-        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+        "백업은 네 DB와 존재한 세 settings를 exact same manifest로 설명",
+        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
     )
     check(
         "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
@@ -1339,6 +1339,7 @@ def test_guild_isolation():
     usage = database.SQLiteUsageRepository(data_dir / "a.db")
     parties = database.SQLitePartyRepository(data_dir / "p.db")
     settings = database.SQLiteGuildSettingsRepository(data_dir / "s.db")
+    profiles = database.SQLiteProfileRepository(data_dir / "g.db")
 
     A, B, USER = 1001, 1002, 7
     # 같은 사람이 서버마다 별도 카운트를 갖는다. 경계는 코드가 아니라 스키마가 만든다.
@@ -1363,18 +1364,59 @@ def test_guild_isolation():
     settings.set_party_channel(A, 333)
     check("설정 분리", settings.get_party_channel(A) == 333 and settings.get_party_channel(B) is None)
 
+    # 두 번째 길드에 초대된 상황. 같은 사람이 서버마다 다른 계정을 등록하고,
+    # 한쪽에서만 금지어 필터를 꺼도 다른 쪽 동작은 그대로여야 한다.
+    settings.set_party_channel(B, 444)
+    settings.set_forbidden_filter_enabled(B, False)
+    profiles.set_uid(A, USER, "hsr", "800000001")
+    profiles.set_uid(B, USER, "hsr", "800000002")
+    profiles.set_uid(B, USER, "gi", "900000002")
+    check(
+        "두 번째 길드 설정·등록은 첫 길드와 독립",
+        settings.get_forbidden_filter_enabled(A) is True
+        and settings.get_forbidden_filter_enabled(B) is False
+        and settings.get_party_channel(A) == 333
+        and settings.get_party_channel(B) == 444
+        and profiles.get_uid(A, USER, "hsr") == "800000001"
+        and profiles.list_uids(B, USER) == {"hsr": "800000002", "gi": "900000002"},
+    )
+
     # 봇이 서버에서 제거되면 그 서버 것만 지운다.
-    for repo in (usage, parties, settings):
+    for repo in (usage, parties, settings, profiles):
         repo.delete_guild(A)
     check("제거된 서버 데이터 삭제", usage.get_forbidden_count(A, USER) == 0 and parties.get_party(A, "PUBG") is None
-          and settings.get_party_channel(A) is None)
-    check("다른 서버는 보존", usage.get_forbidden_count(B, USER) == 1 and parties.get_party(B, "PUBG") is not None)
+          and settings.get_party_channel(A) is None and profiles.list_uids(A, USER) == {})
+    check("다른 서버는 보존", usage.get_forbidden_count(B, USER) == 1 and parties.get_party(B, "PUBG") is not None
+          and profiles.get_uid(B, USER, "hsr") == "800000002")
 
-    # 스키마가 경계를 강제하는지 — 모든 기본키에 guild_id가 있어야 한다.
-    import sqlite3
-    with sqlite3.connect(data_dir / "a.db") as conn:
-        pk = [r[1] for r in conn.execute("PRAGMA table_info(users)") if r[5]]
-    check("users 기본키에 guild_id 포함", "guild_id" in pk, f"({pk})")
+    check(
+        "이탈 후에도 두 번째 길드 설정 보존",
+        settings.get_party_channel(B) == 444
+        and settings.get_forbidden_filter_enabled(B) is False,
+    )
+
+    # 격리는 코드가 아니라 스키마가 만든다. 모든 테이블의 PK에 guild_id가 있어야 한다.
+    for repository in (usage, parties, settings, profiles):
+        with sqlite3.connect(repository.db_path) as conn:
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'"
+                )
+            ]
+            for table in tables:
+                columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                primary_key = {
+                    row[1] for row in conn.execute(f'PRAGMA table_info("{table}")') if row[5]
+                }
+                # ai_usage는 인스턴스 전역이라는 명시적 예외다.
+                if table == "ai_usage":
+                    continue
+                check(
+                    f"{repository.db_path.name}:{table} 기본키에 guild_id",
+                    "guild_id" in primary_key,
+                    f"({sorted(columns)})",
+                )
 
     check(
         "DM은 금지어 집계에서 제외",

@@ -1,6 +1,6 @@
 # Hyacine — Discord Bot HSR
 
-Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성을 제공합니다. Python 3.12 이상과 SQLite를 사용합니다.
+Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성, 게임 프로필 카드를 제공합니다. Python 3.12 이상과 SQLite를 사용합니다.
 
 각 운영자가 자신의 Discord Application과 토큰을 만들어 직접 운영합니다. 저장소 소유자는 다른 사람에게 봇을 호스팅하거나 Discord 서버를 대신 관리하지 않습니다. Hyacine은 *Honkai: Star Rail* 비공식 팬 프로젝트이며 HoYoverse와 제휴하거나 승인받지 않았습니다.
 
