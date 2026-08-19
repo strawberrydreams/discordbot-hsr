@@ -1899,6 +1899,42 @@ def test_imports():
             check(f"import {m}", False, f"({e})")
 
 
+def test_repository_layer_is_the_only_sql_surface():
+    """SQL이 저장소 계층 밖으로 새지 않는지 AST로 고정한다.
+
+    §8.4의 추상화는 이미 구현돼 있다. 이 테스트는 새로 만드는 게 아니라
+    깨지지 않게 못을 박는 것이다. 외부 DB로 교체할 때 고쳐야 할 파일이
+    database.py 하나로 유지된다는 뜻이기도 하다.
+    """
+    print("\n[9] 저장소 계층 밖 sqlite3 직접 사용 금지")
+    import ast
+
+    # database.py는 저장소 구현 본체. backup.py는 파일 단위 스냅샷이라 SQL이 아닌
+    # sqlite3 백업 API를 쓴다. export_legacy.py는 삭제된 컬럼을 읽는 일회성 도구로,
+    # 현재 스키마를 모르는 구버전 DB를 상대하므로 저장소를 경유할 수 없다.
+    allowed = {"database.py", "backup.py", "export_legacy.py"}
+
+    for path in sorted((PROJECT_ROOT / "module").glob("*.py")):
+        if path.name in allowed:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        offenders = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                offenders.update(
+                    alias.name for alias in node.names if alias.name.split(".")[0] == "sqlite3"
+                )
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "sqlite3":
+                offenders.add(node.module)
+        check(f"{path.name}는 sqlite3를 import하지 않음", not offenders, f"({sorted(offenders)})")
+
+    # 예외 목록이 실재하는 파일만 담고 있어야 한다. 파일이 사라지면 구멍이 남는다.
+    check(
+        "예외 목록의 파일이 모두 존재",
+        all((PROJECT_ROOT / "module" / name).exists() for name in allowed),
+    )
+
+
 def test_backup_round_trip():
     import module.backup as backup
 
@@ -3173,6 +3209,7 @@ if __name__ == "__main__":
         test_cog_facade()
         test_channel_sessions()
         test_imports()
+        test_repository_layer_is_the_only_sql_surface()
         test_backup_round_trip()
         test_settings_backup_round_trip()
         test_setting_source_inspection_failure_closes_descriptor()
