@@ -13,7 +13,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
