@@ -473,8 +473,12 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
     )
     check(
-        "MIT와 무기여 정책을 유지",
-        "MIT License" in readme and "사용자 기여를 받지 않습니다" in readme,
+        "GPL-3.0과 무기여 정책을 유지",
+        "GNU General Public License v3.0" in readme
+        and "사용자 기여를 받지 않습니다" in readme
+        and "GNU GENERAL PUBLIC LICENSE" in (PROJECT_ROOT / "LICENSE").read_text(
+            encoding="utf-8"
+        ),
     )
     check(
         "사용자 문서에 폐기된 파티 명령·설정 열 없음",

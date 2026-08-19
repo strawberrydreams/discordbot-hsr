@@ -141,7 +141,9 @@ AI 명령은 사용자별 KST 일일 AI 한도를 명령별로 적용합니다. 
 
 ## 라이선스와 기여
 
-Hyacine은 [MIT License](LICENSE)로 배포합니다. 이 저장소는 사용자 기여를 받지 않습니다.
+Hyacine은 [GNU General Public License v3.0](LICENSE)으로 배포합니다. 이 저장소는 사용자 기여를 받지 않습니다.
+
+프로필 카드가 쓰는 [`enka`](https://pypi.org/project/enka/)가 GPL-3.0이므로, 이 라이브러리를 링크하는 배포물 전체가 GPL-3.0이 됩니다. MIT였던 이전 버전을 쓰던 운영자는 해당 커밋 이전 이력에서 MIT 조건으로 계속 쓸 수 있습니다. 포크해서 배포한다면 소스 공개 의무를 포함한 GPL-3.0 조건을 따라야 합니다.
 
 ## 상세 운영
 
