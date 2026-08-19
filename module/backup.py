@@ -288,6 +288,7 @@ def _create_backup_set(now: datetime | None) -> Path:
     ]
     if any(path.exists() for path in destinations):
         raise RuntimeError(f"같은 시각의 백업이 이미 있습니다: {timestamp}")
+    manifest_path = destinations[-1]
     temporary_paths: list[Path] = []
     pending: list[tuple[Path, Path, str, dict[str, int]]] = []
     pending_settings: list[tuple[Path, Path, str]] = []
@@ -347,7 +348,6 @@ def _create_backup_set(now: datetime | None) -> Path:
                 for _, final, source_name in pending_settings
             ],
         }
-        manifest_path = BACKUP_DIR / f"{timestamp}-manifest.json"
         manifest_temporary = _temporary_path(f"{timestamp}-manifest.json")
         temporary_paths.append(manifest_temporary)
         with manifest_temporary.open("w", encoding="utf-8") as fp:
@@ -360,6 +360,20 @@ def _create_backup_set(now: datetime | None) -> Path:
     finally:
         for temporary in temporary_paths:
             temporary.unlink(missing_ok=True)
+        # manifest가 backup set의 유일한 commit point다. 공개되기 전 실패는 이미
+        # rename된 data/settings 파일까지 지워 다음 실행과 prune에 고아를 남기지 않는다.
+        if not manifest_path.exists():
+            removed = False
+            for _, final, _, _ in pending:
+                if final.exists():
+                    final.unlink()
+                    removed = True
+            for _, final, _ in pending_settings:
+                if final.exists():
+                    final.unlink()
+                    removed = True
+            if removed:
+                _fsync_directory(BACKUP_DIR)
 
     prune_backups(now=created_at)
     return manifest_path

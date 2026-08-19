@@ -12,7 +12,7 @@
   <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{csrf}}"><button type="submit">로그아웃</button></form>
 
   <h2>Persona</h2>
-  <form method="post" action="/settings/persona.json"><input type="hidden" name="csrf" value="{{csrf}}"><label>System prompt<textarea name="system_prompt" required>{{persona_prompt}}</textarea></label><label>인삿말<input name="greeting" required value="{{persona_greeting}}"></label><button type="submit">저장 — 새 AI 세션부터 적용</button></form>
+  <form method="post" action="/settings/persona.json"><input type="hidden" name="csrf" value="{{csrf}}"><label>System prompt<textarea name="system_prompt" maxlength="16000" required>{{persona_prompt}}</textarea></label><label>인삿말<input name="greeting" maxlength="1974" required value="{{persona_greeting}}"></label><button type="submit">저장 — 새 AI 세션부터 적용</button></form>
 
   <h2>Forbidden words</h2>
   <form method="post" action="/settings/forbidden_words.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{forbidden_words}}</textarea><button type="submit">저장 — 즉시 다시 불러오기</button></form>

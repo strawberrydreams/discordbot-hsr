@@ -14,7 +14,7 @@
 
 `/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 고정된 `127.0.0.1:8080`에서 시작하며, Compose는 web port를 host의 `127.0.0.1`에만 publish합니다. launchd로 실행할 때도 loopback에서만 접근할 수 있습니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 시작됩니다. host/launchd 실행은 `127.0.0.1:8080`에 bind하고, Compose는 container 내부의 `0.0.0.0:8080`을 host의 `127.0.0.1:8080`에만 publish합니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
 
 웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다.
 
@@ -46,7 +46,7 @@
 
 같은 채널에서 연달아 적발되면 응답은 10초에 한 번만 나갑니다. 채널 메시지 버킷이 5개/5초라 연타에 응답을 그대로 내보내면 레이트리밋에 걸립니다. 창 안의 적발도 `forbidden_count`에는 전부 집계됩니다.
 
-`settings/forbidden_words.json`은 단어 배열이거나 `words`·`template`·`allow`를 담은 객체입니다. 형식은 README를 참고하세요. 웹 관리에서 저장하면 들어온 형태를 그대로 유지합니다.
+`settings/forbidden_words.json`은 단어 배열이거나 `words`·`template`·`allow`를 담은 객체입니다. `words`·`allow`는 각각 최대 1,000개·항목당 100자이고, 치환된 `template`은 2,000자 이하여야 합니다. AI persona의 system prompt는 16,000자, 인삿말은 1,974자 이하여야 합니다. 형식은 README를 참고하세요. 웹 관리에서 저장하면 들어온 형태를 그대로 유지합니다.
 
 ### 프로필 카드
 

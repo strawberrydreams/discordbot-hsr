@@ -29,6 +29,7 @@ BACKOFF_SECONDS = 60.0
 # 안에서만 재사용한다. 한 장이 수 MB까지 가므로 개수를 묶는다.
 ART_CACHE_MAX = 24
 ART_MAX_BYTES = 8 * 1024 * 1024
+ART_CACHE_MAX_BYTES = 32 * 1024 * 1024
 ART_TIMEOUT_SECONDS = 15
 
 
@@ -76,22 +77,7 @@ class GameAdapter:
         return self._convert(response)
 
 
-def _hsr_showcase(response: Any) -> Showcase:
-    return Showcase(
-        nickname=response.player.nickname,
-        level=response.player.level,
-        characters=[
-            ShowcaseCharacter(
-                name=character.name,
-                level=character.level,
-                art_url=character.icon.gacha,
-            )
-            for character in response.characters
-        ],
-    )
-
-
-def _gi_showcase(response: Any) -> Showcase:
+def _standard_showcase(response: Any) -> Showcase:
     return Showcase(
         nickname=response.player.nickname,
         level=response.player.level,
@@ -134,7 +120,7 @@ ADAPTERS: Dict[str, GameAdapter] = {
                 "여기에 표시됩니다."
             ),
             _client_factory=lambda: enka.HSRClient(enka.hsr.Language.KOREAN),
-            _convert=_hsr_showcase,
+            _convert=_standard_showcase,
         ),
         GameAdapter(
             key="gi",
@@ -145,7 +131,7 @@ ADAPTERS: Dict[str, GameAdapter] = {
                 "**상세 정보 표시**를 켜면 여기에 표시됩니다."
             ),
             _client_factory=lambda: enka.GenshinClient(enka.gi.Language.KOREAN),
-            _convert=_gi_showcase,
+            _convert=_standard_showcase,
         ),
         GameAdapter(
             key="zzz",
@@ -183,6 +169,7 @@ class ProfileService:
         self._cache: Dict[Tuple[str, str], Tuple[float, Showcase]] = {}
         self._failures: Dict[str, _Failure] = {}
         self._art: "OrderedDict[str, bytes]" = OrderedDict()
+        self._art_bytes = 0
         self._art_session: Optional[aiohttp.ClientSession] = None
 
     def adapter(self, game: str) -> GameAdapter:
@@ -285,16 +272,28 @@ class ProfileService:
             return None
         if len(payload) > ART_MAX_BYTES:
             return None
+        if len(payload) > ART_CACHE_MAX_BYTES:
+            return payload
         # ponytail: 삽입 순서로 가장 오래된 것부터 버린다. LRU가 필요할 규모가 아니다.
-        while len(self._art) >= ART_CACHE_MAX:
-            self._art.popitem(last=False)
+        existing = self._art.pop(url, None)
+        if existing is not None:
+            self._art_bytes -= len(existing)
+        while self._art and (
+            len(self._art) >= ART_CACHE_MAX
+            or self._art_bytes + len(payload) > ART_CACHE_MAX_BYTES
+        ):
+            _, evicted = self._art.popitem(last=False)
+            self._art_bytes -= len(evicted)
         self._art[url] = payload
+        self._art_bytes += len(payload)
         return payload
 
     async def close(self) -> None:
         session, self._art_session = self._art_session, None
         if session is not None:
             await session.close()
+        self._art.clear()
+        self._art_bytes = 0
         clients, self._clients = self._clients, {}
         for client in clients.values():
             try:

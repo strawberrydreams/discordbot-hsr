@@ -15,7 +15,7 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.panel import drop_panel_locks, panel_lock
+from module.panel import drop_panel_locks, is_sendable_panel_channel, panel_lock
 
 
 class SetupView(discord.ui.View):
@@ -140,6 +140,12 @@ class GuildSettingsCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        if not is_sendable_panel_channel(inter.guild, target):
+            await inter.response.send_message(
+                "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드 권한이 필요합니다.",
+                ephemeral=True,
+            )
+            return
         await inter.response.defer(ephemeral=True)
         await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
         await self._ensure_panels(inter.guild)
@@ -179,11 +185,18 @@ class GuildSettingsCog(commands.Cog):
         forbidden_filter = await run_db(
             self.settings.get_forbidden_filter_enabled, inter.guild_id
         )
+        party_value = "미지정 — `/설정 파티채널`"
+        if party:
+            party_value = f"<#{party}>"
+            guild = getattr(inter, "guild", None)
+            channel = guild.get_channel(party) if guild is not None else None
+            if guild is not None and not is_sendable_panel_channel(guild, channel):
+                party_value += " — 삭제됨 또는 권한 부족"
 
         embed = discord.Embed(title="⚙️ 이 서버의 봇 설정", color=discord.Color.blurple())
         embed.add_field(
             name="파티 패널 채널",
-            value=f"<#{party}>" if party else "미지정 — `/설정 파티채널`",
+            value=party_value,
             inline=False,
         )
         embed.add_field(

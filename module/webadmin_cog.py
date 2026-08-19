@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -21,9 +22,11 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
+from module.panel import is_sendable_panel_channel
 
 
-HOST = "127.0.0.1"
+DEFAULT_HOST = "127.0.0.1"
+ALLOWED_HOSTS = frozenset({DEFAULT_HOST, "0.0.0.0"})
 PORT = 8080
 SESSION_COOKIE = "admin_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
@@ -55,6 +58,15 @@ PLACEHOLDER_PATTERN = re.compile(
 # 먼저 확인할 것.
 RAW_PLACEHOLDERS = frozenset({"guild_options", "guild_rows"})
 logger = logging.getLogger(__name__)
+
+
+def _bind_host() -> str:
+    host = os.environ.get("WEB_ADMIN_HOST", DEFAULT_HOST)
+    if host not in ALLOWED_HOSTS:
+        raise RuntimeError(
+            "WEB_ADMIN_HOST는 127.0.0.1 또는 0.0.0.0이어야 합니다."
+        )
+    return host
 
 
 @dataclass(frozen=True)
@@ -110,10 +122,11 @@ class WebAdminCog(commands.Cog):
     async def start(self) -> None:
         if self.runner is not None:
             return
+        host = _bind_host()
         runner = web.AppRunner(self.app)
         try:
             await runner.setup()
-            site = web.TCPSite(runner, HOST, PORT)
+            site = web.TCPSite(runner, host, PORT)
             await site.start()
         except BaseException:
             await runner.cleanup()
@@ -259,7 +272,10 @@ class WebAdminCog(commands.Cog):
         if not channel_id:
             return "미설정"
         channel = guild.get_channel(channel_id)
-        return f"#{channel.name}" if channel is not None else f"삭제됨 ({channel_id})"
+        if channel is None:
+            return f"삭제됨 ({channel_id})"
+        label = f"#{channel.name}"
+        return label if is_sendable_panel_channel(guild, channel) else f"{label} (권한 부족)"
 
     async def _guild_overview(self) -> tuple[str, str, str]:
         """(길드 현황 표의 행, 공지 대상 option, 읽기 실패 사유)를 돌려준다.
@@ -409,22 +425,6 @@ class WebAdminCog(commands.Cog):
         }
         return await self._index_response(csrf, notices[name])
 
-    @staticmethod
-    def _sendable_text_channel(guild, channel) -> bool:
-        if channel is None or getattr(channel, "type", None) not in {
-            discord.ChannelType.text,
-            discord.ChannelType.news,
-        }:
-            return False
-        member = getattr(guild, "me", None)
-        if member is None:
-            return False
-        permissions = channel.permissions_for(member)
-        return all(
-            getattr(permissions, name, False)
-            for name in ("view_channel", "send_messages", "embed_links")
-        )
-
     async def announce_post(self, request: web.Request) -> web.StreamResponse:
         self._require_session(request)
         form = await self._read_form(request)
@@ -471,7 +471,7 @@ class WebAdminCog(commands.Cog):
                         continue
                     channel_id = await run_db(self.settings.get_party_channel, guild_id)
                     channel = guild.get_channel(channel_id) if channel_id else None
-                    if not self._sendable_text_channel(guild, channel):
+                    if not is_sendable_panel_channel(guild, channel):
                         skipped += 1
                         continue
                     await asyncio.wait_for(

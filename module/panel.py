@@ -8,6 +8,27 @@ import discord
 _LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 
 
+def is_sendable_panel_channel(guild, channel) -> bool:
+    if channel is None or getattr(channel, "type", None) not in {
+        discord.ChannelType.text,
+        discord.ChannelType.news,
+    }:
+        return False
+    member = getattr(guild, "me", None)
+    if member is None:
+        return False
+    permissions = channel.permissions_for(member)
+    return all(
+        getattr(permissions, name, False)
+        for name in (
+            "view_channel",
+            "send_messages",
+            "read_message_history",
+            "embed_links",
+        )
+    )
+
+
 def panel_lock(guild_id: int, panel_key: str) -> asyncio.Lock:
     return _LOCKS.setdefault((guild_id, panel_key), asyncio.Lock())
 

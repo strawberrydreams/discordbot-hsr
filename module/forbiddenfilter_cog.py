@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import discord
+import logging
 import re
 import time
 import unicodedata
@@ -15,6 +16,8 @@ from module.database import (
     run_db,
 )
 
+logger = logging.getLogger(__name__)
+
 # 옵션: 자모 입력(ㅍ ㅔ ㄴ ...)을 완성형으로 결합할지
 COMBINE_JAMO = True
 
@@ -23,6 +26,10 @@ COMBINE_JAMO = True
 RESPONSE_COOLDOWN_SECONDS = 10.0
 
 DEFAULT_TEMPLATE = "🛑🛑 {mention} 삐삑~~ 나쁜 단어 **{word}** 금지! 금지! 🛑🛑"
+MAX_TERMS_PER_LIST = 1_000
+MAX_TERM_CHARS = 100
+MAX_RESPONSE_CHARS = 2_000
+MAX_MENTION_CHARS = 24
 
 # ─────────── 유틸 ─────────── #
 ZERO_WIDTH = {
@@ -59,10 +66,9 @@ def _strip_to_core_chars(s: str) -> str:
 
 def _normalize_term(s: str) -> str:
     """
-    금지어(정상 표기) 정규화: 전각/조합 통합 + 소문자
-    * 금지어 JSON에는 평범한 표기를 넣는 걸 권장.
+    금지어와 허용어를 메시지와 같은 규칙으로 정규화한다.
     """
-    return unicodedata.normalize("NFKC", s).lower()
+    return _normalize_message_for_match(s)
 
 def _normalize_message_for_match(s: str) -> str:
     """
@@ -97,10 +103,41 @@ class ForbiddenPolicy:
 EMPTY_POLICY = ForbiddenPolicy(words=[], template=DEFAULT_TEMPLATE, allow=[])
 
 
-def _normalized_terms(raw: object) -> List[str]:
+def _normalized_terms(
+    raw: object, *, field: str, strict: bool
+) -> List[str]:
     if not isinstance(raw, list):
         return []
-    return [_normalize_term(str(term)) for term in raw if str(term).strip()]
+    if len(raw) > MAX_TERMS_PER_LIST:
+        message = f"forbidden_words.json의 {field}는 최대 {MAX_TERMS_PER_LIST:,}개여야 합니다."
+        if strict:
+            raise ValueError(message)
+        print(f"⚠️ {message} 앞 항목만 사용합니다.")
+        raw = raw[:MAX_TERMS_PER_LIST]
+    normalized = []
+    seen = set()
+    for term in raw:
+        value = _normalize_term(str(term))
+        if len(value) > MAX_TERM_CHARS:
+            message = (
+                f"forbidden_words.json의 {field} 항목은 "
+                f"{MAX_TERM_CHARS}자 이하여야 합니다."
+            )
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message} 해당 항목을 건너뜁니다.")
+            continue
+        if value and value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return normalized
+
+
+def _template_fits_discord(template: str) -> bool:
+    rendered = template.replace("{mention}", "m" * MAX_MENTION_CHARS).replace(
+        "{word}", "w" * MAX_TERM_CHARS
+    )
+    return len(rendered) <= MAX_RESPONSE_CHARS
 
 
 def canonicalize_forbidden_policy(
@@ -113,7 +150,9 @@ def canonicalize_forbidden_policy(
     """
     if isinstance(data, list):
         return ForbiddenPolicy(
-            words=_normalized_terms(data), template=DEFAULT_TEMPLATE, allow=[]
+            words=_normalized_terms(data, field="words", strict=strict),
+            template=DEFAULT_TEMPLATE,
+            allow=[],
         )
     if isinstance(data, dict):
         words = data.get("words")
@@ -130,6 +169,12 @@ def canonicalize_forbidden_policy(
                 raise ValueError(message)
             print(f"⚠️ {message} 기본 문구를 씁니다.")
             template = DEFAULT_TEMPLATE
+        elif not _template_fits_discord(template):
+            message = "forbidden_words.json의 template 응답은 2,000자 이하여야 합니다."
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message} 기본 문구를 씁니다.")
+            template = DEFAULT_TEMPLATE
         allow = data.get("allow", [])
         if not isinstance(allow, list):
             message = "forbidden_words.json의 allow는 배열이어야 합니다."
@@ -138,9 +183,9 @@ def canonicalize_forbidden_policy(
             print(f"⚠️ {message} 허용 목록을 비웁니다.")
             allow = []
         return ForbiddenPolicy(
-            words=_normalized_terms(words),
+            words=_normalized_terms(words, field="words", strict=strict),
             template=template,
-            allow=_normalized_terms(allow),
+            allow=_normalized_terms(allow, field="allow", strict=strict),
         )
     message = "forbidden_words.json 최상단은 배열 또는 객체여야 합니다."
     if strict:
@@ -313,16 +358,29 @@ class ForbiddenFilterCog(commands.Cog):
         if not bad_word:
             return
 
-        # 쿨다운은 응답만 묶는다. 박제는 생략해도 카운트는 정확해야 한다.
+        # 쿨다운은 응답만 묶는다. 카운트와 전송 실패도 서로 영향을 주지 않는다.
         if self._claim_response_slot(message.guild.id, message.channel.id):
-            await message.channel.send(self._format_response(message, bad_word))
+            try:
+                await message.channel.send(self._format_response(message, bad_word))
+            except Exception:
+                logger.exception(
+                    "Failed to send forbidden response for guild_id=%s channel_id=%s",
+                    message.guild.id,
+                    message.channel.id,
+                )
 
-        # Increment forbidden count
         usage_cog = self.bot.get_cog("UsageCog")
         if usage_cog:
-            await usage_cog.increment_forbidden_count(
-                message.guild.id, message.author.id
-            )
+            try:
+                await usage_cog.increment_forbidden_count(
+                    message.guild.id, message.author.id
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to count forbidden word for guild_id=%s user_id=%s",
+                    message.guild.id,
+                    message.author.id,
+                )
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):

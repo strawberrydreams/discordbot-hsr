@@ -4,7 +4,6 @@ from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional
 import discord
 import openai
-import tiktoken
 from discord import app_commands
 from discord.ext import commands
 from module.config import (
@@ -23,6 +22,13 @@ DEFAULT_PERSONA = {
     "system_prompt": "당신은 놀빛 정원의 따뜻한 의사, 하늘의 백성 히아킨입니다. 사용자를 '회색둥이 씨'라 부르며, 한국어로 정확하고 다정하게 답하세요.",
     "greeting": "안녕하세요~ 정원에서 기다리고 있었답니다🌼",
 }
+SYSTEM_PROMPT_MAX_CHARS = 16_000
+# Discord mention의 최장 형태(<@! + 20자리 ID + >)와 ", "를 더해도 2,000자다.
+GREETING_MAX_CHARS = 1_974
+PERSONA_FIELD_LIMITS = {
+    "system_prompt": SYSTEM_PROMPT_MAX_CHARS,
+    "greeting": GREETING_MAX_CHARS,
+}
 
 
 def canonicalize_persona(data: object, *, strict: bool = False) -> dict:
@@ -30,9 +36,21 @@ def canonicalize_persona(data: object, *, strict: bool = False) -> dict:
         if strict:
             raise ValueError("persona.json 최상단은 객체여야 합니다.")
         data = {}
-    accepted = {k: v for k, v in data.items() if isinstance(v, str) and v}
-    if strict and len(accepted) != len(data):
-        raise ValueError("persona.json 값은 비어 있지 않은 문자열이어야 합니다.")
+    accepted = {}
+    for key, value in data.items():
+        limit = PERSONA_FIELD_LIMITS.get(key)
+        valid = isinstance(value, str) and bool(value) and (
+            limit is None or len(value) <= limit
+        )
+        if not valid:
+            message = "persona.json 값은 비어 있지 않은 문자열이어야 합니다."
+            if limit is not None and isinstance(value, str) and len(value) > limit:
+                message = f"persona.json의 {key}는 {limit:,}자 이하여야 합니다."
+            if strict:
+                raise ValueError(message)
+            print(f"⚠️ {message} 기본값을 씁니다.")
+            continue
+        accepted[key] = value
     return {**DEFAULT_PERSONA, **accepted}
 
 
@@ -64,9 +82,8 @@ class HyacineChatCog(commands.Cog):
         self.bot = bot
         self.client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-        self.MAX_ASSISTANT_LIGHT = 2_000 # Reduced for efficiency
-        self.MAX_ASSISTANT_DEEP = 16_000 # Stricter limit for GPT-5.5 Thinking
-        self.DISCORD_LIMIT = 2000
+        self.MAX_ASSISTANT_LIGHT = 2_000
+        self.MAX_ASSISTANT_DEEP = 16_000
 
         self.system_prompt = load_persona()["system_prompt"]
 
@@ -90,18 +107,6 @@ class HyacineChatCog(commands.Cog):
                 break  # 전부 사용 중이면 이번 사이클은 축출하지 않음
         return session
 
-    def tokenizer_for(self, model_name: str):
-        try:
-            return tiktoken.encoding_for_model(model_name)
-        except KeyError:
-            if any(tag in model_name for tag in ("gpt-4o", "gpt-5")):
-                return tiktoken.get_encoding("o200k_base")
-            return tiktoken.get_encoding("cl100k_base")
-
-    def tok(self, s: str, model_name: str) -> int:
-        tokenizer = self.tokenizer_for(model_name)
-        return len(tokenizer.encode(s))
-
     def trim(self, session: ChannelSession):
         # system 제외하고 최근 10개(5턴)까지 유지
         non_system = [m for m in session.history if m["role"] != "system"]
@@ -122,50 +127,44 @@ class HyacineChatCog(commands.Cog):
         return parts
 
     def _split_for_discord(self, text: str, limit: int = 2000) -> List[str]:
+        if limit <= 0:
+            raise ValueError("limit은 양수여야 합니다.")
         if len(text) <= limit:
             return [text]
+
+        # 열린 code fence를 닫고 다음 메시지에서 다시 여는 최대 8자를 남긴다.
+        reserve = 8 if "```" in text and limit > 8 else 0
+        payload_limit = limit - reserve
+        raw_chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + payload_limit, len(text))
+            if end < len(text):
+                original_end = end
+                # ``` 한가운데를 자르면 fence 상태를 잘못 계산한다.
+                while end > start and text[end - 1] == "`" and text[end] == "`":
+                    end -= 1
+                if end == start:
+                    end = original_end
+            raw_chunks.append(text[start:end])
+            start = end
+
+        if reserve == 0:
+            return raw_chunks
+
         chunks = []
-        buf = ""
         fence_open = False
-
-        lines = text.splitlines(keepends=True)
-        for ln in lines:
-            if ln.strip().startswith("```"):
-                if len(buf) + len(ln) > limit:
-                    if fence_open and not buf.rstrip().endswith("```"):
-                        buf += "\n```"
-                    chunks.append(buf)
-                    buf = ""
-                    if fence_open: buf += "```\n"
+        for raw in raw_chunks:
+            prefix = "```\n" if fence_open else ""
+            if raw.count("```") % 2:
                 fence_open = not fence_open
-                buf += ln
-                if len(buf) >= limit:
-                    chunks.append(buf)
-                    buf = ""
-                continue
-
-            if len(buf) + len(ln) <= limit:
-                buf += ln
-            else:
-                if fence_open and not buf.rstrip().endswith("```"):
-                    buf += "\n```"
-                chunks.append(buf)
-                buf = ""
-                if fence_open: buf += "```\n"
-                while len(ln) > limit:
-                    part = ln[:limit]
-                    ln = ln[limit:]
-                    chunks.append(part)
-                buf = ln
-        if buf:
-            if fence_open and not buf.rstrip().endswith("```"):
-                buf += "\n```"
-            chunks.append(buf)
+            suffix = "\n```" if fence_open else ""
+            chunks.append(prefix + raw + suffix)
         return chunks
 
     async def send_chunked_followup(self, inter: discord.Interaction, text: str):
         parts = self._split_for_discord(text)
-        for idx, p in enumerate(parts):
+        for p in parts:
             if not p.strip():
                 continue
             await inter.followup.send(p)
@@ -253,17 +252,20 @@ class HyacineChatCog(commands.Cog):
                     "total_tokens": resp.usage.total_tokens
                 }
 
-                # Update History
                 history_parts = [
                     part for part in parts if part.get("type") == "input_text"
                 ]
                 if not history_parts:
                     history_parts = [{"type": "input_text", "text": "(이전 턴에 이미지 첨부됨)"}]
+
+                await self.send_chunked_followup(
+                    inter, f"**{inter.user.mention}**: {내용}"
+                )
+                await self.send_chunked_followup(inter, reply)
+
+                # 사용자가 실제로 받은 턴만 다음 provider 입력에 포함한다.
                 session.history.append({"role": "user", "content": history_parts})
                 session.history.append({"role": "assistant", "content": reply})
-
-            await inter.followup.send(f"**{inter.user.mention}**: {내용}")
-            await self.send_chunked_followup(inter, reply)
 
         except Exception as exc:
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송

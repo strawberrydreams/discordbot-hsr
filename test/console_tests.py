@@ -463,9 +463,10 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         "`Connect`" not in quick_start and "`Speak`" not in quick_start,
     )
     check(
-        "웹 관리는 선택 token·고정 loopback·unsupported remote 경계",
+        "웹 관리는 선택 token·host loopback·unsupported remote 경계",
         "`ADMIN_TOKEN`은 선택 사항입니다." in readme
-        and "고정된 `127.0.0.1:8080`에만 bind됩니다." in readme
+        and "host의 `127.0.0.1:8080`에만 publish" in readme
+        and "다른 network interface에는 노출되지 않습니다." in readme
         and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다." in readme
         and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며" in operations
         and "port가 아닌 host-scoped" in operations,
@@ -600,13 +601,14 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
     backup_service = compose.split("\n  backup:", 1)[1]
     check(
-        "Compose service별 settings mode와 loopback 전용 port 구조",
+        "Compose service별 settings mode와 host loopback 전용 port 구조",
         "      - ./settings:/app/settings\n" in bot_service
         and "      - ./settings:/app/settings:ro\n" not in bot_service
         and "      - ./settings:/app/settings:ro\n" in backup_service
         # host 쪽 bind를 빠뜨리면 web admin이 모든 interface에 열린다.
         and '      - "127.0.0.1:8080:8080"\n' in bot_service
-        and "0.0.0.0" not in bot_service
+        # container 안에서는 publish 대상인 container interface에서 받아야 한다.
+        and '      WEB_ADMIN_HOST: "0.0.0.0"\n' in bot_service
         and "ports:" not in backup_service,
     )
     expected_healthcheck = (

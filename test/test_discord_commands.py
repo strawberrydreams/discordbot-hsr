@@ -37,9 +37,11 @@ from module.database import (
 from module.eventnotice_cog import EventNoticeCog
 from module.guildsettings_cog import GuildSettingsCog, SetupView
 from module.hyacine_chat_cog import HyacineChatCog
+import module.hyacine_chat_cog as hyacine_chat_cog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
 from module.panel import drop_panel_locks, panel_lock, upsert_panel
+import module.panel as panel_module
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.greeting_cog as greeting_cog
@@ -498,6 +500,71 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(attachment.url, repr(captured["input"]))
         self.assertNotIn(
             attachment.url, repr(list(self.cog.get_session(1).history))
+        )
+
+    def test_splitter_never_exceeds_discord_limit_around_code_fences(self):
+        text = "```\n" + "a" * 1_993 + "\n" + "bbbb\n"
+
+        chunks = self.cog._split_for_discord(text)
+
+        self.assertTrue(chunks)
+        self.assertTrue(all(len(chunk) <= 2_000 for chunk in chunks))
+        self.assertIn("bbbb", "".join(chunks))
+
+        tiny_chunks = self.cog._split_for_discord("```\n" + "a" * 20, limit=8)
+        self.assertTrue(all(len(chunk) <= 8 for chunk in tiny_chunks))
+
+    async def test_long_user_echo_is_chunked_before_sending(self):
+        interaction = FakeInteraction(channel_id=1)
+
+        async def response(**kwargs):
+            return SimpleNamespace(
+                output_text="응답",
+                model="gpt-5.6-terra",
+                usage=SimpleNamespace(
+                    input_tokens=1, output_tokens=1, total_tokens=2
+                ),
+            )
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=response)
+        )
+        await self.cog._run_talk(
+            interaction, "가" * 2_500, None, "gpt-5.6-terra", "none",
+            "light", config.LIMIT_LIGHT,
+        )
+
+        sent = [args[0] for args, _ in interaction.followup.messages]
+        self.assertTrue(all(len(message) <= 2_000 for message in sent))
+        self.assertIn("응답", sent[-1])
+
+    async def test_transport_failure_does_not_commit_invisible_history(self):
+        interaction = FakeInteraction(channel_id=1)
+        interaction.followup = RecordingFollowup(fail_on_call=1)
+
+        async def response(**kwargs):
+            return SimpleNamespace(
+                output_text="provider reply",
+                model="gpt-5.6-terra",
+                usage=SimpleNamespace(
+                    input_tokens=1, output_tokens=1, total_tokens=2
+                ),
+            )
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=response)
+        )
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "user text", None, "gpt-5.6-terra", "none",
+                "light", config.LIMIT_LIGHT,
+            )
+
+        session = self.cog.get_session(1)
+        self.assertEqual(
+            [item["role"] for item in session.history], ["system"]
         )
 
 class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -1309,12 +1376,30 @@ class PanelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             drop_panel_locks(1)
             drop_panel_locks(2)
 
+    def test_panel_channel_requires_every_runtime_permission(self):
+        guild = _SetupGuild()
+        channel = _SetupChannel(1, "party", read_message_history=False)
+
+        self.assertFalse(panel_module.is_sendable_panel_channel(guild, channel))
+
 
 class _SetupChannel:
-    def __init__(self, channel_id, name):
+    type = discord.ChannelType.text
+
+    def __init__(self, channel_id, name, **permission_overrides):
         self.id = channel_id
         self.name = name
         self.mention = f"<#{channel_id}>"
+        self.permissions = {
+            "view_channel": True,
+            "send_messages": True,
+            "read_message_history": True,
+            "embed_links": True,
+            **permission_overrides,
+        }
+
+    def permissions_for(self, member):
+        return SimpleNamespace(**self.permissions)
 
 
 class _SetupGuild:
@@ -1495,6 +1580,53 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
             await GuildSettingsCog._party_channel.callback(cog, interaction, explicit)
             self.assertIn("지정했습니다", interaction.followup.messages[0][0][0])
             self.assertEqual(settings.get_party_channel(guild.id), explicit.id)
+
+    async def test_party_channel_without_panel_permissions_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            guildsettings_cog.discord, "TextChannel", _SetupChannel
+        ):
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            channel = _SetupChannel(88, "blocked", read_message_history=False)
+            interaction = SimpleNamespace(
+                guild=guild,
+                guild_id=guild.id,
+                channel=channel,
+                response=RecordingResponse(),
+                followup=RecordingFollowup(),
+            )
+
+            await GuildSettingsCog._party_channel.callback(
+                cog, interaction, channel
+            )
+
+            self.assertIn("권한", interaction.response.messages[0][0][0])
+            self.assertIsNone(settings.get_party_channel(guild.id))
+
+    async def test_show_marks_a_stored_channel_that_can_no_longer_host_panels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            channel = _SetupChannel(88, "blocked", embed_links=False)
+            guild.channels[channel.id] = channel
+            settings.set_party_channel(guild.id, channel.id)
+            interaction = SimpleNamespace(
+                guild=guild,
+                guild_id=guild.id,
+                response=RecordingResponse(),
+            )
+
+            await GuildSettingsCog._show.callback(cog, interaction)
+
+            embed = interaction.response.messages[0][1]["embed"]
+            field = next(f for f in embed.fields if f.name == "파티 패널 채널")
+            self.assertIn("권한 부족", field.value)
 
     async def test_setup_completion_ensures_party_panels(self):
         party_calls = []
@@ -1730,6 +1862,31 @@ class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.sent, [])
         self.assertEqual(counter.counts, [])
 
+    async def test_send_failure_does_not_lose_the_moderation_count(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        message.channel.send = AsyncMock(side_effect=RuntimeError("send failed"))
+
+        with patch.object(forbiddenfilter_cog.logger, "exception"):
+            await cog.on_message(message)
+
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+    async def test_count_failure_does_not_suppress_the_channel_response(self):
+        counter = SimpleNamespace(
+            increment_forbidden_count=AsyncMock(
+                side_effect=RuntimeError("database failed")
+            )
+        )
+        cog = make_forbidden_cog(counter)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+
+        with patch.object(forbiddenfilter_cog.logger, "exception"):
+            await cog.on_message(message)
+
+        self.assertEqual(len(message.sent), 1)
+
 
 class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
     """배열(구형)과 객체(신형) 두 형태를 모두 받는다."""
@@ -1746,6 +1903,17 @@ class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((policy.words, policy.allow), (["시장"], ["시장님"]))
         self.assertEqual(policy.template, "{mention} 금지: {word}")
+
+    def test_terms_use_message_normalization_and_drop_duplicates(self):
+        policy = forbiddenfilter_cog.canonicalize_forbidden_policy(
+            {
+                "words": ["금지 어", "금지-어", "  "],
+                "allow": ["금지어가 들어간 멀쩡한 표현"],
+            }
+        )
+
+        self.assertEqual(policy.words, ["금지어"])
+        self.assertEqual(policy.allow, ["금지어가들어간멀쩡한표현"])
 
     def test_document_canonicalization_preserves_shape(self):
         self.assertEqual(
@@ -1765,6 +1933,35 @@ class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
                         {"words": [], "allow": "no"}, "string"):
             with self.subTest(document=invalid), self.assertRaises(ValueError):
                 forbiddenfilter_cog.canonicalize_forbidden_policy(invalid, strict=True)
+
+    def test_strict_bounds_terms_counts_and_rendered_template(self):
+        invalid_documents = (
+            {"words": ["x" * 101]},
+            {"words": [str(index) for index in range(1_001)]},
+            {"words": [], "allow": ["x" * 101]},
+            {"words": ["x"], "template": "{word}" * 21},
+        )
+
+        for document in invalid_documents:
+            with self.subTest(document=list(document)), self.assertRaises(ValueError):
+                forbiddenfilter_cog.canonicalize_forbidden_policy(
+                    document, strict=True
+                )
+
+    def test_runtime_drops_oversized_terms_and_uses_default_template(self):
+        with patch.object(forbiddenfilter_cog, "print") as warned:
+            policy = forbiddenfilter_cog.canonicalize_forbidden_policy(
+                {
+                    "words": ["정상", "x" * 101],
+                    "template": "z" * 2_001,
+                    "allow": ["y" * 101],
+                }
+            )
+
+        self.assertEqual(policy.words, ["정상"])
+        self.assertEqual(policy.allow, [])
+        self.assertEqual(policy.template, forbiddenfilter_cog.DEFAULT_TEMPLATE)
+        self.assertTrue(warned.called)
 
     async def test_template_substitutes_only_two_placeholders(self):
         counter = RecordingForbiddenCounts()
@@ -1806,6 +2003,27 @@ class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
 
         await cog.on_message(message)
 
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+    async def test_spaced_allow_phrase_beats_separator_obfuscation(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter,
+            document={
+                "words": ["금지 어"],
+                "allow": ["금지어가 들어간 멀쩡한 표현"],
+            },
+        )
+        allowed = FakeMessage(
+            "금지어가 들어간 멀쩡한 표현", guild_id=TEST_GUILD_ID
+        )
+        caught = FakeMessage("금-지 어", guild_id=TEST_GUILD_ID, channel_id=2)
+
+        await cog.on_message(allowed)
+        await cog.on_message(caught)
+
+        self.assertEqual(allowed.sent, [])
+        self.assertEqual(len(caught.sent), 1)
         self.assertEqual(counter.counts, [FakeUser.id])
 
 
@@ -1955,6 +2173,18 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackupConnectionTests(unittest.TestCase):
+    @staticmethod
+    def _backup_tree(root):
+        data = pathlib.Path(root) / "data"
+        backups = pathlib.Path(root) / "backups"
+        settings = pathlib.Path(root) / "settings"
+        SQLiteUsageRepository(data / "attendance_data.db")
+        SQLitePartyRepository(data / "party_data.db")
+        SQLiteGuildSettingsRepository(data / "guild_settings.db")
+        SQLiteProfileRepository(data / "profile_data.db")
+        settings.mkdir()
+        return data, backups, settings
+
     def test_backup_database_connections_are_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / "party.db"
@@ -1974,6 +2204,84 @@ class BackupConnectionTests(unittest.TestCase):
         self.assertFalse(
             [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
         )
+
+    def test_pre_manifest_failures_remove_every_published_backup_file(self):
+        fixed = datetime(2026, 8, 19, tzinfo=timezone.utc)
+        timestamp = "20260819T000000Z"
+        failures = ("hash", "manifest-write", "manifest-replace")
+
+        for failure in failures:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                data, backups, settings = self._backup_tree(root)
+                real_replace = backup.os.replace
+
+                def replace(source, destination):
+                    if failure == "manifest-replace" and str(destination).endswith(
+                        "-manifest.json"
+                    ):
+                        raise OSError("manifest replace failed")
+                    return real_replace(source, destination)
+
+                patches = [
+                    patch.object(backup, "DATA_DIR", data),
+                    patch.object(backup, "BACKUP_DIR", backups),
+                    patch.object(backup, "SETTINGS_DIR", settings),
+                    patch.object(backup.os, "replace", side_effect=replace),
+                ]
+                if failure == "hash":
+                    patches.append(
+                        patch.object(
+                            backup, "_sha256", side_effect=OSError("hash failed")
+                        )
+                    )
+                if failure == "manifest-write":
+                    patches.append(
+                        patch.object(
+                            backup.json, "dump", side_effect=OSError("write failed")
+                        )
+                    )
+
+                with contextlib.ExitStack() as stack:
+                    for configured in patches:
+                        stack.enter_context(configured)
+                    with self.assertRaises(OSError):
+                        backup.create_backup_set(fixed)
+
+                self.assertEqual(list(backups.glob(f"{timestamp}-*")), [])
+
+    def test_post_manifest_fsync_failure_keeps_a_complete_backup_set(self):
+        fixed = datetime(2026, 8, 19, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as root:
+            data, backups, settings = self._backup_tree(root)
+            real_replace = backup.os.replace
+            real_fsync_directory = backup._fsync_directory
+            manifest_published = False
+
+            def replace(source, destination):
+                nonlocal manifest_published
+                result = real_replace(source, destination)
+                if str(destination).endswith("-manifest.json"):
+                    manifest_published = True
+                return result
+
+            def fsync_directory(path):
+                if manifest_published:
+                    raise OSError("post-publication fsync failed")
+                return real_fsync_directory(path)
+
+            with patch.object(backup, "DATA_DIR", data), patch.object(
+                backup, "BACKUP_DIR", backups
+            ), patch.object(backup, "SETTINGS_DIR", settings), patch.object(
+                backup.os, "replace", side_effect=replace
+            ), patch.object(
+                backup, "_fsync_directory", side_effect=fsync_directory
+            ):
+                with self.assertRaises(OSError):
+                    backup.create_backup_set(fixed)
+
+            manifest = backups / "20260819T010000Z-manifest.json"
+            self.assertTrue(manifest.exists())
+            self.assertEqual(set(backup.verify_backup_set(manifest)), set(backup.DATABASES))
 
 
 class SettingsLoaderTest(unittest.TestCase):
@@ -2152,6 +2460,20 @@ class PersonaExternalizationTest(unittest.TestCase):
 
         self.assertIn("히아킨", cog.system_prompt)
         self.assertIn("회색둥이 씨", cog.system_prompt)
+
+    def test_persona_field_limits_reject_saves_and_fallback_at_runtime(self):
+        invalid = {
+            "system_prompt": "p" * 16_001,
+            "greeting": "g" * 1_975,
+        }
+
+        with self.assertRaises(ValueError):
+            config._validate_settings_document("persona.json", invalid)
+        with patch.object(hyacine_chat_cog, "print") as warned:
+            persona = hyacine_chat_cog.canonicalize_persona(invalid)
+
+        self.assertEqual(persona, hyacine_chat_cog.DEFAULT_PERSONA)
+        self.assertTrue(warned.called)
 
     def test_constructors_take_no_nickname(self):
         with self.assertRaises(TypeError):
@@ -2608,6 +2930,44 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.fetch("hsr", f"80000{index:04d}")
         self.assertLessEqual(len(service._cache), game_profile.CACHE_MAX_ENTRIES)
 
+    async def test_art_cache_is_bounded_by_bytes_and_cleared_on_close(self):
+        class ArtResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.content = SimpleNamespace(read=AsyncMock(return_value=payload))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class ArtSession:
+            def __init__(self):
+                self.closed = False
+
+            def get(self, url):
+                return ArtResponse(url.encode() * 3)
+
+            async def close(self):
+                self.closed = True
+
+        service = game_profile.ProfileService()
+        session = ArtSession()
+        service._art_session = session
+
+        with patch.object(game_profile, "ART_CACHE_MAX_BYTES", 10):
+            await service.fetch_art("aa")
+            await service.fetch_art("bb")
+
+        self.assertEqual(list(service._art), ["bb"])
+        self.assertEqual(service._art_bytes, 6)
+        await service.close()
+        self.assertEqual(service._art, {})
+        self.assertEqual(service._art_bytes, 0)
+        self.assertTrue(session.closed)
+
     async def test_close_releases_the_client(self):
         service, client = self._service([_showcase()])
         await service.fetch("hsr", "800333171")
@@ -2742,18 +3102,38 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("module.webadmin_cog", names)
         self.assertNotIn("module.hyacine_chat_cog", names)
 
-    async def test_fixed_loopback_bind_and_idempotent_cleanup(self):
+    async def test_web_admin_defaults_to_loopback_and_accepts_container_bind(self):
         runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
         site = SimpleNamespace(start=AsyncMock())
         cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
-        with patch.object(webadmin_cog.web, "AppRunner", return_value=runner), patch.object(
-            webadmin_cog.web, "TCPSite", return_value=site
-        ) as site_factory:
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            webadmin_cog.web, "AppRunner", return_value=runner
+        ), patch.object(webadmin_cog.web, "TCPSite", return_value=site) as site_factory:
             await cog.start()
             site_factory.assert_called_once_with(runner, "127.0.0.1", 8080)
             await cog.cog_unload()
             await cog.close()  # bot close after extension unload
         runner.cleanup.assert_awaited_once()
+
+        container_runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+        container_site = SimpleNamespace(start=AsyncMock())
+        container_cog = webadmin_cog.WebAdminCog(
+            _WebBot(), _WebSettingsRepository()
+        )
+        with patch.dict(os.environ, {"WEB_ADMIN_HOST": "0.0.0.0"}, clear=True), patch.object(
+            webadmin_cog.web, "AppRunner", return_value=container_runner
+        ), patch.object(
+            webadmin_cog.web, "TCPSite", return_value=container_site
+        ) as site_factory:
+            await container_cog.start()
+            site_factory.assert_called_once_with(container_runner, "0.0.0.0", 8080)
+            await container_cog.close()
+
+    async def test_web_admin_rejects_unsupported_bind_host(self):
+        cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
+        with patch.dict(os.environ, {"WEB_ADMIN_HOST": "192.0.2.1"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "WEB_ADMIN_HOST"):
+                await cog.start()
 
     async def test_bot_close_cleans_runner_before_isolated_superclass_close(self):
         events = []
@@ -2928,7 +3308,7 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
             self.assertEqual(forbiddenfilter_cog.load_forbidden_words(), ["1", "word"])
         self.assertEqual(
             forbiddenfilter_cog.canonicalize_forbidden_words([1, {}, ""]),
-            ["1", "{}"],
+            ["1"],
         )
         for name, invalid in (
             ("persona.json", []),
@@ -3362,27 +3742,26 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         for name in config.SETTINGS_FILES:
             self.assertIn(name, page)
 
-    async def test_percent_encoded_korean_settings_within_file_limit_are_accepted(self):
-        """form body 한도가 파일 한도보다 작아서 저장이 막히면 안 된다."""
+    async def test_percent_encoded_transport_padding_does_not_expand_field_limits(self):
+        """전송 한도와 실제 설정 필드 한도는 서로 독립적이다."""
         _, csrf = await self._login()
-        # UTF-8 3바이트 문자는 percent-encoding에서 9자로 늘어난다. 파일 한도의
-        # 3분의 1을 넘는 한글 문서는 옛 한도(= 파일 한도)에서 413으로 막혔다.
-        prompt = "가" * (config.MAX_SETTINGS_BYTES // 6)
-        document = {"system_prompt": prompt, "greeting": "안녕"}
-        self.assertGreater(
-            len(json.dumps(document, ensure_ascii=False).encode()) * 3,
-            config.MAX_SETTINGS_BYTES,
-        )
+        padding = "가" * (config.MAX_SETTINGS_BYTES // 6)
+        self.assertGreater(len(padding) * 9, config.MAX_SETTINGS_BYTES)
         response = await self.client.post(
             "/settings/persona.json",
-            data={"csrf": csrf, "system_prompt": prompt, "greeting": "안녕"},
+            data={
+                "csrf": csrf,
+                "system_prompt": "prompt",
+                "greeting": "안녕",
+                "padding": padding,
+            },
         )
         self.assertEqual(response.status, 200)
         self.assertIn("새 AI 세션부터 적용", await response.text())
         saved = json.loads(
             (self.settings_dir / "persona.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(saved["system_prompt"], prompt)
+        self.assertEqual(saved["system_prompt"], "prompt")
 
     async def test_persona_form_round_trips_quotes_and_newlines_without_json_escaping(self):
         """persona는 값만 입력받는다. JSON 이스케이프는 운영자 몫이 아니다."""
@@ -3437,6 +3816,7 @@ class _AnnouncementChannel:
         return SimpleNamespace(
             view_channel=self.allowed,
             send_messages=self.allowed,
+            read_message_history=self.allowed,
             embed_links=self.allowed,
         )
 
@@ -3608,14 +3988,14 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         await self._login()
         self.repository.guild_ids = [1]
         self.repository.channels = {1: 11, 2: 22}
-        party = SimpleNamespace(name="🎮-파티")
+        party = _AnnouncementChannel(allowed=False, name="🎮-파티")
         self.bot.guilds = [
             _AnnouncementGuild({11: party}, 1, "공지 켠 길드"),
             _AnnouncementGuild({}, 2, "<공지 끈 길드>"),
         ]
         page = await (await self.client.get("/")).text()
 
-        self.assertIn("#🎮-파티", page)
+        self.assertIn("#🎮-파티 (권한 부족)", page)
         # 길드 2는 party_channel_id 22가 있지만 채널이 사라졌다.
         self.assertIn("삭제됨 (22)", page)
         self.assertIn('<option value="1">공지 켠 길드</option>', page)
