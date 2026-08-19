@@ -122,9 +122,9 @@ def _validate_settings_document(name: str, document: object) -> object:
         canonicalize_persona(document, strict=True)
         return document
     elif name == "forbidden_words.json":
-        from module.forbiddenfilter_cog import canonicalize_forbidden_words
+        from module.forbiddenfilter_cog import canonicalize_forbidden_document
 
-        return canonicalize_forbidden_words(document, strict=True)
+        return canonicalize_forbidden_document(document, strict=True)
     elif name == "games.json":
         _canonicalize_games(document, strict=True)
         return document
@@ -282,7 +282,7 @@ def validate_config() -> None:
     """부팅을 막을 값만 검사한다.
 
     AI 키는 필수가 아니다. 없으면 main.py가 해당 확장을 로드하지 않을 뿐이고,
-    파티·이벤트·주가만 쓰려는 운영자가 결제를 붙일 이유가 없다.
+    파티·이벤트만 쓰려는 운영자가 결제를 붙일 이유가 없다.
     """
     if not DISCORD_TOKEN:
         raise RuntimeError("필수 환경변수가 없습니다: DISCORD_TOKEN")

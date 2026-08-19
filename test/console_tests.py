@@ -3,14 +3,11 @@
 #
 # 검증 항목:
 #   1. SQLite 마이그레이션 (구버전 users 테이블에 luckybox 컬럼 추가)
-#   2. deduct_points 원자성 (동시 차감 시 잔액이 음수가 되지 않음)
-#   3. 포인트 원장 (모든 이동 기록, 실패한 차감은 미기록)
 #   4. PartyRepository CRUD (파티 생성/참가/탈퇴/만료 정리)
 #   5. Repository 팩토리 (sqlite 선택, 미지원 백엔드 거부)
-#   6. AttendanceCog 파사드 (Repository 주입 및 위임)
+#   6. UsageCog 파사드 (Repository 주입 및 위임)
 #   7. 채널별 대화 세션 분리 (히스토리 독립)
 #   8. 전체 모듈 import 스모크 테스트
-#   9. 음악 core·영속 패널 계약
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
@@ -46,13 +43,14 @@ os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
 
 import module.database as database
 from module.database import (
-    SQLiteAttendanceRepository,
+    SQLiteUsageRepository,
     SQLitePartyRepository,
     SQLiteGuildSettingsRepository,
-    create_attendance_repository,
+    SQLiteProfileRepository,
+    create_usage_repository,
     create_party_repository,
 )
-from module.attendance_cog import AttendanceCog
+from module.usage_cog import UsageCog
 from module.hyacine_chat_cog import HyacineChatCog
 
 PASS = 0
@@ -88,7 +86,7 @@ def _create_legacy_attendance_db(path: pathlib.Path, version: int = 1) -> None:
                 reason TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 3);
             INSERT INTO point_ledger
                 (guild_id, user_id, delta, reason, created_at)
                 VALUES (7, 8, 9000, 'attendance', 1);
@@ -258,6 +256,7 @@ def test_public_env_contract():
         "LIMIT_LIGHT",
         "LIMIT_DEEP",
         "LIMIT_IMAGE",
+        "CARD_FONT_PATH",
     }
     check("공개 env 변수 계약", set(example) == expected)
     check("관리 토큰 env 예제는 빈 값", example["ADMIN_TOKEN"] == "")
@@ -345,7 +344,7 @@ def test_readme_public_distribution_contract():
         "provider 계정에도 예산 상한",
         "Docker Compose를 권장",
         "launchd 선택 사항",
-        "포인트·출석·금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`",
+        "금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`",
         "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
         "`Manage Guild` 권한",
     )
@@ -372,11 +371,9 @@ def test_operations_document_contract():
         and 'cmp -s "$staged" "settings/$name"' in restore,
     )
     check("복구 문서에 긴 DB 수리 one-liner 없음", "verify_database" not in restore)
-    check("원장 예시에 길드 ID 포함", "repo.get_ledger(GUILD_ID, USER_ID" in operations)
-    check("잔액 예시에 길드 ID 포함", "repo.get_points(GUILD_ID, USER_ID)" in operations)
     check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
     check("AI 한도는 KST 자정 리셋", "매일 KST 자정에 리셋" in operations)
-    check("AI 한도는 포인트와 별도", "포인트와 별도로 적용" in operations)
+    check("AI 한도는 명령별로 적용", "명령별로 적용" in operations)
     check("provider 계정 예산 안전망 유지", "OpenAI 계정 예산 한도" in operations)
 
 
@@ -455,13 +452,15 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "현재 설정과 영속 panel 명령 block 유지",
-        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`, `/설정 음악채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
+        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
     )
     check(
-        "channel과 voice permission block 유지",
-        """- `Manage Channels` — 봇 전용 category와 파티·음악 채널 생성
-- `Connect`
-- `Speak`""" in quick_start,
+        "channel permission block 유지",
+        "- `Manage Channels` — 봇 전용 category와 파티 채널 생성" in quick_start,
+    )
+    check(
+        "voice permission은 더 이상 요구하지 않음",
+        "`Connect`" not in quick_start and "`Speak`" not in quick_start,
     )
     check(
         "웹 관리는 선택 token·고정 loopback·unsupported remote 경계",
@@ -476,14 +475,12 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
     )
     check(
-        "음악 선택 의존성과 exact yt-dlp 갱신 절차",
-        "`PyNaCl` 또는 `yt-dlp` 의존성이 없으면 음악 extension만 건너뛰고 나머지 봇은 계속 동작합니다." in readme
-        and ".venv/bin/python -m pip install --upgrade yt-dlp" in readme
-        and "docker compose build --no-cache bot && docker compose up -d --no-deps bot" in readme,
-    )
-    check(
-        "MIT와 무기여 정책을 유지",
-        "MIT License" in readme and "사용자 기여를 받지 않습니다" in readme,
+        "GPL-3.0과 무기여 정책을 유지",
+        "GNU General Public License v3.0" in readme
+        and "사용자 기여를 받지 않습니다" in readme
+        and "GNU GENERAL PUBLIC LICENSE" in (PROJECT_ROOT / "LICENSE").read_text(
+            encoding="utf-8"
+        ),
     )
     check(
         "사용자 문서에 폐기된 파티 명령·설정 열 없음",
@@ -500,8 +497,8 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         ),
     )
     check(
-        "백업은 세 DB와 존재한 세 settings를 exact same manifest로 설명",
-        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+        "백업은 네 DB와 존재한 세 settings를 exact same manifest로 설명",
+        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
     )
     check(
         "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
@@ -603,11 +600,13 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     bot_service = compose.split("  bot:", 1)[1].split("\n  backup:", 1)[0]
     backup_service = compose.split("\n  backup:", 1)[1]
     check(
-        "Compose service별 settings mode와 no ports 구조",
+        "Compose service별 settings mode와 loopback 전용 port 구조",
         "      - ./settings:/app/settings\n" in bot_service
         and "      - ./settings:/app/settings:ro\n" not in bot_service
         and "      - ./settings:/app/settings:ro\n" in backup_service
-        and "ports:" not in bot_service
+        # host 쪽 bind를 빠뜨리면 web admin이 모든 interface에 열린다.
+        and '      - "127.0.0.1:8080:8080"\n' in bot_service
+        and "0.0.0.0" not in bot_service
         and "ports:" not in backup_service,
     )
     expected_healthcheck = (
@@ -617,8 +616,14 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
     )
     check(
-        "Docker runtime은 exact ffmpeg install과 main healthcheck",
-        "apt-get install -y --no-install-recommends ffmpeg" in dockerfile
+        # apt는 프로필 카드용 CJK 폰트 하나에만 허용한다. healthcheck는 여전히
+        # 순수 Python이어야 한다 — curl 같은 것을 넣으려고 apt를 여는 게 아니다.
+        "Docker runtime은 폰트 외 apt 없이 main healthcheck",
+        [
+            line for line in dockerfile.splitlines() if "apt-get install" in line
+        ] == ["    && apt-get install --no-install-recommends -y fonts-noto-cjk \\"]
+        and "apt-get clean" not in dockerfile
+        and "rm -rf /var/lib/apt/lists/*" in dockerfile
         and expected_healthcheck in dockerfile
         and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
     )
@@ -752,8 +757,13 @@ def test_deployment_contracts():
             ),
         )
         check(
-            "Compose는 web port를 publish하지 않음",
-            all(not service.get("ports") for service in (bot, backup)),
+            "Compose web port는 host loopback에만 publish",
+            not backup.get("ports")
+            and [
+                (port.get("host_ip"), str(port.get("published")), port.get("target"))
+                for port in bot.get("ports", [])
+            ]
+            == [("127.0.0.1", "8080", 8080)],
         )
         check(
             "Compose 로그 크기 제한",
@@ -965,7 +975,7 @@ def test_forbidden_words_load_logs_to_stdout():
 
     check(
         "금지어 로드 로그가 stdout에 기록",
-        output.getvalue().strip() == "📥 금지어 1개 로드",
+        output.getvalue().strip() == "📥 금지어 1개 로드 (허용 0개)",
     )
 
 
@@ -1077,9 +1087,11 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
 
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
-            if extension == "module.attendance_cog":
-                SQLiteAttendanceRepository(attendance_path)
+            if extension == "module.usage_cog":
+                SQLiteUsageRepository(attendance_path)
                 events.append("migrate:attendance")
+            if extension == "module.profile_cog":
+                SQLiteProfileRepository(data_dir / "profile_data.db")
 
     with patch.object(main, "DATA_DIR", data_dir):
         try:
@@ -1096,15 +1108,18 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        points = conn.execute(
-            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        forbidden = conn.execute(
+            "SELECT forbidden_count FROM users WHERE guild_id = 7 AND user_id = 8"
         ).fetchone()
+        user_columns = {row[1] for row in conn.execute('PRAGMA table_info("users")')}
     check("legacy attendance startup reaches repository migration", started)
     check(
         "startup migration precedes sync and preserves data",
-        version == 2
+        version == 3
         and "ai_usage" in tables
-        and points == (9000,)
+        and "point_ledger" not in tables
+        and not {"points", "last_attendance_date"} & user_columns
+        and forbidden == (3,)
         and "migrate:attendance" in events
         and events.index("migrate:attendance") < events.index("sync"),
         f"(version={version}, events={events})",
@@ -1295,9 +1310,8 @@ def test_backup_reads_wal_without_writer():
         data_dir = pathlib.Path(directory) / "data"
         data_dir.mkdir()
         source = data_dir / "attendance_data.db"
-        repo = SQLiteAttendanceRepository(source)
-        repo = _bind(repo)
-        repo.add_points(1, 10)
+        repo = SQLiteUsageRepository(source)
+        repo.increment_forbidden_count(_TEST_GUILD, 1)
         del repo  # 쓰기 연결 없음 = 봇 정지 상태
         gc.collect()
 
@@ -1308,69 +1322,10 @@ def test_backup_reads_wal_without_writer():
         target = pathlib.Path(directory) / "copy.db"
         backup._backup_one(source, target)
         with closing(sqlite3.connect(target)) as conn:
-            points = conn.execute("SELECT points FROM users WHERE user_id = 1").fetchone()
-        check("쓰기 프로세스 없이도 백업 가능", points == (10,), f"({points})")
-
-
-def test_luckybox_removed():
-    print("\n[0] 럭키박스 제거")
-    import module.attendance_cog as attendance_cog
-
-    check(
-        "play_luckybox 인터페이스 제거",
-        not hasattr(database.AttendanceRepository, "play_luckybox"),
-    )
-    names = {c.name for c in AttendanceCog(bot=None).get_app_commands()}
-    check("럭키박스 명령 제거", "럭키박스" not in names, f"({sorted(names)})")
-
-    repo = SQLiteAttendanceRepository(_TMP_DIR / "luckybox_columns.db")
-    repo = _bind(repo)
-    with closing(sqlite3.connect(repo.db_path)) as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
-    check(
-        "럭키박스 컬럼 완전 제거",
-        not {"luckybox_count", "last_luckybox_date"} & columns,
-        f"({sorted(columns)})",
-    )
-    check(
-        "출석 외 통화 발행 없음",
-        "add_points" not in inspect.getsource(attendance_cog.AttendanceCog._attend.callback),
-    )
-
-
-def test_point_ledger():
-    print("\n[0] 포인트 원장")
-    with tempfile.TemporaryDirectory() as directory:
-        repo = SQLiteAttendanceRepository(pathlib.Path(directory) / "a.db")
-        repo = _bind(repo)
-        repo.add_points(1, 500, reason="attendance")
-        check(
-            "차감 실패는 원장에 남기지 않음",
-            repo.deduct_points(1, 9_999, reason="image") is False,
-        )
-        check("차감 성공", repo.deduct_points(1, 200, reason="image") is True)
-        repo.add_points(1, 200, reason="image_refund")
-
-        entries = repo.get_ledger(1, limit=10)
-        check("모든 성공 이동이 기록됨", len(entries) == 3, f"({entries})")
-        check(
-            "원장 합계가 잔액과 일치",
-            sum(delta for delta, _, _ in entries) == repo.get_points(1),
-        )
-        check(
-            "실패한 차감은 기록되지 않음",
-            all(reason != "image" or delta == -200 for delta, reason, _ in entries),
-        )
-        check(
-            "출석 지급도 원장에 기록",
-            repo.claim_attendance(2, 7_000, "2026-07-30") == 7_000
-            and repo.get_ledger(2) == [(7_000, "attendance", repo.get_ledger(2)[0][2])],
-        )
-        check(
-            "중복 출석은 원장에 기록되지 않음",
-            repo.claim_attendance(2, 7_000, "2026-07-30") is None
-            and len(repo.get_ledger(2)) == 1,
-        )
+            counted = conn.execute(
+                "SELECT forbidden_count FROM users WHERE user_id = 1"
+            ).fetchone()
+        check("쓰기 프로세스 없이도 백업 가능", counted == (1,), f"({counted})")
 
 
 def test_guild_isolation():
@@ -1381,26 +1336,20 @@ def test_guild_isolation():
 
     data_dir = _TMP_DIR / "guild-isolation"
     data_dir.mkdir(exist_ok=True)
-    points = database.SQLiteAttendanceRepository(data_dir / "a.db")
+    usage = database.SQLiteUsageRepository(data_dir / "a.db")
     parties = database.SQLitePartyRepository(data_dir / "p.db")
     settings = database.SQLiteGuildSettingsRepository(data_dir / "s.db")
+    profiles = database.SQLiteProfileRepository(data_dir / "g.db")
 
     A, B, USER = 1001, 1002, 7
-    # 같은 사람이 서버마다 별도 잔액을 갖는다. 경계는 코드가 아니라 스키마가 만든다.
-    points.add_points(A, USER, 500, "t")
-    points.add_points(B, USER, 900, "t")
-    check("포인트는 서버별로 분리", (points.get_points(A, USER), points.get_points(B, USER)) == (500, 900))
-    check("차감은 해당 서버만", points.deduct_points(A, USER, 500, "t") and points.get_points(B, USER) == 900)
-    check("랭킹은 자기 서버만", points.get_top_rankings(B) == [(USER, 900)])
-
-    # 출석은 서버마다 따로 받는다.
-    check("A서버 출석", points.claim_attendance(A, USER, 10, "2026-07-31") is not None)
-    check("A서버 재출석 거부", points.claim_attendance(A, USER, 10, "2026-07-31") is None)
-    check("B서버는 여전히 출석 가능", points.claim_attendance(B, USER, 10, "2026-07-31") is not None)
-
-    # 금지어 카운트도 서버별.
-    points.increment_forbidden_count(A, USER)
-    check("금지어 카운트 분리", (points.get_forbidden_count(A, USER), points.get_forbidden_count(B, USER)) == (1, 0))
+    # 같은 사람이 서버마다 별도 카운트를 갖는다. 경계는 코드가 아니라 스키마가 만든다.
+    usage.increment_forbidden_count(A, USER)
+    usage.increment_forbidden_count(A, USER)
+    usage.increment_forbidden_count(B, USER)
+    check(
+        "금지어 카운트는 서버별로 분리",
+        (usage.get_forbidden_count(A, USER), usage.get_forbidden_count(B, USER)) == (2, 1),
+    )
 
     # 파티: 같은 게임을 서버마다 독립적으로 연다.
     check("같은 게임을 두 서버가 각각 생성", parties.create_party(A, "PUBG", 1) and parties.create_party(B, "PUBG", 1))
@@ -1415,18 +1364,59 @@ def test_guild_isolation():
     settings.set_party_channel(A, 333)
     check("설정 분리", settings.get_party_channel(A) == 333 and settings.get_party_channel(B) is None)
 
-    # 봇이 서버에서 제거되면 그 서버 것만 지운다.
-    for repo in (points, parties, settings):
-        repo.delete_guild(A)
-    check("제거된 서버 데이터 삭제", points.get_points(A, USER) == 0 and parties.get_party(A, "PUBG") is None
-          and settings.get_party_channel(A) is None)
-    check("다른 서버는 보존", points.get_points(B, USER) == 910 and parties.get_party(B, "PUBG") is not None)
+    # 두 번째 길드에 초대된 상황. 같은 사람이 서버마다 다른 계정을 등록하고,
+    # 한쪽에서만 금지어 필터를 꺼도 다른 쪽 동작은 그대로여야 한다.
+    settings.set_party_channel(B, 444)
+    settings.set_forbidden_filter_enabled(B, False)
+    profiles.set_uid(A, USER, "hsr", "800000001")
+    profiles.set_uid(B, USER, "hsr", "800000002")
+    profiles.set_uid(B, USER, "gi", "900000002")
+    check(
+        "두 번째 길드 설정·등록은 첫 길드와 독립",
+        settings.get_forbidden_filter_enabled(A) is True
+        and settings.get_forbidden_filter_enabled(B) is False
+        and settings.get_party_channel(A) == 333
+        and settings.get_party_channel(B) == 444
+        and profiles.get_uid(A, USER, "hsr") == "800000001"
+        and profiles.list_uids(B, USER) == {"hsr": "800000002", "gi": "900000002"},
+    )
 
-    # 스키마가 경계를 강제하는지 — 모든 기본키에 guild_id가 있어야 한다.
-    import sqlite3
-    with sqlite3.connect(data_dir / "a.db") as conn:
-        pk = [r[1] for r in conn.execute("PRAGMA table_info(users)") if r[5]]
-    check("users 기본키에 guild_id 포함", "guild_id" in pk, f"({pk})")
+    # 봇이 서버에서 제거되면 그 서버 것만 지운다.
+    for repo in (usage, parties, settings, profiles):
+        repo.delete_guild(A)
+    check("제거된 서버 데이터 삭제", usage.get_forbidden_count(A, USER) == 0 and parties.get_party(A, "PUBG") is None
+          and settings.get_party_channel(A) is None and profiles.list_uids(A, USER) == {})
+    check("다른 서버는 보존", usage.get_forbidden_count(B, USER) == 1 and parties.get_party(B, "PUBG") is not None
+          and profiles.get_uid(B, USER, "hsr") == "800000002")
+
+    check(
+        "이탈 후에도 두 번째 길드 설정 보존",
+        settings.get_party_channel(B) == 444
+        and settings.get_forbidden_filter_enabled(B) is False,
+    )
+
+    # 격리는 코드가 아니라 스키마가 만든다. 모든 테이블의 PK에 guild_id가 있어야 한다.
+    for repository in (usage, parties, settings, profiles):
+        with sqlite3.connect(repository.db_path) as conn:
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'"
+                )
+            ]
+            for table in tables:
+                columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                primary_key = {
+                    row[1] for row in conn.execute(f'PRAGMA table_info("{table}")') if row[5]
+                }
+                # ai_usage는 인스턴스 전역이라는 명시적 예외다.
+                if table == "ai_usage":
+                    continue
+                check(
+                    f"{repository.db_path.name}:{table} 기본키에 guild_id",
+                    "guild_id" in primary_key,
+                    f"({sorted(columns)})",
+                )
 
     check(
         "DM은 금지어 집계에서 제외",
@@ -1464,11 +1454,11 @@ def test_temp_image_lifecycle():
     fresh.unlink()
 
 
-def test_schema_initialization() -> SQLiteAttendanceRepository:
+def test_schema_initialization() -> SQLiteUsageRepository:
     print("\n[1] SQLite 스키마 초기화")
     db_path = _TMP_DIR / "attendance_schema.db"
 
-    repo = SQLiteAttendanceRepository(db_path)
+    repo = SQLiteUsageRepository(db_path)
 
     with closing(sqlite3.connect(db_path)) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -1479,17 +1469,16 @@ def test_schema_initialization() -> SQLiteAttendanceRepository:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
 
-    check("users 컬럼 구성", cols == {"guild_id", "user_id", "points",
-                                     "last_attendance_date", "forbidden_count"}, f"({cols})")
+    check("users 컬럼 구성", cols == {"guild_id", "user_id", "forbidden_count"}, f"({cols})")
     check("복합 기본키 (guild_id, user_id)", pk == ["guild_id", "user_id"], f"({pk})")
-    check("원장 테이블 생성", "point_ledger" in tables)
+    check("원장 테이블 없음", "point_ledger" not in tables)
     check("AI 사용량 테이블 생성", "ai_usage" in tables)
     check("AI 사용량은 guild_id 없이 전역", ai_cols == {"user_id", "usage_date", "command", "count"})
     check("AI 사용량 복합 기본키", ai_pk == ["user_id", "usage_date", "command"])
     check("폐기된 luckybox 컬럼 없음", not {"luckybox_count", "last_luckybox_date"} & cols)
 
     # 중복 실행해도 에러가 없어야 함 (멱등성)
-    SQLiteAttendanceRepository(db_path)
+    SQLiteUsageRepository(db_path)
     check("스키마 재생성 시 에러 없음 (멱등성)", True)
     return _bind(repo)
 
@@ -1504,16 +1493,16 @@ def test_schema_versions():
     attendance_path = _TMP_DIR / "attendance_version.db"
     party_path = _TMP_DIR / "party_version.db"
     settings_path = _TMP_DIR / "settings_version.db"
-    SQLiteAttendanceRepository(attendance_path)
+    SQLiteUsageRepository(attendance_path)
     SQLitePartyRepository(party_path)
     SQLiteGuildSettingsRepository(settings_path)
 
-    check("attendance 스키마 버전", _user_version(attendance_path) == 2)
+    check("usage 스키마 버전", _user_version(attendance_path) == 3)
     check("party 스키마 버전", _user_version(party_path) == 2)
-    check("settings 스키마 버전", _user_version(settings_path) == 2)
+    check("settings 스키마 버전", _user_version(settings_path) == 4)
 
     for label, repository in (
-        ("attendance", SQLiteAttendanceRepository),
+        ("attendance", SQLiteUsageRepository),
         ("party", SQLitePartyRepository),
         ("settings", SQLiteGuildSettingsRepository),
     ):
@@ -1530,11 +1519,11 @@ def test_schema_versions():
 
     with sqlite3.connect(attendance_path) as conn:
         conn.execute("PRAGMA user_version = 0")
-        conn.execute("INSERT INTO users VALUES (1, 2, 3, NULL, 0)")
-    SQLiteAttendanceRepository(attendance_path)
+        conn.execute("INSERT INTO users VALUES (1, 2, 4)")
+    SQLiteUsageRepository(attendance_path)
     check(
-        "무버전 attendance 데이터 보존",
-        SQLiteAttendanceRepository(attendance_path).get_points(1, 2) == 3,
+        "무버전 usage 데이터 보존",
+        SQLiteUsageRepository(attendance_path).get_forbidden_count(1, 2) == 4,
     )
 
     version_one_path = _TMP_DIR / "attendance_version_one.db"
@@ -1556,12 +1545,12 @@ def test_schema_versions():
                 reason TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            INSERT INTO users VALUES (7, 8, 9000, NULL, 0);
+            INSERT INTO users VALUES (7, 8, 9000, NULL, 5);
             PRAGMA user_version = 1;
         """)
-    migrated = SQLiteAttendanceRepository(version_one_path)
-    check("attendance v1에서 v2로 마이그레이션", _user_version(version_one_path) == 2)
-    check("attendance v1 포인트 보존", migrated.get_points(7, 8) == 9_000)
+    migrated = SQLiteUsageRepository(version_one_path)
+    check("usage v1에서 v3로 마이그레이션", _user_version(version_one_path) == 3)
+    check("usage v1 금지어 카운트 보존", migrated.get_forbidden_count(7, 8) == 5)
 
     with sqlite3.connect(party_path) as conn:
         conn.execute("PRAGMA user_version = 0")
@@ -1614,7 +1603,7 @@ def test_schema_versions():
         )
 
     for legacy_version in (0, 1):
-        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v2.db"
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v4.db"
         with sqlite3.connect(legacy_path) as conn:
             conn.execute(
                 "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
@@ -1624,7 +1613,10 @@ def test_schema_versions():
         SQLiteGuildSettingsRepository(legacy_path)
         with sqlite3.connect(legacy_path) as conn:
             row = conn.execute(
-                "SELECT party_channel_id, music_channel_id, music_panel_msg_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+                "SELECT party_channel_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+            ).fetchone()
+            forbidden_default = conn.execute(
+                "SELECT forbidden_filter_enabled FROM guild_settings WHERE guild_id = 7"
             ).fetchone()
             tables = {
                 item[0]
@@ -1641,30 +1633,105 @@ def test_schema_versions():
                 row[1] for row in sorted(panel_info, key=lambda row: row[5]) if row[5]
             )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        check(f"settings v{legacy_version} recruit 보존", row == (700, None, None, 0))
+        check(f"settings v{legacy_version} recruit 보존", row == (700, 0))
+        check(
+            f"settings v{legacy_version} 금지어 필터 기본 켜짐",
+            forbidden_default == (1,),
+        )
         check(f"settings v{legacy_version} party_panels 생성", "party_panels" in tables)
         check(
             f"settings v{legacy_version} 정확한 패널 스키마",
             guild_columns == (
                 "guild_id",
                 "party_channel_id",
-                "music_channel_id",
-                "music_panel_msg_id",
                 "allow_host_announce",
+                "forbidden_filter_enabled",
             )
             and panel_columns == ("guild_id", "game", "message_id")
             and panel_primary_key == ("guild_id", "game"),
         )
-        check(f"settings v{legacy_version} 버전", version == 2)
+        check(f"settings v{legacy_version} 버전", version == 4)
+
+    # v2(음악 컬럼 보유)와 v3(토글만 없음) 모두 v4로 올라오고, 기존 서버의
+    # 금지어 필터는 켜진 상태 그대로여야 한다. 마이그레이션이 조용히 동작을
+    # 바꾸면 안 된다.
+    settings_upgrade_schemas = {
+        2: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 800, 801, 1);
+        """,
+        3: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 1);
+            INSERT INTO party_panels VALUES (7, 'LOL', 900);
+        """,
+    }
+    for old_version, schema in settings_upgrade_schemas.items():
+        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v4.db"
+        with sqlite3.connect(upgrade_path) as conn:
+            conn.executescript(schema)
+            conn.execute(f"PRAGMA user_version = {old_version}")
+        repository = SQLiteGuildSettingsRepository(upgrade_path)
+        with sqlite3.connect(upgrade_path) as conn:
+            columns = tuple(
+                row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
+            )
+        check(
+            f"settings v{old_version}에서 v4로 마이그레이션",
+            _user_version(upgrade_path) == 4
+            and columns == (
+                "guild_id",
+                "party_channel_id",
+                "allow_host_announce",
+                "forbidden_filter_enabled",
+            ),
+            f"({_user_version(upgrade_path)}, {columns})",
+        )
+        check(
+            f"settings v{old_version} 기존 설정 보존",
+            repository.get_party_channel(7) == 700
+            and repository.get_allow_host_announce(7) is True,
+        )
+        check(
+            f"settings v{old_version} 금지어 필터는 켜진 채로 넘어옴",
+            repository.get_forbidden_filter_enabled(7) is True,
+        )
+
+    # 미등록 길드도 켜짐이 기본이다. 행이 없다고 필터가 꺼지면 안 된다.
+    toggle = SQLiteGuildSettingsRepository(_TMP_DIR / "settings_toggle.db")
+    check("미등록 길드 금지어 필터 기본 켜짐", toggle.get_forbidden_filter_enabled(11))
+    toggle.set_forbidden_filter_enabled(11, False)
+    check("금지어 필터 끄기 반영", toggle.get_forbidden_filter_enabled(11) is False)
+    toggle.set_forbidden_filter_enabled(11, True)
+    check("금지어 필터 다시 켜기 반영", toggle.get_forbidden_filter_enabled(11) is True)
+    check(
+        "금지어 필터 토글은 다른 길드에 번지지 않음",
+        toggle.get_forbidden_filter_enabled(12),
+    )
 
     malformed_schemas = {
         "extra guild_settings column": """
             CREATE TABLE guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1,
                 obsolete INTEGER
             )
         """,
@@ -1672,9 +1739,8 @@ def test_schema_versions():
             CREATE TABLE guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
-                allow_host_announce INTEGER NOT NULL DEFAULT 0
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE party_panels (
                 guild_id INTEGER NOT NULL,
@@ -1704,55 +1770,21 @@ def test_schema_versions():
     panels_after_upsert = settings.get_party_panels(7)
     settings.delete_party_panel(7, "LOL")
     settings.set_party_channel(7, 700)
-    settings.set_music_channel(7, 701)
-    settings.set_music_panel_msg(7, 702)
     settings.set_allow_host_announce(7, True)
     settings.set_allow_host_announce(8, True)
     settings.clear_channel(7, 701)
     check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
-    check("삭제된 음악 채널은 패널 메시지도 해제", settings.get_party_channel(7) == 700 and settings.get_music_channel(7) is None and settings.get_music_panel_msg(7) is None)
-    settings.set_music_channel(7, 701)
-    settings.set_music_panel_msg(7, 702)
+    check("무관한 채널 삭제는 파티 설정을 건드리지 않음", settings.get_party_channel(7) == 700)
     settings.clear_channel(7, 700)
-    check("삭제된 파티 채널은 음악 설정을 보존하고 해제", settings.get_party_channel(7) is None and settings.get_music_channel(7) == 701 and settings.get_music_panel_msg(7) == 702)
+    check("삭제된 파티 채널은 해제", settings.get_party_channel(7) is None)
     check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
     settings.delete_guild(7)
     check("길드 삭제는 설정과 party panel 정리", settings.get_party_panels(7) == {} and settings.get_party_channel(7) is None)
 
 
-def test_deduct_points_atomicity(repo: SQLiteAttendanceRepository):
-    print("\n[2] deduct_points 원자성")
-    user = 100
-    repo.add_points(user, 10_000)
-
-    check("잔액 부족 시 차감 거부", repo.deduct_points(user, 99_999) is False)
-    check("잔액 변동 없음", repo.get_points(user) == 10_000)
-    check("정상 차감 성공", repo.deduct_points(user, 3_000) is True)
-    check("차감 후 잔액 일치", repo.get_points(user) == 7_000)
-
-    # 동시 차감: 7,000 P 보유, 20개 스레드가 동시에 1,000 P씩 차감 시도
-    # -> 정확히 7번만 성공해야 하고 잔액은 0이어야 함
-    results = []
-    lock = threading.Lock()
-
-    def worker():
-        ok = repo.deduct_points(user, 1_000)
-        with lock:
-            results.append(ok)
-
-    threads = [threading.Thread(target=worker) for _ in range(20)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-
-    successes = sum(results)
-    final = repo.get_points(user)
-    check("동시 차감: 성공 횟수가 잔액과 정확히 일치 (7회)", successes == 7, f"(성공 {successes}회)")
-    check("동시 차감: 최종 잔액 0, 음수 아님", final == 0, f"(잔액 {final})")
-
-
 def test_ai_usage_atomicity():
     print("\n[2] AI 일일 사용량 원자성")
-    repo = SQLiteAttendanceRepository(_TMP_DIR / "ai_usage_atomicity.db")
+    repo = SQLiteUsageRepository(_TMP_DIR / "ai_usage_atomicity.db")
     user_id = 200
     usage_date = "2026-08-04"
     results = []
@@ -1782,49 +1814,6 @@ def test_ai_usage_atomicity():
     check("예약 반환 3회 성공", all(repo.release_ai_usage(user_id, usage_date, "light") for _ in range(3)))
     check("0에서 추가 반환 거부", repo.release_ai_usage(user_id, usage_date, "light") is False)
     check("사용량은 0 아래로 내려가지 않음", repo.get_ai_usage(user_id, usage_date, "light") == 0)
-
-
-def test_attendance_atomicity(repo: SQLiteAttendanceRepository):
-    print("\n[3] claim_attendance 원자성")
-    user_id = 150
-    results = []
-    errors = []
-    lock = threading.Lock()
-
-    def worker():
-        try:
-            result = repo.claim_attendance(user_id, 10_000, "2026-07-29")
-            with lock:
-                results.append(result)
-        except Exception as exc:
-            with lock:
-                errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(20)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    check(
-        "동시 출석 20개 호출 모두 정상 완료",
-        len(results) == len(threads) and not errors,
-        f"(완료 {len(results)}개, 예외 {errors})",
-    )
-    check("동시 출석은 정확히 한 번 성공", sum(result is not None for result in results) == 1)
-    check("동시 출석 포인트는 한 번만 지급", repo.get_points(user_id) == 10_000)
-
-    existing_user_id = 151
-    repo.add_points(existing_user_id, 5_000)
-    new_points = repo.claim_attendance(existing_user_id, 10_000, "2026-07-29")
-    check(
-        "기존 유저 출석은 reward만큼 증가",
-        new_points == 15_000 and repo.get_points(existing_user_id) == 15_000,
-    )
-
-    duplicate = repo.claim_attendance(existing_user_id, 99_999, "2026-07-29")
-    check("같은 날짜 순차 중복은 None", duplicate is None)
-    check("같은 날짜 순차 중복은 잔액 불변", repo.get_points(existing_user_id) == 15_000)
 
 
 def test_party_repository():
@@ -1946,9 +1935,9 @@ def test_persistent_party_panel_contract():
 def test_factory():
     print("\n[5] Repository 팩토리")
     # sqlite 백엔드 (기본값)
-    a_repo = create_attendance_repository()
+    a_repo = create_usage_repository()
     p_repo = create_party_repository()
-    check("sqlite 백엔드: AttendanceRepository 생성", isinstance(a_repo, SQLiteAttendanceRepository))
+    check("sqlite 백엔드: UsageRepository 생성", isinstance(a_repo, SQLiteUsageRepository))
     check("sqlite 백엔드: PartyRepository 생성", isinstance(p_repo, SQLitePartyRepository))
     check("DB 파일이 DATA_DIR 아래에 생성됨", a_repo.db_path.parent == _TMP_DIR.resolve())
 
@@ -1957,7 +1946,7 @@ def test_factory():
     database.DB_BACKEND = "oracle"
     try:
         try:
-            create_attendance_repository()
+            create_usage_repository()
             check("미지원 백엔드 거부 (NotImplementedError)", False)
         except NotImplementedError:
             check("미지원 백엔드 거부 (NotImplementedError)", True)
@@ -1966,26 +1955,17 @@ def test_factory():
 
 
 def test_cog_facade():
-    print("\n[6] AttendanceCog 파사드 (Repository 주입)")
-    raw = SQLiteAttendanceRepository(_TMP_DIR / "facade_test.db")
-    repo = _bind(raw)
-    cog = AttendanceCog(bot=None, repository=raw)
+    print("\n[6] UsageCog 파사드 (Repository 주입)")
+    raw = SQLiteUsageRepository(_TMP_DIR / "facade_test.db")
+    cog = UsageCog(bot=None, repository=raw)
     G = _TEST_GUILD
 
     # 파사드는 모두 async다. 동기 리포지토리를 스레드로 넘겨 이벤트 루프를 지킨다.
-    asyncio.run(cog.add_points(G, 42, 1_500))
-    check("add_points 위임", repo.get_points(42) == 1_500)
-    check("get_points 위임", asyncio.run(cog.get_points(G, 42)) == 1_500)
-    check(
-        "deduct_points 위임",
-        asyncio.run(cog.deduct_points(G, 42, 500)) is True and repo.get_points(42) == 1_000,
-    )
-
     asyncio.run(cog.increment_forbidden_count(G, 42))
     asyncio.run(cog.increment_forbidden_count(G, 42))
     check("forbidden_count 위임", asyncio.run(cog.get_forbidden_count(G, 42)) == 2)
     kst_now = datetime.datetime(2026, 8, 4, 23, 59, tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-    with patch("module.attendance_cog.datetime") as mocked_datetime:
+    with patch("module.usage_cog.datetime") as mocked_datetime:
         mocked_datetime.now.return_value = kst_now
         reservation = asyncio.run(cog.reserve_ai_usage(42, "light", 3))
         check("KST 날짜로 AI 사용량 예약", reservation == ("2026-08-04", 1))
@@ -1994,9 +1974,8 @@ def test_cog_facade():
     check(
         "파사드 전체가 코루틴",
         all(
-            inspect.iscoroutinefunction(getattr(AttendanceCog, name))
-            for name in ("get_points", "add_points", "deduct_points",
-                         "get_ledger", "reserve_ai_usage", "release_ai_usage",
+            inspect.iscoroutinefunction(getattr(UsageCog, name))
+            for name in ("reserve_ai_usage", "release_ai_usage",
                          "get_ai_usage", "increment_forbidden_count", "get_forbidden_count")
         ),
     )
@@ -2041,17 +2020,18 @@ def test_imports():
         "module.config",
         "module.database",
         "module.main",
-        "module.music_cog",
         "module.panel",
         "module.guildsettings_cog",
-        "module.attendance_cog",
+        "module.usage_cog",
         "module.playwith_cog",
         "module.eventnotice_cog",
         "module.forbiddenfilter_cog",
+        "module.greeting_cog",
+        "module.game_profile",
+        "module.profile_cog",
         "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
-        "module.finance_cog",
     ]
     for m in mods:
         try:
@@ -2061,87 +2041,40 @@ def test_imports():
             check(f"import {m}", False, f"({e})")
 
 
-def test_music_core_contract():
-    print("\n[9] 음악 core·영속 패널")
-    import module.main as bot_main
-    import module.music_cog as music_cog
+def test_repository_layer_is_the_only_sql_surface():
+    """SQL이 저장소 계층 밖으로 새지 않는지 AST로 고정한다.
 
-    declared = [
-        line.split("#")[0].strip()
-        for line in (PROJECT_ROOT / "requirements.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    declared = [line for line in declared if line]
-    check("PyNaCl은 1.5 이상 2 미만으로 고정", "PyNaCl>=1.5,<2" in declared)
-    check(
-        # 외부 사이트가 바뀌면 즉시 최신 yt-dlp로 올라갈 수 있어야 한다.
-        "yt-dlp는 상한도 exact pin도 없음",
-        [line for line in declared if line.lower().startswith("yt-dlp")] == ["yt-dlp"],
-    )
+    §8.4의 추상화는 이미 구현돼 있다. 이 테스트는 새로 만드는 게 아니라
+    깨지지 않게 못을 박는 것이다. 외부 DB로 교체할 때 고쳐야 할 파일이
+    database.py 하나로 유지된다는 뜻이기도 하다.
+    """
+    print("\n[9] 저장소 계층 밖 sqlite3 직접 사용 금지")
+    import ast
 
-    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    apt_packages = [
-        token
-        for token in dockerfile.split("apt-get install")[-1].split("&&")[0].split()
-        if not token.startswith("-") and token != "\\"
-    ]
-    check("Dockerfile은 distro 패키지로 ffmpeg만 설치", apt_packages == ["ffmpeg"])
-    check(
-        "apt cache를 이미지에 남기지 않음",
-        "rm -rf /var/lib/apt/lists/*" in dockerfile,
-    )
+    # database.py는 저장소 구현 본체. backup.py는 파일 단위 스냅샷이라 SQL이 아닌
+    # sqlite3 백업 API를 쓴다. export_legacy.py는 삭제된 컬럼을 읽는 일회성 도구로,
+    # 현재 스키마를 모르는 구버전 DB를 상대하므로 저장소를 경유할 수 없다.
+    allowed = {"database.py", "backup.py", "export_legacy.py"}
 
-    # 최상위(들여쓰기 0) import만 본다. `from yt_dlp import YoutubeDL`처럼 형태만 바꾼
-    # 회귀도 잡아야 하므로 문자열 하나가 아니라 import 줄 전체를 훑는다.
-    top_level_imports = [
-        line
-        for line in inspect.getsource(music_cog).splitlines()
-        if (line.startswith("import ") or line.startswith("from "))
-        and ("yt_dlp" in line or "nacl" in line)
-    ]
-    check(
-        "yt-dlp/PyNaCl은 최상위에서 import하지 않음 (미설치 환경에서도 import 가능)",
-        top_level_imports == [],
-        f"({top_level_imports})",
-    )
-    check(
-        "의존성 검사를 가진 확장은 음악뿐",
-        [name for name, _, dep in bot_main.EXTENSIONS if dep is not None]
-        == ["module.music_cog"],
-    )
+    for path in sorted((PROJECT_ROOT / "module").glob("*.py")):
+        if path.name in allowed:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        offenders = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                offenders.update(
+                    alias.name for alias in node.names if alias.name.split(".")[0] == "sqlite3"
+                )
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "sqlite3":
+                offenders.add(node.module)
+        check(f"{path.name}는 sqlite3를 import하지 않음", not offenders, f"({sorted(offenders)})")
 
-    with patch.object(music_cog, "find_spec", lambda name, *a, **k: None):
-        reason = music_cog.music_dependency_error()
+    # 예외 목록이 실재하는 파일만 담고 있어야 한다. 파일이 사라지면 구멍이 남는다.
     check(
-        "skip 사유에 빠진 package와 설치 안내 포함",
-        reason is not None
-        and "PyNaCl" in reason
-        and "yt-dlp" in reason
-        and "pip install" in reason,
-        f"({reason})",
+        "예외 목록의 파일이 모두 존재",
+        all((PROJECT_ROOT / "module" / name).exists() for name in allowed),
     )
-    with patch.object(music_cog, "find_spec", lambda name, *a, **k: object()):
-        check("의존성이 갖춰지면 skip 사유 없음", music_cog.music_dependency_error() is None)
-
-    view = music_cog.MusicPanelView(SimpleNamespace())
-    check("음악 패널 view는 persistent", view.is_persistent())
-    check(
-        "음악 패널 button custom_id 고정",
-        {item.custom_id for item in view.children}
-        == {"music:add", "music:skip", "music:pause", "music:stop", "music:remove"},
-    )
-    check("패널 queue 표시는 10곡", music_cog.MAX_QUEUE_DISPLAY == 10)
-    check("remove select는 25곡", music_cog.MAX_REMOVE_OPTIONS == 25)
-    check(
-        "패널 복구·렌더 interface 존재",
-        all(callable(getattr(music_cog.MusicCog, name, None)) for name in ("ensure_panel", "render_panel")),
-    )
-    source = inspect.getsource(music_cog)
-    check("주기적 음악 progress update 없음", "@tasks.loop" not in source)
-
-    # 재생 엔진의 동작 계약(상태 전이, ffmpeg option, 불변 track)은
-    # test_discord_commands.py의 MusicPlayerStateTests/MusicPanelTests가 실행해 검증한다.
 
 
 def test_backup_round_trip():
@@ -2150,17 +2083,21 @@ def test_backup_round_trip():
     backup.DATA_DIR = _TMP_DIR
     backup.BACKUP_DIR = _TMP_DIR / "backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
-    SQLiteAttendanceRepository(_TMP_DIR / "attendance_data.db").add_points(_TEST_GUILD, 77, 1234)
+    SQLiteUsageRepository(_TMP_DIR / "attendance_data.db").increment_forbidden_count(_TEST_GUILD, 77)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(_TMP_DIR / "guild_settings.db")
+    SQLiteProfileRepository(_TMP_DIR / "profile_data.db").set_uid(
+        _TEST_GUILD, 77, "hsr", "800333171"
+    )
 
     manifest = backup.create_backup_set()
     result = backup.verify_backup_set(manifest)
     check("출석 DB 백업 검증", result["attendance_data.db"]["users"] == 1)
     check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
+    check("프로필 DB 백업 검증", result["profile_data.db"]["game_uids"] == 1)
     backup.restore_test(manifest)
     check("백업 복구 테스트", True)
 
@@ -2176,9 +2113,10 @@ def test_settings_backup_round_trip():
         stage = root / "stage"
         data_dir.mkdir()
         settings_dir.mkdir()
-        SQLiteAttendanceRepository(data_dir / "attendance_data.db")
+        SQLiteUsageRepository(data_dir / "attendance_data.db")
         SQLitePartyRepository(data_dir / "party_data.db")
         SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+        SQLiteProfileRepository(data_dir / "profile_data.db")
         expected = {
             "persona.json": b'{"system_prompt":"p","greeting":"g"}\n',
             "forbidden_words.json": b'["x"]\n',
@@ -2502,6 +2440,10 @@ def test_legacy_backup_restore_and_prune():
         conn.commit()
     with closing(sqlite3.connect(party_path)) as conn:
         conn.execute("PRAGMA user_version = 0")
+    # profile_data.db는 구버전이 없다. 현재 스키마 그대로 함께 백업된다.
+    SQLiteProfileRepository(data_dir / "profile_data.db").set_uid(
+        _TEST_GUILD, 8, "hsr", "800333171"
+    )
     backup_dir.mkdir(parents=True)
 
     items = []
@@ -2601,12 +2543,15 @@ def test_legacy_backup_restore_and_prune():
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        points = conn.execute(
-            "SELECT points FROM users WHERE guild_id = 7 AND user_id = 8"
+        forbidden = conn.execute(
+            "SELECT forbidden_count FROM users WHERE guild_id = 7 AND user_id = 8"
         ).fetchone()
     check(
         "staged historical attendance migrates before installation",
-        version == 2 and "ai_usage" in tables and points == (9000,),
+        version == 3
+        and "ai_usage" in tables
+        and "point_ledger" not in tables
+        and forbidden == (3,),
     )
     staged_settings = stage / "guild_settings.db"
     with closing(sqlite3.connect(staged_settings)) as conn:
@@ -2622,7 +2567,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical settings migrates to the panel contract",
-        settings_version == 2
+        settings_version == 4
         and "party_panels" in settings_tables
         and party_channel == (700,),
     )
@@ -2692,13 +2637,14 @@ def test_invalid_retention_prevents_pruning():
         backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
         backup.BACKUP_INTERVAL_SECONDS = 21600
         backup.BACKUP_RETENTION_DAYS = 30
-        SQLiteAttendanceRepository(
+        SQLiteUsageRepository(
             backup.DATA_DIR / "attendance_data.db"
-        ).add_points(_TEST_GUILD, 1, 100)
+        ).increment_forbidden_count(_TEST_GUILD, 1)
         SQLitePartyRepository(
             backup.DATA_DIR / "party_data.db"
         ).create_party(_TEST_GUILD, "LOL", 2_000_000_000)
         SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+        SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
         created_at = datetime.datetime(
             2026,
             1,
@@ -3090,19 +3036,20 @@ def test_backup_same_timestamp_rejected():
     backup.DATA_DIR = _TMP_DIR / "collision_data"
     backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
-    attendance = SQLiteAttendanceRepository(
+    attendance = SQLiteUsageRepository(
         backup.DATA_DIR / "attendance_data.db"
     )
-    attendance.add_points(_TEST_GUILD, 1, 100)
+    attendance.increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
 
-    attendance.add_points(_TEST_GUILD, 2, 200)
+    attendance.increment_forbidden_count(_TEST_GUILD, 2)
     try:
         backup.create_backup_set(fixed)
         check("동일 시각 백업 충돌 거부", False)
@@ -3119,14 +3066,15 @@ def test_prune_requires_timestamp_bound_filenames():
     backup.BACKUP_DIR = _TMP_DIR / "retention_backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     backup.BACKUP_RETENTION_DAYS = 30
-    SQLiteAttendanceRepository(
+    SQLiteUsageRepository(
         backup.DATA_DIR / "attendance_data.db"
-    ).add_points(_TEST_GUILD, 1, 100)
+    ).increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(current)
     copied = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
@@ -3149,14 +3097,15 @@ def test_backup_publication_is_synced():
     backup.DATA_DIR = _TMP_DIR / "durability_data"
     backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
-    SQLiteAttendanceRepository(
+    SQLiteUsageRepository(
         backup.DATA_DIR / "attendance_data.db"
-    ).add_points(_TEST_GUILD, 1, 100)
+    ).increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     events = []
     synced_directories = []
     real_fsync = backup.os.fsync
@@ -3276,6 +3225,105 @@ def test_prune_skips_invalid_utf8_manifest():
     )
 
 
+def _sha256_file(path: pathlib.Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_legacy_export():
+    """삭제 예정 데이터 export가 원본을 건드리지 않고 전부 담아내는지."""
+    print("\n[N] 삭제 예정 데이터 export")
+    from module import export_legacy
+
+    root = _TMP_DIR / "legacy_export_src"
+    root.mkdir(parents=True, exist_ok=True)
+    attendance = root / "attendance_data.db"
+    settings_db = root / "guild_settings.db"
+    _create_legacy_attendance_db(attendance, version=2)
+    with closing(sqlite3.connect(attendance)) as conn:
+        conn.execute("INSERT INTO users VALUES (7, 99, 1234, '2026-08-17', 3)")
+        conn.commit()
+    with closing(sqlite3.connect(settings_db)) as conn:
+        conn.executescript("""
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                music_channel_id INTEGER,
+                music_panel_msg_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO guild_settings VALUES (7, 100, 200, 300, 1);
+            PRAGMA user_version = 2;
+        """)
+
+    before = (_sha256_file(attendance), _sha256_file(settings_db))
+    document = export_legacy.build_export(root)
+    sections = document["sections"]
+
+    check("스키마 버전 기록", document["schema_versions"]["attendance_data.db"] == 2)
+    check("users 2행 추출", len(sections["users"]) == 2, f"({sections['users']})")
+    check(
+        "포인트와 최종 출석일 보존",
+        {"guild_id": 7, "user_id": 99, "points": 1234,
+         "last_attendance_date": "2026-08-17"} in sections["users"],
+        f"({sections['users']})",
+    )
+    check("원장 추출", len(sections["point_ledger"]) == 1)
+    check("원장 사유 보존", sections["point_ledger"][0]["reason"] == "attendance")
+    check(
+        "음악 채널 설정 추출",
+        sections["music_settings"] == [
+            {"guild_id": 7, "music_channel_id": 200, "music_panel_msg_id": 300}
+        ],
+        f"({sections['music_settings']})",
+    )
+    check(
+        "export는 원본 DB를 수정하지 않음",
+        before == (_sha256_file(attendance), _sha256_file(settings_db)),
+    )
+
+    # 이미 마이그레이션이 끝난 DB — 사라진 것은 null, 남은 것은 그대로.
+    migrated = _TMP_DIR / "legacy_export_migrated"
+    migrated.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(migrated / "attendance_data.db")) as conn:
+        conn.executescript("""
+            CREATE TABLE users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                forbidden_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            PRAGMA user_version = 3;
+        """)
+    migrated_sections = export_legacy.build_export(migrated)["sections"]
+    check("마이그레이션 후 users는 null", migrated_sections["users"] is None)
+    check("마이그레이션 후 원장은 null", migrated_sections["point_ledger"] is None)
+    check("DB 파일이 없으면 null", migrated_sections["music_settings"] is None)
+
+    # 빈 디렉터리에서도 죽지 않는다.
+    empty = _TMP_DIR / "legacy_export_empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    check(
+        "DB가 하나도 없어도 동작",
+        all(
+            rows is None
+            for rows in export_legacy.build_export(empty)["sections"].values()
+        ),
+    )
+
+    destination = _TMP_DIR / "legacy_export_out" / "export.json"
+    export_legacy.write_export(destination, root)
+    written = json.loads(destination.read_text(encoding="utf-8"))
+    check("파일로 기록", written["sections"]["point_ledger"][0]["delta"] == 9000)
+    try:
+        export_legacy.write_export(destination, root)
+        clobbered = True
+    except FileExistsError:
+        clobbered = False
+    check("기존 export 파일을 덮어쓰지 않음", not clobbered)
+
+
 if __name__ == "__main__":
     try:
         test_config_paths()
@@ -3303,15 +3351,11 @@ if __name__ == "__main__":
         test_bot_disables_all_mentions()
         test_sqlite_busy_timeout()
         test_backup_reads_wal_without_writer()
-        test_point_ledger()
-        test_luckybox_removed()
         test_guild_isolation()
         test_temp_image_lifecycle()
         repo = test_schema_initialization()
         test_schema_versions()
-        test_deduct_points_atomicity(repo)
         test_ai_usage_atomicity()
-        test_attendance_atomicity(repo)
         test_party_repository()
         test_party_capacity_constraint()
         test_party_cog_uses_epoch_seconds()
@@ -3320,7 +3364,7 @@ if __name__ == "__main__":
         test_cog_facade()
         test_channel_sessions()
         test_imports()
-        test_music_core_contract()
+        test_repository_layer_is_the_only_sql_surface()
         test_backup_round_trip()
         test_settings_backup_round_trip()
         test_setting_source_inspection_failure_closes_descriptor()
@@ -3343,6 +3387,7 @@ if __name__ == "__main__":
         test_corrupt_backup_rejected()
         test_malformed_manifest_rejected()
         test_prune_skips_invalid_utf8_manifest()
+        test_legacy_export()
     finally:
         shutil.rmtree(_TMP_DIR, ignore_errors=True)  # 임시 DB 정리
 

@@ -11,6 +11,7 @@ images/discord_icon.png
 
 # Runtime state
 runtime/
+.enka_py/
 data/
 backups/
 logs/

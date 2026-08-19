@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>봇 관리</title>
-  <style>body{font:15px system-ui;max-width:64rem;margin:2rem auto;padding:0 1rem}textarea,input,button{box-sizing:border-box;width:100%;padding:.6rem}textarea{min-height:14rem;font-family:ui-monospace,monospace}form{margin:1rem 0 2rem}.notice{font-weight:600}button{margin-top:.5rem}</style>
+  <style>body{font:15px system-ui;max-width:64rem;margin:2rem auto;padding:0 1rem}textarea,input,select,button{box-sizing:border-box;width:100%;padding:.6rem}textarea{min-height:14rem;font-family:ui-monospace,monospace}form{margin:1rem 0 2rem}.notice{font-weight:600}button{margin-top:.5rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:.4rem .6rem;text-align:left}</style>
 </head>
 <body>
   <h1>봇 관리</h1>
@@ -12,7 +12,7 @@
   <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{csrf}}"><button type="submit">로그아웃</button></form>
 
   <h2>Persona</h2>
-  <form method="post" action="/settings/persona.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{persona}}</textarea><button type="submit">저장 — 새 AI 세션부터 적용</button></form>
+  <form method="post" action="/settings/persona.json"><input type="hidden" name="csrf" value="{{csrf}}"><label>System prompt<textarea name="system_prompt" required>{{persona_prompt}}</textarea></label><label>인삿말<input name="greeting" required value="{{persona_greeting}}"></label><button type="submit">저장 — 새 AI 세션부터 적용</button></form>
 
   <h2>Forbidden words</h2>
   <form method="post" action="/settings/forbidden_words.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{forbidden_words}}</textarea><button type="submit">저장 — 즉시 다시 불러오기</button></form>
@@ -20,7 +20,13 @@
   <h2>Games</h2>
   <form method="post" action="/settings/games.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{games}}</textarea><button type="submit">저장 — 봇 재시작 필요</button></form>
 
+  <h2>길드별 설정</h2>
+  <table>
+    <thead><tr><th>길드</th><th>파티 채널</th><th>공지 허용</th></tr></thead>
+    <tbody>{{guild_rows}}</tbody>
+  </table>
+
   <h2>옵트인 공지</h2>
-  <form method="post" action="/announce"><input type="hidden" name="csrf" value="{{csrf}}"><label>제목<input name="title" required maxlength="256"></label><label>본문<textarea name="body" required maxlength="4096"></textarea></label><button type="submit">공지 보내기</button></form>
+  <form method="post" action="/announce"><input type="hidden" name="csrf" value="{{csrf}}"><label>대상<select name="guild_id">{{guild_options}}</select></label><label>제목<input name="title" required maxlength="256"></label><label>본문<textarea name="body" required maxlength="4096"></textarea></label><label>색상<input type="color" name="color" value="#5865f2"></label><button type="submit">공지 보내기</button></form>
 </body>
 </html>

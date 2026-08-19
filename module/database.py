@@ -4,13 +4,14 @@
 # Cog들은 Repository 인터페이스만 사용하므로, 외부 DB로 교체해도 Cog 코드는 바뀌지 않는다.
 #
 # 외부 DB(MySQL, Oracle 등)로 교체하는 방법:
-#   1. AttendanceRepository / PartyRepository / GuildSettingsRepository를 상속한
+#   1. UsageRepository / PartyRepository / GuildSettingsRepository /
+#      ProfileRepository를 상속한
 #      구현 클래스를 이 파일에 작성 (SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리)
 #   2. 아래 create_* 팩토리에 분기 추가
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
 # ── 멀티 길드 ──
-# 포인트·출석·금지어·파티·설정은 스키마의 guild_id로 길드별 격리된다.
+# 금지어 카운트·파티·설정·프로필 UID는 스키마의 guild_id로 길드별 격리된다.
 # AI 일일 사용량은 하나의 인스턴스 안에서 유저별 전역이므로 guild_id를 저장하지 않는다.
 #
 # ── 동시성 ──
@@ -24,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import sqlite3
-import time
 from abc import ABC, abstractmethod
 from contextlib import closing
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -84,55 +84,10 @@ async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def _record_ledger(
-    cursor: sqlite3.Cursor, guild_id: int, user_id: int, delta: int, reason: str
-) -> None:
-    """포인트를 실제로 변경한 트랜잭션 안에서만 호출한다."""
-    cursor.execute(
-        "INSERT INTO point_ledger (guild_id, user_id, delta, reason, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (guild_id, user_id, delta, reason, int(time.time())),
-    )
-
-
 # ─────────── 인터페이스 ─────────── #
 
-class AttendanceRepository(ABC):
-    """길드별 출석/포인트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
-
-    @abstractmethod
-    def get_points(self, guild_id: int, user_id: int) -> int:
-        """해당 길드에서의 포인트 잔액. 미등록 유저는 0."""
-
-    @abstractmethod
-    def add_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> None:
-        """포인트를 지급하고 원장에 기록한다."""
-
-    @abstractmethod
-    def deduct_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> bool:
-        """포인트를 차감한다. 잔액 확인과 차감이 원자적으로 수행되어야 한다.
-        성공 시 True(원장 기록), 잔액 부족 시 False(원장 미기록)."""
-
-    @abstractmethod
-    def claim_attendance(
-        self,
-        guild_id: int,
-        user_id: int,
-        reward: int,
-        attendance_date: str,
-        reason: str = "attendance",
-    ) -> Optional[int]:
-        """당일 첫 출석이면 포인트를 지급하고 새 잔액을, 중복이면 None을 반환한다."""
-
-    @abstractmethod
-    def get_ledger(
-        self, guild_id: int, user_id: int, limit: int = 20
-    ) -> List[Tuple[int, str, int]]:
-        """최근 포인트 이동 [(delta, reason, created_at), ...]를 최신순으로 반환한다."""
+class UsageRepository(ABC):
+    """길드별 금지어 카운트와 인스턴스 전역 AI 사용량 접근 인터페이스."""
 
     @abstractmethod
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
@@ -141,10 +96,6 @@ class AttendanceRepository(ABC):
     @abstractmethod
     def get_forbidden_count(self, guild_id: int, user_id: int) -> int:
         """금지어 경고 횟수를 반환한다. 미등록 유저는 0."""
-
-    @abstractmethod
-    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
-        """해당 길드의 포인트 상위 유저 [(user_id, points), ...]."""
 
     @abstractmethod
     def consume_ai_usage(
@@ -243,28 +194,20 @@ class GuildSettingsRepository(ABC):
         """파티 패널 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
-    def get_music_channel(self, guild_id: int) -> Optional[int]:
-        """음악 패널 채널 ID. 미설정이면 None."""
-
-    @abstractmethod
-    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        """음악 패널 채널을 지정한다. None이면 해제."""
-
-    @abstractmethod
-    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
-        """음악 패널 메시지 ID. 미설정이면 None."""
-
-    @abstractmethod
-    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
-        """음악 패널 메시지 ID를 지정한다. None이면 해제."""
-
-    @abstractmethod
     def get_allow_host_announce(self, guild_id: int) -> bool:
         """파티 호스트 공지를 허용하는지 반환한다."""
 
     @abstractmethod
     def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
         """파티 호스트 공지 허용 여부를 지정한다."""
+
+    @abstractmethod
+    def get_forbidden_filter_enabled(self, guild_id: int) -> bool:
+        """금지어 필터를 켜 두었는지 반환한다. 미설정 길드는 켜짐."""
+
+    @abstractmethod
+    def set_forbidden_filter_enabled(self, guild_id: int, enabled: bool) -> None:
+        """금지어 필터 사용 여부를 지정한다."""
 
     @abstractmethod
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
@@ -291,10 +234,38 @@ class GuildSettingsRepository(ABC):
         """봇이 길드에서 제거됐을 때 해당 길드 설정을 지운다."""
 
 
+class ProfileRepository(ABC):
+    """게임 프로필 UID 매핑. 길드별로 격리된다.
+
+    같은 사람이 서버마다 다른 UID를 쓸 수 있고, 어느 서버에 등록했는지가
+    다른 서버로 새면 안 된다. 인스턴스 전역으로 두지 않는 이유다.
+    """
+
+    @abstractmethod
+    def get_uid(self, guild_id: int, user_id: int, game: str) -> Optional[str]:
+        """등록한 UID. 없으면 None."""
+
+    @abstractmethod
+    def set_uid(self, guild_id: int, user_id: int, game: str, uid: str) -> None:
+        """UID를 등록하거나 교체한다."""
+
+    @abstractmethod
+    def delete_uid(self, guild_id: int, user_id: int, game: str) -> bool:
+        """등록을 해제한다. 지운 게 있으면 True."""
+
+    @abstractmethod
+    def list_uids(self, guild_id: int, user_id: int) -> Dict[str, str]:
+        """이 서버에서 이 유저가 등록한 게임별 UID."""
+
+    @abstractmethod
+    def delete_guild(self, guild_id: int) -> None:
+        """봇이 길드에서 제거됐을 때 해당 길드 등록을 모두 지운다."""
+
+
 # ─────────── SQLite 구현 ─────────── #
 
-class SQLiteAttendanceRepository(AttendanceRepository):
-    _SCHEMA_VERSION = 2
+class SQLiteUsageRepository(UsageRepository):
+    _SCHEMA_VERSION = 3
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -303,35 +274,17 @@ class SQLiteAttendanceRepository(AttendanceRepository):
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
-            _prepare_schema(conn, self._SCHEMA_VERSION, "attendance")
+            version = _prepare_schema(conn, self._SCHEMA_VERSION, "usage")
             c = conn.cursor()
-            # (guild_id, user_id)가 기본키다. 같은 사람이 서버마다 별도 잔액을 갖는다.
+            # (guild_id, user_id)가 기본키다. 금지어 카운트는 서버마다 독립이다.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
-                    points INTEGER NOT NULL DEFAULT 0,
-                    last_attendance_date TEXT,
                     forbidden_count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
-
-            # 모든 포인트 이동을 append-only로 기록한다. 환불 실패 시 대조 근거가 된다.
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS point_ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    delta INTEGER NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
-                )
-            """)
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ledger_user "
-                "ON point_ledger (guild_id, user_id, id DESC)"
-            )
             c.execute("""
                 CREATE TABLE IF NOT EXISTS ai_usage (
                     user_id INTEGER NOT NULL,
@@ -341,16 +294,8 @@ class SQLiteAttendanceRepository(AttendanceRepository):
                     PRIMARY KEY (user_id, usage_date, command)
                 )
             """)
-            _require_columns(
-                conn,
-                "users",
-                {"guild_id", "user_id", "points", "last_attendance_date", "forbidden_count"},
-            )
-            _require_columns(
-                conn,
-                "point_ledger",
-                {"id", "guild_id", "user_id", "delta", "reason", "created_at"},
-            )
+            if version < self._SCHEMA_VERSION:
+                self._drop_point_economy(conn)
             _require_columns(
                 conn,
                 "ai_usage",
@@ -358,16 +303,6 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             )
             _set_schema_version(conn, self._SCHEMA_VERSION)
             conn.commit()
-
-    def get_points(self, guild_id: int, user_id: int) -> int:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT points FROM users WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            result = c.fetchone()
-            return result[0] if result else 0
 
     def consume_ai_usage(
         self, user_id: int, usage_date: str, command: str, limit: int
@@ -408,73 +343,39 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             conn.commit()
             return row[0] if row else 0
 
-    def add_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> None:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR IGNORE INTO users (guild_id, user_id, points) VALUES (?, ?, 0)",
-                (guild_id, user_id),
-            )
-            c.execute(
-                "UPDATE users SET points = points + ? WHERE guild_id = ? AND user_id = ?",
-                (amount, guild_id, user_id),
-            )
-            _record_ledger(c, guild_id, user_id, amount, reason)
-            conn.commit()
+    @staticmethod
+    def _drop_point_economy(conn: sqlite3.Connection) -> None:
+        """v3: 포인트 경제를 버린다. users는 금지어 카운트만 남긴다.
 
-    def deduct_points(
-        self, guild_id: int, user_id: int, amount: int, reason: str = "unspecified"
-    ) -> bool:
-        # 잔액 확인과 차감을 단일 조건부 UPDATE로 처리하여 race condition을 방지한다.
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE users SET points = points - ? "
-                "WHERE guild_id = ? AND user_id = ? AND points >= ?",
-                (amount, guild_id, user_id, amount),
+        컬럼을 빼려면 테이블을 다시 만들어야 한다(guild_settings와 같은 이유로
+        DROP COLUMN을 쓰지 않는다). 마이그레이션 전에 python -m module.export_legacy로
+        잔액과 원장을 JSON으로 받아둘 수 있다.
+        """
+        columns = {row[1] for row in conn.execute('PRAGMA table_info("users")')}
+        if {"points", "last_attendance_date"} & columns:
+            conn.execute("ALTER TABLE users RENAME TO users_v2")
+            conn.execute("""
+                CREATE TABLE users (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO users (guild_id, user_id, forbidden_count) "
+                "SELECT guild_id, user_id, forbidden_count FROM users_v2"
             )
-            charged = c.rowcount > 0
-            if charged:  # 실제로 잔액이 줄었을 때만 기록한다.
-                _record_ledger(c, guild_id, user_id, -amount, reason)
-            conn.commit()
-            return charged
-
-    def claim_attendance(
-        self,
-        guild_id: int,
-        user_id: int,
-        reward: int,
-        attendance_date: str,
-        reason: str = "attendance",
-    ) -> Optional[int]:
-        with closing(_connect(self.db_path)) as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO users (guild_id, user_id, points, last_attendance_date)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                    points = users.points + excluded.points,
-                    last_attendance_date = excluded.last_attendance_date
-                WHERE users.last_attendance_date IS NULL
-                   OR users.last_attendance_date != excluded.last_attendance_date
-                RETURNING points
-                """,
-                (guild_id, user_id, reward, attendance_date),
-            )
-            row = cursor.fetchone()
-            if row:  # 중복 출석은 지급이 없으므로 기록하지 않는다.
-                _record_ledger(cursor, guild_id, user_id, reward, reason)
-            conn.commit()
-            return row[0] if row else None
+            conn.execute("DROP TABLE users_v2")
+        conn.execute("DROP INDEX IF EXISTS idx_ledger_user")
+        conn.execute("DROP TABLE IF EXISTS point_ledger")
 
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute(
-                "INSERT OR IGNORE INTO users (guild_id, user_id, points, forbidden_count) "
-                "VALUES (?, ?, 0, 0)",
+                "INSERT OR IGNORE INTO users (guild_id, user_id, forbidden_count) "
+                "VALUES (?, ?, 0)",
                 (guild_id, user_id),
             )
             c.execute(
@@ -494,33 +395,10 @@ class SQLiteAttendanceRepository(AttendanceRepository):
             result = c.fetchone()
             return result[0] if result else 0
 
-    def get_top_rankings(self, guild_id: int, limit: int = 5) -> List[Tuple[int, int]]:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT user_id, points FROM users WHERE guild_id = ? "
-                "ORDER BY points DESC LIMIT ?",
-                (guild_id, limit),
-            )
-            return c.fetchall()
-
-    def get_ledger(
-        self, guild_id: int, user_id: int, limit: int = 20
-    ) -> List[Tuple[int, str, int]]:
-        with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT delta, reason, created_at FROM point_ledger "
-                "WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
-                (guild_id, user_id, limit),
-            )
-            return c.fetchall()
-
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
             c = conn.cursor()
             c.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
-            c.execute("DELETE FROM point_ledger WHERE guild_id = ?", (guild_id,))
             conn.commit()
 
 
@@ -820,24 +698,36 @@ class SQLitePartyRepository(PartyRepository):
 class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _PARTY_CHANNEL = "party_channel_id"
-    _MUSIC_CHANNEL = "music_channel_id"
-    _MUSIC_PANEL_MESSAGE = "music_panel_msg_id"
     _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
-    _SCHEMA_VERSION = 2
+    _FORBIDDEN_FILTER = "forbidden_filter_enabled"
+    _SCHEMA_VERSION = 4
     _CURRENT_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
-        _MUSIC_CHANNEL,
-        _MUSIC_PANEL_MESSAGE,
         _ALLOW_HOST_ANNOUNCE,
+        _FORBIDDEN_FILTER,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
+    # v2는 음악 컬럼 둘을 더 갖고 있었다. v3는 v4에서 토글만 빠진 모양이다.
+    # 옮겨 담는 컬럼이 양쪽 다 같으므로 한 분기로 처리한다. 부분집합이 아니라
+    # 정확히 일치할 때만 받는다 — 모르는 컬럼이 붙은 DB는 계약 위반으로 거부한다.
+    _V2_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        "music_channel_id",
+        "music_panel_msg_id",
+        _ALLOW_HOST_ANNOUNCE,
+    }
+    _V3_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        _ALLOW_HOST_ANNOUNCE,
+    }
     _GUILD_SETTINGS_COLUMN_ORDER = (
         "guild_id",
         _PARTY_CHANNEL,
-        _MUSIC_CHANNEL,
-        _MUSIC_PANEL_MESSAGE,
         _ALLOW_HOST_ANNOUNCE,
+        _FORBIDDEN_FILTER,
     )
     _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
@@ -867,30 +757,59 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
             }
             if version < self._SCHEMA_VERSION and self._LEGACY_COLUMNS <= columns:
-                conn.execute("BEGIN")
-                try:
-                    conn.execute("ALTER TABLE guild_settings RENAME TO guild_settings_v1")
-                    self._create_current_tables(conn)
-                    conn.execute(
-                        """
-                        INSERT INTO guild_settings (guild_id, party_channel_id)
-                        SELECT guild_id, recruit_channel_id FROM guild_settings_v1
-                        """
-                    )
-                    conn.execute("DROP TABLE guild_settings_v1")
-                    self._require_current_contract(conn)
-                    _set_schema_version(conn, self._SCHEMA_VERSION)
-                except Exception:
-                    conn.rollback()
-                    raise
-                else:
-                    conn.commit()
+                # v1: recruit_channel_id → party_channel_id
+                self._rebuild_guild_settings(
+                    conn,
+                    "guild_settings_v1",
+                    """
+                    INSERT INTO guild_settings (guild_id, party_channel_id)
+                    SELECT guild_id, recruit_channel_id FROM guild_settings_v1
+                    """,
+                )
+                return
+
+            if version < self._SCHEMA_VERSION and columns in (
+                self._V2_COLUMNS,
+                self._V3_COLUMNS,
+            ):
+                # v2: 음악 컬럼을 버린다. v3: forbidden_filter_enabled를 더한다.
+                # 옮겨 담는 컬럼이 같아 한 분기로 충분하다. 새 컬럼은 DEFAULT 1이
+                # 채우므로 기존 서버의 금지어 필터는 켜진 상태 그대로 넘어온다.
+                # SQLite DROP COLUMN 대신 v1과 같은 rename-and-copy를 쓴다.
+                self._rebuild_guild_settings(
+                    conn,
+                    "guild_settings_old",
+                    """
+                    INSERT INTO guild_settings
+                        (guild_id, party_channel_id, allow_host_announce)
+                    SELECT guild_id, party_channel_id, allow_host_announce
+                    FROM guild_settings_old
+                    """,
+                )
                 return
 
             with conn:
                 self._create_party_panels_table(conn)
                 self._require_current_contract(conn)
                 _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    def _rebuild_guild_settings(
+        self, conn: sqlite3.Connection, staging: str, copy_sql: str
+    ) -> None:
+        """현재 스키마로 테이블을 다시 만들고 옮긴다. 실패하면 원본을 되돌린다."""
+        conn.execute("BEGIN")
+        try:
+            conn.execute(f"ALTER TABLE guild_settings RENAME TO {staging}")
+            self._create_current_tables(conn)
+            conn.execute(copy_sql)
+            conn.execute(f"DROP TABLE {staging}")
+            self._require_current_contract(conn)
+            _set_schema_version(conn, self._SCHEMA_VERSION)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
 
     @classmethod
     def _require_current_contract(cls, conn: sqlite3.Connection) -> None:
@@ -928,10 +847,10 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 party_channel_id INTEGER,
-                music_channel_id INTEGER,
-                music_panel_msg_id INTEGER,
                 allow_host_announce INTEGER NOT NULL DEFAULT 0
-                    CHECK (allow_host_announce IN (0, 1))
+                    CHECK (allow_host_announce IN (0, 1)),
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
+                    CHECK (forbidden_filter_enabled IN (0, 1))
             )
         """)
         SQLiteGuildSettingsRepository._create_party_panels_table(conn)
@@ -971,23 +890,24 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
         self._set_column(guild_id, self._PARTY_CHANNEL, channel_id)
 
-    def get_music_channel(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._MUSIC_CHANNEL)
-
-    def set_music_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._MUSIC_CHANNEL, channel_id)
-
-    def get_music_panel_msg(self, guild_id: int) -> Optional[int]:
-        return self._get_column(guild_id, self._MUSIC_PANEL_MESSAGE)
-
-    def set_music_panel_msg(self, guild_id: int, message_id: Optional[int]) -> None:
-        self._set_column(guild_id, self._MUSIC_PANEL_MESSAGE, message_id)
-
     def get_allow_host_announce(self, guild_id: int) -> bool:
         return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
 
     def set_allow_host_announce(self, guild_id: int, allowed: bool) -> None:
         self._set_column(guild_id, self._ALLOW_HOST_ANNOUNCE, int(allowed))
+
+    def get_forbidden_filter_enabled(self, guild_id: int) -> bool:
+        # 미등록 길드는 행이 없다. 기본값은 켜짐이라 _get_column의 falsy 처리에
+        # 기댈 수 없으므로 여기서만 직접 읽는다.
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                f"SELECT {self._FORBIDDEN_FILTER} FROM guild_settings WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+            return True if row is None else bool(row[0])
+
+    def set_forbidden_filter_enabled(self, guild_id: int, enabled: bool) -> None:
+        self._set_column(guild_id, self._FORBIDDEN_FILTER, int(enabled))
 
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
         with closing(_connect(self.db_path)) as conn:
@@ -1023,12 +943,10 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.execute(
                 """
                 UPDATE guild_settings
-                SET party_channel_id = CASE WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
-                    music_panel_msg_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_panel_msg_id END,
-                    music_channel_id = CASE WHEN music_channel_id = ? THEN NULL ELSE music_channel_id END
-                WHERE guild_id = ? AND (party_channel_id = ? OR music_channel_id = ?)
+                SET party_channel_id = NULL
+                WHERE guild_id = ? AND party_channel_id = ?
                 """,
-                (channel_id, channel_id, channel_id, guild_id, channel_id, channel_id),
+                (guild_id, channel_id),
             )
             conn.commit()
 
@@ -1048,6 +966,85 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.commit()
 
 
+class SQLiteProfileRepository(ProfileRepository):
+    _SCHEMA_VERSION = 1
+    _COLUMN_ORDER = ("guild_id", "user_id", "game", "uid")
+
+    def __init__(self, db_path: pathlib.Path):
+        self.db_path = pathlib.Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "profile")
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS game_uids (
+                        guild_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        game TEXT NOT NULL,
+                        uid TEXT NOT NULL,
+                        PRIMARY KEY (guild_id, user_id, game)
+                    )
+                """)
+                actual = list(conn.execute('PRAGMA table_info("game_uids")'))
+                columns = tuple(row[1] for row in actual)
+                primary_key = tuple(
+                    row[1] for row in sorted(actual, key=lambda row: row[5]) if row[5]
+                )
+                if columns != self._COLUMN_ORDER or primary_key != (
+                    "guild_id",
+                    "user_id",
+                    "game",
+                ):
+                    raise RuntimeError("지원하지 않는 game_uids 스키마입니다.")
+                _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    def get_uid(self, guild_id: int, user_id: int, game: str) -> Optional[str]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT uid FROM game_uids WHERE guild_id = ? AND user_id = ? AND game = ?",
+                (guild_id, user_id, game),
+            ).fetchone()
+            return row[0] if row else None
+
+    def set_uid(self, guild_id: int, user_id: int, game: str, uid: str) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO game_uids (guild_id, user_id, game, uid) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, game) DO UPDATE SET uid = excluded.uid
+                """,
+                (guild_id, user_id, game, uid),
+            )
+            conn.commit()
+
+    def delete_uid(self, guild_id: int, user_id: int, game: str) -> bool:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                "DELETE FROM game_uids WHERE guild_id = ? AND user_id = ? AND game = ?",
+                (guild_id, user_id, game),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def list_uids(self, guild_id: int, user_id: int) -> Dict[str, str]:
+        with closing(_connect(self.db_path)) as conn:
+            return {
+                game: uid
+                for game, uid in conn.execute(
+                    "SELECT game, uid FROM game_uids WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+            }
+
+    def delete_guild(self, guild_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM game_uids WHERE guild_id = ?", (guild_id,))
+            conn.commit()
+
+
 # ─────────── 팩토리 ─────────── #
 
 _UNSUPPORTED_MSG = (
@@ -1055,19 +1052,27 @@ _UNSUPPORTED_MSG = (
     "module/database.py에 {repo} 구현을 추가하고 팩토리에 분기를 등록하세요."
 )
 
-def create_attendance_repository() -> AttendanceRepository:
+def create_usage_repository() -> UsageRepository:
     if DB_BACKEND == "sqlite":
-        return SQLiteAttendanceRepository(DATA_DIR / "attendance_data.db")
+        return SQLiteUsageRepository(DATA_DIR / "attendance_data.db")
     # 외부 DB 분기 예시:
     # if DB_BACKEND == "mysql":
-    #     return MySQLAttendanceRepository(DB_URL)
-    raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="AttendanceRepository"))
+    #     return MySQLUsageRepository(DB_URL)
+    raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="UsageRepository"))
 
 
 def create_party_repository() -> PartyRepository:
     if DB_BACKEND == "sqlite":
         return SQLitePartyRepository(DATA_DIR / "party_data.db")
     raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="PartyRepository"))
+
+
+def create_profile_repository() -> ProfileRepository:
+    if DB_BACKEND == "sqlite":
+        return SQLiteProfileRepository(DATA_DIR / "profile_data.db")
+    raise NotImplementedError(
+        _UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="ProfileRepository")
+    )
 
 
 def create_guild_settings_repository() -> GuildSettingsRepository:

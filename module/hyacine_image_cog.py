@@ -11,10 +11,7 @@ from discord.ext import commands
 from google import genai
 from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL, LIMIT_IMAGE
 
-# 평균 출석 수입(17,500 P/일) 기준 이틀에 1회.
-IMAGE_COST = 30_000
-
-# 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패하고 환불도 못 한다.
+# 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패한다.
 MAX_PROMPT_DISPLAY = 1_000
 TEMP_IMAGE_TTL_SECONDS = 300
 
@@ -53,7 +50,7 @@ class HyacineImageCog(commands.Cog):
         inter: discord.Interaction,
         error: app_commands.AppCommandError,
     ):
-        # 쿨다운은 콜백 진입 전에 걸리므로 포인트는 아직 차감되지 않았다.
+        # 쿨다운은 콜백 진입 전에 걸리므로 일일 한도는 아직 예약되지 않았다.
         if isinstance(error, app_commands.CommandOnCooldown):
             await inter.response.send_message(
                 f"⏳ 붓을 말리는 중이에요~ {error.retry_after:.0f}초 뒤에 다시 불러 주세요.",
@@ -62,18 +59,18 @@ class HyacineImageCog(commands.Cog):
             return
         raise error
 
-    @app_commands.command(name="이미지", description="AI에게 그림을 그려달라고 요청합니다. (30,000 P)")
+    @app_commands.command(name="이미지", description="AI에게 그림을 그려달라고 요청합니다.")
     @app_commands.describe(프롬프트="그려줘! 라고 할 내용")
     @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def _image(self, inter: discord.Interaction, 프롬프트: str):
-        # 0. Check Points
-        attendance_cog = self.bot.get_cog("AttendanceCog")
-        if not attendance_cog:
-            await inter.response.send_message("❌ 출석체크 모듈이 로드되지 않아 포인트를 확인할 수 없어요.", ephemeral=True)
+        usage_cog = self.bot.get_cog("UsageCog")
+        if not usage_cog:
+            await inter.response.send_message(
+                "❌ 사용량 모듈이 로드되지 않아 일일 한도를 확인할 수 없어요.", ephemeral=True
+            )
             return
 
-        cost = IMAGE_COST
-        reservation = await attendance_cog.reserve_ai_usage(
+        reservation = await usage_cog.reserve_ai_usage(
             inter.user.id, "image", LIMIT_IMAGE
         )
         if reservation is None:
@@ -83,10 +80,6 @@ class HyacineImageCog(commands.Cog):
             return
         usage_date, _ = reservation
 
-        charged = False
-        refunded = False
-        refund_attempted = False
-        refund_failed = False
         generation_completed = False
         filepath = None
         uploaded = False
@@ -96,7 +89,7 @@ class HyacineImageCog(commands.Cog):
         async def release_usage():
             if not api_started:
                 try:
-                    await attendance_cog.release_ai_usage(
+                    await usage_cog.release_ai_usage(
                         inter.user.id, usage_date, "image"
                     )
                 except Exception:
@@ -106,35 +99,7 @@ class HyacineImageCog(commands.Cog):
                     )
                     traceback.print_exc()
 
-        async def refund_points() -> bool:
-            nonlocal refund_attempted, refund_failed, refunded
-            if not charged or refund_attempted or generation_completed:
-                return False
-            refund_attempted = True
-            try:
-                await attendance_cog.add_points(
-                    inter.guild_id, inter.user.id, cost, "image_refund"
-                )
-            except Exception:
-                refund_failed = True
-                print(
-                    "❌ [hyacine_image] 포인트 자동 환불 실패 "
-                    f"(user={inter.user.id}, amount={cost})"
-                )
-                traceback.print_exc()
-                return False
-            refunded = True
-            return True
-
         try:
-            if not await attendance_cog.deduct_points(
-                inter.guild_id, inter.user.id, cost, "image"
-            ):
-                current = await attendance_cog.get_points(inter.guild_id, inter.user.id)
-                await inter.response.send_message(f"❌ 포인트가 부족해요! (필요: {cost:,} P / 보유: {current:,} P)", ephemeral=True)
-                return
-            charged = True
-
             await inter.response.defer()
 
             # 1. Request Image Generation
@@ -161,18 +126,11 @@ class HyacineImageCog(commands.Cog):
                     break
 
             if image_data is None:
-                await refund_points()
                 print(f"⚠️ Image generation blocked/failed. Response: {response}")
-                message = "❌ 이미지를 생성하지 못했어요."
-                if refunded:
-                    message += " 포인트는 환불해 드렸습니다."
-                elif refund_failed:
-                    message += (
-                        " 자동 환불에 실패했습니다. "
-                        "관리자에게 수동 정산을 요청해 주세요."
-                    )
-                message += "\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)"
-                await inter.followup.send(message)
+                await inter.followup.send(
+                    "❌ 이미지를 생성하지 못했어요."
+                    "\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)"
+                )
                 return
 
             generation_completed = True
@@ -197,7 +155,7 @@ class HyacineImageCog(commands.Cog):
                 color=0x9b59b6 # Purple-ish
             )
             embed.set_image(url=f"attachment://{filename}")
-            embed.set_footer(text=f"Model: {IMAGE_MODEL} | 비용: {cost:,} P | 5분 후 서버에서 삭제됨")
+            embed.set_footer(text=f"Model: {IMAGE_MODEL} | 5분 후 서버에서 삭제됨")
             
             await inter.followup.send(embed=embed, file=file)
             uploaded = True
@@ -208,7 +166,6 @@ class HyacineImageCog(commands.Cog):
             )
 
         except Exception:
-            await refund_points()
             # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
             print(f"❌ [hyacine_image] 이미지 생성 실패 (user={inter.user.id})")
             traceback.print_exc()
@@ -216,13 +173,6 @@ class HyacineImageCog(commands.Cog):
                 message = "❌ 이미지는 생성되었지만 Discord 전송에 실패했습니다."
             else:
                 message = "❌ 이미지 생성 중 오류가 발생했어요."
-                if refunded:
-                    message += " 포인트는 환불해 드렸습니다."
-                elif refund_failed:
-                    message += (
-                        " 자동 환불에 실패했습니다. "
-                        "관리자에게 수동 정산을 요청해 주세요."
-                    )
             try:
                 if inter.response.is_done():
                     await inter.followup.send(message)

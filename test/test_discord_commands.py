@@ -7,8 +7,10 @@ import json
 import os
 import pathlib
 import secrets
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from datetime import datetime, timezone
@@ -26,33 +28,25 @@ from discord.ext import commands
 import module.config as config
 import module.guildsettings_cog as guildsettings_cog
 import module.main as bot_main
-from module.attendance_cog import AttendanceCog, KST
+from module.usage_cog import UsageCog, KST
 from module.database import (
-    SQLiteAttendanceRepository,
+    SQLiteUsageRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
 )
 from module.eventnotice_cog import EventNoticeCog
-from module.finance_cog import FinanceCog
 from module.guildsettings_cog import GuildSettingsCog, SetupView
 from module.hyacine_chat_cog import HyacineChatCog
 from module.hyacine_image_cog import HyacineImageCog
 from module.playwith_cog import PlayWithCog
 from module.panel import drop_panel_locks, panel_lock, upsert_panel
-import module.music_cog as music_cog
-from module.music_cog import (
-    MusicCog,
-    MusicPanelView,
-    MusicPlayer,
-    MusicRemoveView,
-    MusicSnapshot,
-    MusicTrack,
-    extract_track,
-    music_panel,
-    resolve_stream_url,
-)
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
+import module.greeting_cog as greeting_cog
+import module.game_profile as game_profile
+import module.profile_cog as profile_cog
+import module.profile_card as profile_card
+from module.database import SQLiteProfileRepository
 import module.backup as backup
 import module.webadmin_cog as webadmin_cog
 
@@ -114,1372 +108,16 @@ class ConditionalExtensionTest(unittest.TestCase):
             "module.guildsettings_cog",
             "module.playwith_cog",
             "module.forbiddenfilter_cog",
-            "module.attendance_cog",
+            "module.usage_cog",
         ):
             self.assertIn(required, names)
-
-
-def _spec_faker(missing):
-    """nacl/yt_dlp의 설치 여부만 조작하고 나머지 모듈 조회는 그대로 둔다."""
-    real = music_cog.find_spec
-
-    def fake(name, *args, **kwargs):
-        if name in ("nacl", "yt_dlp"):
-            return None if name in missing else object()
-        return real(name, *args, **kwargs)
-
-    return fake
-
-
-_ALL_AI_KEYS = {"OPENAI_API_KEY": "a", "GOOGLE_API_KEY": "b"}
-_NO_AI_KEYS = {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
-_CORE_EXTENSIONS = (
-    "module.guildsettings_cog",
-    "module.eventnotice_cog",
-    "module.playwith_cog",
-    "module.forbiddenfilter_cog",
-    "module.attendance_cog",
-    "module.finance_cog",
-)
-
-
-class MusicDependencyGateTest(unittest.TestCase):
-    """선택적 의존성이 빠지면 음악 확장 하나만 사라져야 한다."""
-
-    def _load(self, missing=(), env=None):
-        buffer = StringIO()
-        with patch.object(music_cog, "find_spec", _spec_faker(set(missing))), \
-             patch.object(bot_main, "ENV_VALUES", dict(env or _ALL_AI_KEYS)), \
-             contextlib.redirect_stdout(buffer):
-            names = bot_main.available_extensions()
-        return names, buffer.getvalue()
-
-    def test_extension_entries_carry_env_names_and_dependency_check(self):
-        for entry in bot_main.EXTENSIONS:
-            self.assertEqual(len(entry), 3, entry)
-            module_name, required, dependency_check = entry
-            self.assertIsInstance(module_name, str)
-            self.assertIsInstance(required, tuple)
-            self.assertTrue(dependency_check is None or callable(dependency_check))
-
-    def test_music_loads_when_both_packages_are_installed(self):
-        names, _ = self._load()
-        self.assertIn("module.music_cog", names)
-
-    def test_music_alone_is_skipped_without_pynacl(self):
-        names, log = self._load(missing=["nacl"])
-        self.assertNotIn("module.music_cog", names)
-        for extension in _CORE_EXTENSIONS:
-            self.assertIn(extension, names)
-        self.assertIn("module.hyacine_chat_cog", names)
-        self.assertIn("module.hyacine_image_cog", names)
-        self.assertIn("PyNaCl", log)
-        self.assertNotIn("yt-dlp", log)
-        self.assertIn("pip install", log)
-
-    def test_music_alone_is_skipped_without_yt_dlp(self):
-        names, log = self._load(missing=["yt_dlp"])
-        self.assertNotIn("module.music_cog", names)
-        for extension in _CORE_EXTENSIONS:
-            self.assertIn(extension, names)
-        self.assertIn("yt-dlp", log)
-        self.assertIn("pip install", log)
-
-    def test_missing_packages_are_all_named_in_the_skip_reason(self):
-        _, log = self._load(missing=["nacl", "yt_dlp"])
-        self.assertIn("PyNaCl", log)
-        self.assertIn("yt-dlp", log)
-        self.assertIn("pip install PyNaCl yt-dlp", log)
-
-    def test_core_extensions_survive_when_every_optional_feature_is_absent(self):
-        names, _ = self._load(missing=["nacl", "yt_dlp"], env=_NO_AI_KEYS)
-        self.assertEqual(names, list(_CORE_EXTENSIONS))
-
-    def test_dependency_error_is_none_when_packages_exist(self):
-        with patch.object(music_cog, "find_spec", _spec_faker(set())):
-            self.assertIsNone(music_cog.music_dependency_error())
-
-
-class _RecordingYTDL:
-    """yt_dlp.YoutubeDL 대역. 어떤 thread에서 불렸는지까지 기록한다."""
-
-    def __init__(self, info=None, error=None):
-        self.info = info
-        self.error = error
-        self.urls = []
-        self.threads = []
-        self.download_flags = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        return False
-
-    def extract_info(self, url, download=False):
-        self.urls.append(url)
-        self.download_flags.append(download)
-        self.threads.append(threading.current_thread())
-        if self.error is not None:
-            raise self.error
-        return self.info
-
-
-class MusicExtractionTests(unittest.IsolatedAsyncioTestCase):
-    def _patch_ytdl(self, info=None, error=None):
-        ytdl = _RecordingYTDL(info, error)
-        patcher = patch.object(music_cog, "_youtube_dl", lambda: ytdl)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return ytdl
-
-    def test_ytdl_options_disable_download_playlist_and_search(self):
-        options = music_cog._YTDL_OPTIONS
-        self.assertIs(options["noplaylist"], True)
-        self.assertIs(options["skip_download"], True)
-        self.assertIs(options["extract_flat"], False)
-        # 기본 검색이 켜져 있으면 "아무 문자열"이 곡으로 승격된다.
-        self.assertEqual(options["default_search"], "error")
-
-    async def test_extraction_runs_off_the_event_loop(self):
-        ytdl = self._patch_ytdl(
-            {"title": "노래", "webpage_url": "https://example.com/watch?v=1"}
-        )
-        await extract_track("https://example.com/watch?v=1", requester_id=7)
-        self.assertEqual(len(ytdl.threads), 1)
-        self.assertIsNot(ytdl.threads[0], threading.main_thread())
-        self.assertEqual(ytdl.download_flags, [False])
-
-    async def test_only_single_http_urls_are_accepted(self):
-        ytdl = self._patch_ytdl({"title": "노래", "webpage_url": "https://e.com/1"})
-        for rejected in (
-            "file:///etc/passwd",
-            "ftp://example.com/song.mp3",
-            "javascript:alert(1)",
-            "example.com/watch",
-            "노래 제목 검색어",
-            "https:///no-host",
-            "",
-        ):
-            with self.subTest(url=rejected):
-                with self.assertRaises(ValueError):
-                    await extract_track(rejected, requester_id=7)
-        self.assertEqual(ytdl.urls, [])  # 검증 전에 yt-dlp를 부르지 않는다
-
-    async def test_playlists_are_rejected(self):
-        self._patch_ytdl({"_type": "playlist", "title": "목록", "entries": []})
-        with self.assertRaises(ValueError):
-            await extract_track("https://example.com/list", requester_id=7)
-
-    async def test_live_streams_are_rejected(self):
-        for info in (
-            {"title": "생방송", "webpage_url": "https://e.com/1", "is_live": True},
-            {
-                "title": "예정",
-                "webpage_url": "https://e.com/1",
-                "live_status": "is_upcoming",
-            },
-        ):
-            with self.subTest(info=info):
-                self._patch_ytdl(info)
-                with self.assertRaises(ValueError):
-                    await extract_track("https://example.com/1", requester_id=7)
-
-    async def test_title_must_be_a_non_empty_string(self):
-        for title in (None, 12, "", "   "):
-            with self.subTest(title=title):
-                self._patch_ytdl({"title": title, "webpage_url": "https://e.com/1"})
-                with self.assertRaises(ValueError):
-                    await extract_track("https://example.com/1", requester_id=7)
-
-    async def test_long_title_is_bounded(self):
-        self._patch_ytdl({"title": "가" * 400, "webpage_url": "https://e.com/1"})
-        track = await extract_track("https://example.com/1", requester_id=7)
-        self.assertEqual(len(track.title), music_cog.MAX_TITLE_LENGTH)
-
-    async def test_canonical_webpage_url_replaces_the_input_url(self):
-        self._patch_ytdl(
-            {"title": "노래", "webpage_url": "https://example.com/watch?v=abc"}
-        )
-        track = await extract_track(
-            "https://example.com/short/abc?utm=1", requester_id=99
-        )
-        self.assertEqual(track.webpage_url, "https://example.com/watch?v=abc")
-        self.assertEqual(track.requester_id, 99)
-
-    async def test_unusable_canonical_url_is_rejected(self):
-        for webpage_url in (
-            "file:///tmp/song.mp3",
-            12,
-            "https://example.com/" + "a" * music_cog.MAX_URL_LENGTH,
-        ):
-            with self.subTest(webpage_url=webpage_url):
-                self._patch_ytdl({"title": "노래", "webpage_url": webpage_url})
-                with self.assertRaises(ValueError):
-                    await extract_track("https://example.com/1", requester_id=7)
-
-    def test_track_is_immutable_and_stores_no_stream_url(self):
-        track = MusicTrack("노래", "https://example.com/1", 7)
-        self.assertEqual(
-            set(MusicTrack.__dataclass_fields__),
-            {"title", "webpage_url", "requester_id"},
-        )
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            track.title = "다른 노래"
-
-    async def test_stream_url_is_resolved_again_off_the_event_loop(self):
-        ytdl = self._patch_ytdl(
-            {
-                "title": "노래",
-                "webpage_url": "https://example.com/watch?v=1",
-                "url": "https://cdn.example.com/stream?expires=1",
-            }
-        )
-        track = MusicTrack("노래", "https://example.com/watch?v=1", 7)
-        stream = await resolve_stream_url(track)
-        self.assertEqual(stream, "https://cdn.example.com/stream?expires=1")
-        self.assertEqual(ytdl.urls, ["https://example.com/watch?v=1"])
-        self.assertIsNot(ytdl.threads[0], threading.main_thread())
-
-    async def test_unusable_stream_url_is_rejected(self):
-        for url in (None, "", "file:///tmp/song.mp3"):
-            with self.subTest(url=url):
-                self._patch_ytdl(
-                    {"title": "노래", "webpage_url": "https://e.com/1", "url": url}
-                )
-                with self.assertRaises(ValueError):
-                    await resolve_stream_url(MusicTrack("노래", "https://e.com/1", 7))
-
-
-BOT_USER_ID = 999
-
-
-class _FakeVoiceMember:
-    def __init__(self, bot=False, user_id=1, guild_id=TEST_GUILD_ID):
-        self.bot = bot
-        self.id = user_id
-        self.guild = SimpleNamespace(id=guild_id)
-
-
-class _FakeVoiceChannel:
-    def __init__(self, members=()):
-        self.members = list(members)
-
-
-class _FakeVoiceState:
-    def __init__(self, channel=None):
-        self.channel = channel
-
-
-class _FakeVoiceClient:
-    """discord.VoiceClient 대역.
-
-    실제 VoiceClient의 두 가지 성질을 그대로 흉내낸다.
-    - `stop()`과 `disconnect()`가 after callback을 부른다(`disconnect()`는 내부에서
-      `stop()`을 부른다). MusicPlayer.stop()이 별도 `stop()` 호출 없이도 유령 재생을
-      남기지 않는지는 이 성질에 기대고 있다.
-    - `play()`는 이미 재생 중이거나 연결이 없으면 `ClientException`을 던진다.
-    """
-
-    def __init__(self, channel=None, play_error=None):
-        self.channel = channel
-        self.play_error = play_error
-        self.sources = []
-        self.after = None
-        self.disconnects = 0
-        self._playing = False
-        self._paused = False
-
-    def play(self, source, *, after=None):
-        if self.play_error is not None:
-            raise self.play_error
-        if self._playing:
-            raise discord.ClientException("Already playing audio.")
-        self.sources.append(source)
-        self.after = after
-        self._playing = True
-        self._paused = False
-
-    def is_playing(self):
-        return self._playing and not self._paused
-
-    def is_paused(self):
-        return self._paused
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
-
-    def stop(self):
-        after, self.after = self.after, None
-        self._playing = False
-        self._paused = False
-        if after is not None:
-            after(None)
-
-    async def disconnect(self, *, force=False):
-        self.disconnects += 1
-        self.stop()
-
-
-class _FakeSource:
-    def __init__(self, url, **options):
-        self.url = url
-        self.options = options
-        self.thread = threading.current_thread()
-        self.cleaned = False
-
-    def cleanup(self):
-        self.cleaned = True
-
-
-def _music_track(number):
-    return MusicTrack(f"곡{number}", f"https://example.com/{number}", 100 + number)
-
-
-class _PatchedPlaybackTests(unittest.IsolatedAsyncioTestCase):
-    """스트림 해석과 ffmpeg source를 대역으로 바꾼 공통 바탕."""
-
-    async def asyncSetUp(self):
-        self.sources = []          # play() 성공 여부와 무관하게 생성된 모든 source
-        self.resolve_errors = {}   # 곡 제목 → 해석 시 던질 예외
-
-        async def fake_resolve(track):
-            error = self.resolve_errors.get(track.title)
-            if error is not None:
-                raise error
-            return f"https://cdn.example.com/{track.title}"
-
-        def fake_source(url, **options):
-            source = _FakeSource(url, **options)
-            self.sources.append(source)
-            return source
-
-        for patcher in (
-            patch.object(music_cog, "resolve_stream_url", fake_resolve),
-            patch("discord.FFmpegPCMAudio", fake_source),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    async def _wait_until(self, predicate, timeout=2.0):
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while not predicate():
-            if loop.time() > deadline:
-                return False
-            await asyncio.sleep(0.01)
-        return True
-
-    async def _settle(self):
-        """thread→loop로 예약된 뒷정리 task가 다 돌도록 잠시 양보한다."""
-        await asyncio.sleep(0.05)
-
-
-class MusicPlayerStateTests(_PatchedPlaybackTests):
-    async def test_first_enqueue_starts_playback_exactly_once(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        first, second = _music_track(1), _music_track(2)
-
-        await player.enqueue(voice, first)
-        self.assertEqual(len(voice.sources), 1)
-        self.assertEqual(player.current, first)
-        self.assertEqual(player.snapshot().queue, ())
-
-        await player.enqueue(voice, second)
-        self.assertEqual(len(voice.sources), 1)  # 재생 중이면 다시 시작하지 않는다
-        self.assertEqual(player.current, first)
-        self.assertEqual(player.snapshot().queue, (second,))
-
-    async def test_ffmpeg_source_reconnects_and_drops_video(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        await player.enqueue(voice, _music_track(1))
-        options = voice.sources[0].options
-        self.assertIn("-reconnect 1", options["before_options"])
-        self.assertIn("-reconnect_delay_max", options["before_options"])
-        self.assertEqual(options["options"], "-vn")
-
-    async def test_playback_callback_hands_the_next_track_to_the_event_loop(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        first, second = _music_track(1), _music_track(2)
-        await player.enqueue(voice, first)
-        await player.enqueue(voice, second)
-
-        # discord.py는 재생 완료 callback을 별도 thread에서 부른다.
-        worker = threading.Thread(target=voice.stop)
-        worker.start()
-        started = await self._wait_until(lambda: len(voice.sources) == 2)
-        worker.join(timeout=2)
-
-        self.assertTrue(started, "다음 곡이 시작되지 않았다")
-        self.assertEqual(player.current, second)
-        self.assertEqual(player.snapshot().queue, ())
-        # 다음 곡 준비는 worker thread가 아니라 event loop에서 이뤄져야 한다.
-        self.assertIs(voice.sources[1].thread, threading.main_thread())
-        self.assertIsNot(voice.sources[1].thread, worker)
-
-    async def test_skip_stops_the_current_source_and_advances(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        first, second = _music_track(1), _music_track(2)
-        await player.enqueue(voice, first)
-        await player.enqueue(voice, second)
-
-        skipped = await player.skip()
-        self.assertEqual(skipped, first)
-        self.assertTrue(await self._wait_until(lambda: player.current == second))
-        self.assertEqual(len(voice.sources), 2)
-        self.assertEqual(voice.sources[1].url, "https://cdn.example.com/곡2")
-        self.assertEqual(player.snapshot().queue, ())
-
-    async def test_skipping_the_last_track_leaves_the_player_idle(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        await player.enqueue(voice, _music_track(1))
-
-        await player.skip()
-        self.assertTrue(await self._wait_until(lambda: player.current is None))
-        self.assertEqual(len(voice.sources), 1)
-        self.assertFalse(voice.is_playing())
-
-    async def test_pause_and_resume_track_the_voice_client_state(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        await player.enqueue(voice, _music_track(1))
-
-        self.assertTrue(await player.toggle_pause())
-        self.assertTrue(voice.is_paused())
-        self.assertFalse(voice.is_playing())
-        self.assertTrue(player.snapshot().paused)
-
-        self.assertFalse(await player.toggle_pause())
-        self.assertFalse(voice.is_paused())
-        self.assertTrue(voice.is_playing())
-        self.assertFalse(player.snapshot().paused)
-
-    async def test_stop_clears_the_queue_and_disconnects(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        await player.enqueue(voice, _music_track(1))
-        await player.enqueue(voice, _music_track(2))
-
-        await player.stop()
-        # 실제 disconnect()는 내부에서 stop()을 불러 after callback을 깨운다.
-        # 그 뒤늦은 _advance가 유령 재생을 만들지 않아야 한다.
-        await self._settle()
-        snapshot = player.snapshot()
-        self.assertIsNone(snapshot.current)
-        self.assertEqual(snapshot.queue, ())
-        self.assertFalse(snapshot.connected)
-        self.assertEqual(voice.disconnects, 1)
-        self.assertEqual(len(voice.sources), 1)
-        self.assertIsNone(player.voice_client)
-
-    async def test_remove_uses_one_based_queue_numbers(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        playing, second, third = _music_track(1), _music_track(2), _music_track(3)
-        await player.enqueue(voice, playing)
-        await player.enqueue(voice, second)
-        await player.enqueue(voice, third)
-
-        self.assertIsNone(await player.remove(0))       # 0-based 번호는 없다
-        self.assertIsNone(await player.remove(3))       # 대기열은 2곡뿐이다
-        self.assertIsNone(await player.remove(-1))
-        self.assertIsNone(await player.remove(True))    # bool은 번호가 아니다
-        self.assertEqual(player.snapshot().queue, (second, third))
-
-        # 1번은 재생 중인 곡이 아니라 대기열 첫 곡이다.
-        self.assertEqual(await player.remove(1), second)
-        self.assertEqual(player.snapshot().queue, (third,))
-        self.assertEqual(player.current, playing)
-
-    async def test_empty_voice_channel_goes_idle_and_disconnects(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        listener = _FakeVoiceMember()
-        channel = _FakeVoiceChannel([_FakeVoiceMember(bot=True), listener])
-        voice = _FakeVoiceClient(channel)
-        await player.enqueue(voice, _music_track(1))
-        await player.enqueue(voice, _music_track(2))
-
-        self.assertFalse(await player.disconnect_if_alone())
-        self.assertEqual(voice.disconnects, 0)
-
-        channel.members.remove(listener)
-        self.assertTrue(await player.disconnect_if_alone())
-        await self._settle()
-        snapshot = player.snapshot()
-        self.assertIsNone(snapshot.current)
-        self.assertEqual(snapshot.queue, ())
-        self.assertFalse(snapshot.connected)
-        self.assertEqual(voice.disconnects, 1)
-        self.assertEqual(len(voice.sources), 1)
-
-    async def test_players_are_per_guild_and_all_stop_on_unload(self):
-        cog = MusicCog(bot=None)
-        first = cog.get_player(1)
-        self.assertIs(cog.get_player(1), first)
-        second = cog.get_player(2)
-        self.assertIsNot(second, first)
-
-        voices = []
-        for player in (first, second):
-            voice = _FakeVoiceClient()
-            voices.append(voice)
-            await player.enqueue(voice, _music_track(1))
-
-        await cog.cog_unload()
-        await self._settle()
-        self.assertEqual(cog.players, {})
-        self.assertTrue(all(voice.disconnects == 1 for voice in voices))
-        self.assertTrue(all(player.current is None for player in (first, second)))
-
-    async def test_controls_are_not_blocked_by_a_slow_resolution(self):
-        """해석은 lock 밖에서 돈다. 그렇지 않으면 Task 6 버튼이 3초 안에 응답하지 못한다."""
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        gate = asyncio.Event()
-        resolving = asyncio.Event()
-
-        async def slow_resolve(track):
-            resolving.set()
-            await gate.wait()
-            return f"https://cdn.example.com/{track.title}"
-
-        with patch.object(music_cog, "resolve_stream_url", slow_resolve):
-            enqueueing = asyncio.create_task(player.enqueue(voice, _music_track(1)))
-            await asyncio.wait_for(resolving.wait(), timeout=1)
-            # 해석이 아직 진행 중인데도 제어는 즉시 돌아와야 한다.
-            await asyncio.wait_for(player.stop(), timeout=1)
-            gate.set()
-            await asyncio.wait_for(enqueueing, timeout=1)
-
-        self.assertEqual(voice.sources, [])  # 끊긴 뒤에는 재생하지 않는다
-        self.assertIsNone(player.current)
-        self.assertEqual(voice.disconnects, 1)
-        self.assertTrue(all(source.cleaned for source in self.sources))
-
-    async def test_skip_during_resolution_discards_that_result_and_starts_the_next(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        gate = asyncio.Event()
-        resolving = asyncio.Event()
-
-        async def slow_first(track):
-            if track.title == "곡1":
-                resolving.set()
-                await gate.wait()
-            return f"https://cdn.example.com/{track.title}"
-
-        await player.queue_track(voice, _music_track(1))
-        await player.queue_track(voice, _music_track(2))
-        with patch.object(music_cog, "resolve_stream_url", slow_first):
-            starting = asyncio.create_task(player.start_if_idle())
-            await asyncio.wait_for(resolving.wait(), timeout=1)
-            snapshot = player.snapshot()
-            self.assertIsNone(snapshot.current)
-            self.assertEqual(snapshot.resolving, _music_track(1))
-            self.assertEqual(await player.skip(), _music_track(1))
-            gate.set()
-            await asyncio.wait_for(starting, timeout=1)
-
-        self.assertEqual(player.current, _music_track(2))
-        self.assertEqual(len(voice.sources), 1)
-        self.assertTrue(voice.sources[0].url.endswith("곡2"))
-        self.assertTrue(self.sources[0].cleaned)
-
-    async def test_dead_link_is_skipped_and_the_queue_keeps_playing(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        playing, dead, alive = _music_track(1), _music_track(2), _music_track(3)
-        self.resolve_errors[dead.title] = ValueError("사라진 영상입니다.")
-        for track in (playing, dead, alive):
-            await player.enqueue(voice, track)
-
-        with self.assertLogs(music_cog.logger, level="ERROR"):
-            voice.stop()  # 첫 곡 종료 → 죽은 링크를 건너뛰고 다음 곡으로
-            self.assertTrue(await self._wait_until(lambda: player.current == alive))
-        self.assertEqual([source.url for source in voice.sources][-1],
-                         "https://cdn.example.com/곡3")
-        self.assertEqual(len(voice.sources), 2)
-        self.assertEqual(player.snapshot().queue, ())
-
-    async def test_only_dead_links_leave_the_player_idle(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient()
-        dead = _music_track(1)
-        self.resolve_errors[dead.title] = ValueError("사라진 영상입니다.")
-
-        with self.assertLogs(music_cog.logger, level="ERROR"):
-            await player.enqueue(voice, dead)
-
-        self.assertIsNone(player.current)
-        self.assertEqual(voice.sources, [])
-        self.assertEqual(player.snapshot().queue, ())
-
-    async def test_failed_play_reaps_the_ffmpeg_process(self):
-        # 해석 도중 연결이 끊기면 play()가 던진다. 이때 이미 떠 있는 ffmpeg를
-        # 거둬 가지 않으면 대기열 길이만큼 고아 프로세스가 남는다.
-        player = MusicPlayer(TEST_GUILD_ID)
-        voice = _FakeVoiceClient(
-            play_error=discord.ClientException("Not connected to voice.")
-        )
-        with self.assertLogs(music_cog.logger, level="ERROR"):
-            await player.enqueue(voice, _music_track(1))
-            await player.enqueue(voice, _music_track(2))
-
-        self.assertEqual(len(self.sources), 2)
-        self.assertTrue(all(source.cleaned for source in self.sources))
-        self.assertEqual(voice.sources, [])
-        self.assertIsNone(player.current)
-
-    async def test_enqueue_disconnects_a_voice_client_it_replaces(self):
-        player = MusicPlayer(TEST_GUILD_ID)
-        old, new = _FakeVoiceClient(), _FakeVoiceClient()
-        await player.enqueue(old, _music_track(1))
-        await player.enqueue(new, _music_track(2))
-        await self._settle()
-
-        self.assertEqual(old.disconnects, 1)
-        self.assertIs(player.voice_client, new)
-        self.assertEqual(len(new.sources), 1)
-        self.assertEqual(player.current, _music_track(2))
-
-
-class MusicVoiceEventTests(_PatchedPlaybackTests):
-    """on_voice_state_update — Task 5에서 봇이 실제로 실행하는 유일한 경로."""
-
-    def _cog(self):
-        return MusicCog(bot=SimpleNamespace(user=SimpleNamespace(id=BOT_USER_ID)))
-
-    async def _connected(self, cog, channel):
-        player = cog.get_player(TEST_GUILD_ID)
-        voice = _FakeVoiceClient(channel)
-        await player.enqueue(voice, _music_track(1))
-        await player.enqueue(voice, _music_track(2))
-        return player, voice
-
-    async def test_last_human_leaving_disconnects_the_player(self):
-        cog = self._cog()
-        listener = _FakeVoiceMember(user_id=1)
-        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
-        channel = _FakeVoiceChannel([bot_member, listener])
-        player, voice = await self._connected(cog, channel)
-
-        channel.members.remove(listener)
-        await cog.on_voice_state_update(
-            listener, _FakeVoiceState(channel), _FakeVoiceState(None)
-        )
-        await self._settle()
-        self.assertEqual(voice.disconnects, 1)
-        self.assertFalse(player.snapshot().connected)
-        self.assertEqual(player.snapshot().queue, ())
-
-    async def test_a_human_leaving_a_still_occupied_channel_changes_nothing(self):
-        cog = self._cog()
-        staying = _FakeVoiceMember(user_id=2)
-        leaving = _FakeVoiceMember(user_id=1)
-        channel = _FakeVoiceChannel(
-            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), staying, leaving]
-        )
-        player, voice = await self._connected(cog, channel)
-
-        channel.members.remove(leaving)
-        await cog.on_voice_state_update(
-            leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
-        )
-        self.assertEqual(voice.disconnects, 0)
-        self.assertTrue(player.snapshot().connected)
-
-    async def test_mute_toggles_do_not_touch_the_player(self):
-        cog = self._cog()
-        channel = _FakeVoiceChannel([_FakeVoiceMember(bot=True, user_id=BOT_USER_ID)])
-        player, voice = await self._connected(cog, channel)
-
-        member = _FakeVoiceMember(user_id=1)
-        # 같은 채널 안에서의 상태 변화(음소거 등)는 채널이 비어 있어도 무시한다.
-        await cog.on_voice_state_update(
-            member, _FakeVoiceState(channel), _FakeVoiceState(channel)
-        )
-        self.assertEqual(voice.disconnects, 0)
-        self.assertTrue(player.snapshot().connected)
-
-    async def test_forced_disconnect_of_the_bot_clears_stale_state(self):
-        cog = self._cog()
-        channel = _FakeVoiceChannel(
-            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
-        )
-        player, voice = await self._connected(cog, channel)
-
-        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
-        await cog.on_voice_state_update(
-            bot_member, _FakeVoiceState(channel), _FakeVoiceState(None)
-        )
-        snapshot = player.snapshot()
-        self.assertFalse(snapshot.connected)  # connected=True는 패널이 렌더할 거짓말이다
-        self.assertIsNone(snapshot.current)
-        self.assertEqual(snapshot.queue, ())
-        self.assertIsNone(player.voice_client)
-        self.assertEqual(voice.disconnects, 0)  # 이미 끊긴 연결을 다시 끊지 않는다
-
-    async def test_moving_the_bot_to_an_occupied_channel_keeps_playing(self):
-        cog = self._cog()
-        channel = _FakeVoiceChannel(
-            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
-        )
-        player, voice = await self._connected(cog, channel)
-
-        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
-        destination = _FakeVoiceChannel(
-            [bot_member, _FakeVoiceMember(user_id=2)]
-        )
-        await cog.on_voice_state_update(
-            bot_member, _FakeVoiceState(channel), _FakeVoiceState(destination)
-        )
-        self.assertTrue(player.snapshot().connected)
-        self.assertEqual(player.current, _music_track(1))
-        self.assertEqual(voice.disconnects, 0)
-
-    async def test_moving_the_bot_to_an_empty_channel_disconnects_and_evicts(self):
-        cog = self._cog()
-        channel = _FakeVoiceChannel(
-            [_FakeVoiceMember(bot=True, user_id=BOT_USER_ID), _FakeVoiceMember(user_id=1)]
-        )
-        player, voice = await self._connected(cog, channel)
-        bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
-        destination = _FakeVoiceChannel([bot_member])
-
-        await cog.on_voice_state_update(
-            bot_member, _FakeVoiceState(channel), _FakeVoiceState(destination)
-        )
-        await self._settle()
-
-        self.assertEqual(voice.disconnects, 1)
-        self.assertFalse(player.snapshot().connected)
-        self.assertNotIn(TEST_GUILD_ID, cog.players)
-
-    async def test_voice_events_from_guilds_without_a_player_are_ignored(self):
-        cog = self._cog()
-        member = _FakeVoiceMember(user_id=1, guild_id=TEST_GUILD_ID + 1)
-        await cog.on_voice_state_update(
-            member, _FakeVoiceState(_FakeVoiceChannel()), _FakeVoiceState(None)
-        )
-        self.assertEqual(cog.players, {})
-
-
-class _MusicPanelMessage:
-    def __init__(self, message_id):
-        self.id = message_id
-        self.edits = []
-
-    async def edit(self, **kwargs):
-        self.edits.append(kwargs)
-
-
-class _MusicPanelChannel:
-    def __init__(self, channel_id=70):
-        self.id = channel_id
-        self.messages = {}
-        self.fetch_error = None
-        self.sent = []
-
-    async def fetch_message(self, message_id):
-        if self.fetch_error is not None:
-            raise self.fetch_error
-        message = self.messages.get(message_id)
-        if message is None:
-            raise discord.NotFound(_FakeResponse(), "missing")
-        return message
-
-    async def send(self, **kwargs):
-        message = _MusicPanelMessage(100 + len(self.sent))
-        self.messages[message.id] = message
-        self.sent.append((message, kwargs))
-        return message
-
-
-class _MusicGuild:
-    def __init__(self, channel=None):
-        self.id = TEST_GUILD_ID
-        self.channel = channel or _MusicPanelChannel()
-        self.me = SimpleNamespace(id=BOT_USER_ID)
-        self.voice_client = None
-
-    def get_channel(self, channel_id):
-        return self.channel if channel_id == self.channel.id else None
-
-
-class _MusicBot:
-    def __init__(self, guild):
-        self.guild = guild
-        self.guilds = [guild]
-        self.user = SimpleNamespace(id=BOT_USER_ID)
-        self.views = []
-
-    def add_view(self, view):
-        self.views.append(view)
-
-    def get_guild(self, guild_id):
-        return self.guild if guild_id == self.guild.id else None
-
-
-class _MusicInteraction:
-    def __init__(
-        self,
-        guild,
-        user_id=123,
-        *,
-        manager=False,
-        voice_channel=None,
-        message_id=10,
-    ):
-        self.guild = guild
-        self.guild_id = guild.id
-        self.message = SimpleNamespace(id=message_id) if message_id is not None else None
-        self.user = SimpleNamespace(
-            id=user_id,
-            voice=SimpleNamespace(channel=voice_channel),
-            guild_permissions=SimpleNamespace(manage_guild=manager),
-        )
-        self.response = RecordingResponse()
-        self.followup = RecordingFollowup()
-
-
-class MusicPanelTests(_PatchedPlaybackTests):
-    def _cog(self, directory):
-        settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
-        guild = _MusicGuild()
-        settings.set_music_channel(guild.id, guild.channel.id)
-        settings.set_music_panel_msg(guild.id, 10)
-        bot = _MusicBot(guild)
-        cog = MusicCog(bot, settings)
-        self.addCleanup(drop_panel_locks, guild.id)
-        return cog, guild, settings, bot
-
-    async def test_embed_shows_state_requesters_and_only_first_ten_queue_items(self):
-        current = MusicTrack("현재 곡", "https://example.com/current", 7)
-        queue = tuple(_music_track(number) for number in range(1, 13))
-        snapshot = MusicSnapshot(current, queue, paused=True, connected=True)
-
-        embed = music_panel(snapshot)
-
-        self.assertEqual(embed.fields[0].value, "⏸️ 일시정지")
-        self.assertIn("현재 곡", embed.fields[1].value)
-        self.assertIn("<@7>", embed.fields[1].value)
-        self.assertIn("10. 곡10", embed.fields[2].value)
-        self.assertNotIn("곡11", embed.fields[2].value)
-        self.assertIn("외 2곡", embed.fields[2].value)
-
-    async def test_resolving_snapshot_is_not_rendered_as_idle(self):
-        track = _music_track(1)
-        embed = music_panel(
-            MusicSnapshot(None, (), paused=False, connected=True, resolving=track, starting=True)
-        )
-        self.assertEqual(embed.fields[0].value, "⏳ 재생 준비 중")
-        self.assertIn(track.title, embed.fields[1].value)
-
-    async def test_panel_edits_recreates_on_not_found_and_preserves_id_on_forbidden(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, settings, _ = self._cog(directory)
-            original = _MusicPanelMessage(10)
-            guild.channel.messages[10] = original
-            settings.set_music_panel_msg(guild.id, 10)
-
-            await cog.ensure_panel(guild)
-            self.assertTrue(original.edits)
-            self.assertEqual(settings.get_music_panel_msg(guild.id), 10)
-
-            guild.channel.messages.pop(10)
-            await cog.ensure_panel(guild)
-            replacement_id = settings.get_music_panel_msg(guild.id)
-            self.assertNotEqual(replacement_id, 10)
-
-            guild.channel.fetch_error = discord.Forbidden(_FakeResponse(403), "no")
-            with self.assertLogs(music_cog.logger, level="WARNING") as logged:
-                await cog.ensure_panel(guild)
-            self.assertEqual(settings.get_music_panel_msg(guild.id), replacement_id)
-            self.assertIn("403", "\n".join(logged.output))
-
-    def test_persistent_buttons_and_remove_select_obey_discord_limits(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cog, _, _, bot = self._cog(directory)
-            self.assertIsInstance(bot.views[0], MusicPanelView)
-            self.assertTrue(bot.views[0].is_persistent())
-            self.assertEqual(
-                {item.custom_id for item in bot.views[0].children},
-                {"music:add", "music:skip", "music:pause", "music:stop", "music:remove"},
-            )
-            remove = MusicRemoveView(
-                cog, tuple(_music_track(number) for number in range(1, 31))
-            )
-            self.assertEqual(len(remove.children[0].options), 25)
-            self.assertTrue(all(len(option.label) <= 100 for option in remove.children[0].options))
-            modal = music_cog.MusicURLModal(cog)
-            self.assertEqual(len(modal.children), 1)
-            self.assertEqual(modal.children[0].max_length, music_cog.MAX_URL_LENGTH)
-
-    async def test_replaced_panel_denies_old_controls_and_accepts_the_current_panel(self):
-        class VoiceChannel:
-            def __init__(self):
-                self.connects = 0
-
-            def permissions_for(self, member):
-                return SimpleNamespace(connect=True, speak=True)
-
-            async def connect(self):
-                self.connects += 1
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(
-            music_cog, "extract_track", return_value=_music_track(3)
-        ) as extract:
-            cog, guild, settings, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            player.current = _music_track(1)
-            player.queue.append(_music_track(2))
-            before = player.snapshot()
-            settings.set_music_panel_msg(guild.id, 20)
-
-            stale = [
-                _MusicInteraction(guild, manager=True, message_id=10)
-                for _ in range(5)
-            ]
-            for child, interaction in zip(cog.view.children, stale):
-                await child.callback(interaction)
-
-            voice_channel = VoiceChannel()
-            stale_modal = _MusicInteraction(
-                guild, voice_channel=voice_channel, message_id=None
-            )
-            await cog.add_url(
-                stale_modal,
-                "https://example.com/song",
-                panel_message_id=10,
-            )
-
-            current = _MusicInteraction(guild, message_id=20)
-            await cog.view.children[0].callback(current)
-
-        self.assertEqual(player.snapshot(), before)
-        self.assertEqual(voice_channel.connects, 0)
-        self.assertEqual(extract.await_count, 1)
-        self.assertTrue(all("최신" in item.followup.messages[0][0][0] for item in stale[1:4]))
-        self.assertIn("최신", stale[0].response.messages[0][0][0])
-        self.assertIn("최신", stale[4].response.messages[0][0][0])
-        self.assertIn("최신", stale_modal.followup.messages[0][0][0])
-        self.assertIsInstance(current.response.modal, music_cog.MusicURLModal)
-        self.assertEqual(current.response.modal.panel_message_id, 20)
-
-    async def test_panel_id_is_rechecked_after_waiting_for_music_lock(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cog, guild, settings, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            player.current = _music_track(1)
-            before = player.snapshot()
-            interaction = _MusicInteraction(guild, user_id=1, message_id=10)
-            deferred = asyncio.Event()
-            original_defer = interaction.response.defer
-
-            async def recording_defer(**kwargs):
-                await original_defer(**kwargs)
-                deferred.set()
-
-            interaction.response.defer = recording_defer
-            lock = panel_lock(guild.id, "music")
-            await lock.acquire()
-            task = asyncio.create_task(cog.skip(interaction))
-            await deferred.wait()
-            settings.set_music_panel_msg(guild.id, 20)
-            lock.release()
-            await task
-
-        self.assertEqual(player.snapshot(), before)
-        self.assertIn("최신", interaction.followup.messages[0][0][0])
-
-    async def test_permission_denials_do_not_change_player_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cog, guild, _, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            player.current = MusicTrack("남의 곡", "https://example.com/1", 999)
-            before = player.snapshot()
-
-            skip = _MusicInteraction(guild, user_id=123)
-            await cog.skip(skip)
-            pause = _MusicInteraction(guild, user_id=123)
-            await cog.pause(pause)
-            stop = _MusicInteraction(guild, user_id=123)
-            await cog.stop(stop)
-
-        self.assertEqual(player.snapshot(), before)
-        for interaction in (skip, pause, stop):
-            messages = interaction.followup.messages or interaction.response.messages
-            self.assertTrue(messages[0][1]["ephemeral"])
-
-    async def test_invalid_url_and_other_voice_channel_do_not_mutate_or_move_player(self):
-        class VoiceChannel:
-            def __init__(self):
-                self.connects = 0
-
-            def permissions_for(self, member):
-                return SimpleNamespace(connect=True, speak=True)
-
-            async def connect(self):
-                self.connects += 1
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(music_cog, "extract_track") as extract:
-            cog, guild, _, _ = self._cog(directory)
-            requested = VoiceChannel()
-            connected_elsewhere = SimpleNamespace(channel=VoiceChannel())
-            guild.voice_client = connected_elsewhere
-            interaction = _MusicInteraction(guild, voice_channel=requested)
-            await cog.add_url(interaction, "https://example.com/song")
-
-            guild.voice_client = None
-            invalid = _MusicInteraction(guild, voice_channel=requested)
-            await cog.add_url(invalid, "not-a-url")
-
-        extract.assert_not_awaited()
-        self.assertEqual(cog.players, {})
-        self.assertEqual(requested.connects, 0)
-        self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
-        self.assertTrue(invalid.response.messages[0][1]["ephemeral"])
-
-    async def test_add_requires_user_voice_and_bot_connect_and_speak_permissions(self):
-        class VoiceChannel:
-            def __init__(self, connect, speak):
-                self.permissions = SimpleNamespace(connect=connect, speak=speak)
-
-            def permissions_for(self, member):
-                return self.permissions
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(music_cog, "extract_track") as extract:
-            cog, guild, _, _ = self._cog(directory)
-            interactions = [
-                _MusicInteraction(guild, voice_channel=None),
-                _MusicInteraction(guild, voice_channel=VoiceChannel(False, True)),
-                _MusicInteraction(guild, voice_channel=VoiceChannel(True, False)),
-            ]
-            for interaction in interactions:
-                await cog.add_url(interaction, "https://example.com/song")
-
-        extract.assert_not_awaited()
-        self.assertEqual(cog.players, {})
-        self.assertTrue(
-            all(interaction.response.messages[0][1]["ephemeral"] for interaction in interactions)
-        )
-
-    async def test_add_revalidates_voice_and_permissions_after_slow_extraction(self):
-        class VoiceChannel:
-            def __init__(self):
-                self.permissions = SimpleNamespace(connect=True, speak=True)
-                self.connects = 0
-
-            def permissions_for(self, member):
-                return self.permissions
-
-            async def connect(self):
-                self.connects += 1
-
-        async def suspend_then_change(cog, guild, change):
-            started = asyncio.Event()
-            release = asyncio.Event()
-            channel = VoiceChannel()
-            interaction = _MusicInteraction(guild, voice_channel=channel)
-
-            async def slow_extract(url, requester_id):
-                started.set()
-                await release.wait()
-                return MusicTrack("새 곡", url, requester_id)
-
-            with patch.object(music_cog, "extract_track", side_effect=slow_extract):
-                adding = asyncio.create_task(
-                    cog.add_url(interaction, "https://example.com/song")
-                )
-                await asyncio.wait_for(started.wait(), timeout=1)
-                change(interaction, channel)
-                release.set()
-                await asyncio.wait_for(adding, timeout=1)
-            return interaction, channel
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, _, _ = self._cog(directory)
-            left, left_channel = await suspend_then_change(
-                cog, guild, lambda interaction, channel: setattr(
-                    interaction.user.voice, "channel", None
-                )
-            )
-            revoked, revoked_channel = await suspend_then_change(
-                cog, guild, lambda interaction, channel: setattr(
-                    channel.permissions, "speak", False
-                )
-            )
-
-        self.assertEqual(left_channel.connects, 0)
-        self.assertEqual(revoked_channel.connects, 0)
-        self.assertEqual(cog.players, {})
-        self.assertIn("바뀌", left.followup.messages[0][0][0])
-        self.assertIn("권한", revoked.followup.messages[0][0][0])
-
-    async def test_valid_modal_url_is_extracted_connected_and_queued(self):
-        track = MusicTrack("새 곡", "https://example.com/song", 123)
-
-        class VoiceChannel:
-            def __init__(self, guild):
-                self.guild = guild
-
-            def permissions_for(self, member):
-                return SimpleNamespace(connect=True, speak=True)
-
-            async def connect(self):
-                voice = _FakeVoiceClient(self)
-                self.guild.voice_client = voice
-                return voice
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(
-            music_cog, "extract_track", return_value=track
-        ) as extract, patch.object(
-            MusicPlayer, "start_if_idle", return_value=None
-        ) as start:
-            cog, guild, settings, _ = self._cog(directory)
-            channel = VoiceChannel(guild)
-            interaction = _MusicInteraction(guild, voice_channel=channel)
-            await cog.add_url(interaction, "https://example.com/song")
-            self.assertIsNotNone(settings.get_music_panel_msg(guild.id))
-
-        extract.assert_awaited_once_with("https://example.com/song", 123)
-        start.assert_awaited_once_with()
-        self.assertEqual(cog.get_player(guild.id).snapshot().queue, (track,))
-        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
-
-    async def test_queue_and_start_use_the_same_player_instance(self):
-        """get_player()를 두 번 부르면 그 사이 정리된 player에 곡을 잃는다."""
-        track = MusicTrack("새 곡", "https://example.com/song", 123)
-
-        class VoiceChannel:
-            def __init__(self, guild):
-                self.guild = guild
-
-            def permissions_for(self, member):
-                return SimpleNamespace(connect=True, speak=True)
-
-            async def connect(self):
-                voice = _FakeVoiceClient(self)
-                self.guild.voice_client = voice
-                return voice
-
-        handed_out = []
-        started = []
-
-        async def record_start(self):
-            started.append(self)
-            return None
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(music_cog, "extract_track", return_value=track):
-            cog, guild, _, _ = self._cog(directory)
-            real_get_player = cog.get_player
-
-            def counting_get_player(guild_id):
-                player = real_get_player(guild_id)
-                handed_out.append(player)
-                return player
-
-            with patch.object(cog, "get_player", counting_get_player), patch.object(
-                MusicPlayer, "start_if_idle", record_start
-            ):
-                interaction = _MusicInteraction(
-                    guild, voice_channel=VoiceChannel(guild)
-                )
-                await cog.add_url(interaction, "https://example.com/song")
-
-        self.assertEqual(len(handed_out), 1)
-        self.assertEqual(started, handed_out)
-        self.assertEqual(handed_out[0].snapshot().queue, (track,))
-
-    async def test_initial_voice_play_failure_reports_error_and_preserves_queue(self):
-        track = MusicTrack("실패 곡", "https://example.com/song", 123)
-
-        class VoiceChannel:
-            def __init__(self, guild):
-                self.guild = guild
-
-            def permissions_for(self, member):
-                return SimpleNamespace(connect=True, speak=True)
-
-            async def connect(self):
-                voice = _FakeVoiceClient(
-                    self, play_error=discord.ClientException("voice unavailable")
-                )
-                self.guild.voice_client = voice
-                return voice
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ), patch.object(
-            music_cog, "extract_track", return_value=track
-        ):
-            cog, guild, _, _ = self._cog(directory)
-            interaction = _MusicInteraction(
-                guild, voice_channel=VoiceChannel(guild)
-            )
-            with self.assertLogs(music_cog.logger, level="ERROR"):
-                await cog.add_url(interaction, "https://example.com/song")
-
-        snapshot = cog.get_player(guild.id).snapshot()
-        self.assertEqual(snapshot.queue, (track,))
-        self.assertIsNone(snapshot.current)
-        self.assertIn("시작하지 못", snapshot.error)
-        self.assertTrue(all(source.cleaned for source in self.sources))
-        self.assertIn("대기열은 보존", interaction.followup.messages[0][0][0])
-        self.assertNotIn("✅", interaction.followup.messages[0][0][0])
-
-    async def test_automatic_next_track_voice_failure_is_visible_on_panel(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, settings, _ = self._cog(directory)
-            voice_channel = _FakeVoiceChannel([_FakeVoiceMember(user_id=1)])
-            voice = _FakeVoiceClient(voice_channel)
-            player = cog.get_player(guild.id)
-            await player.enqueue(voice, _music_track(1))
-            await player.enqueue(voice, _music_track(2))
-            voice.play_error = discord.ClientException("voice unavailable")
-
-            with self.assertLogs(music_cog.logger, level="ERROR"):
-                voice.stop()
-                self.assertTrue(
-                    await self._wait_until(lambda: player.snapshot().error is not None)
-                )
-            message = guild.channel.messages[settings.get_music_panel_msg(guild.id)]
-
-        embed = message.edits[-1]["embed"]
-        self.assertIn("재생 오류", embed.fields[0].value)
-        self.assertEqual(player.snapshot().queue, (_music_track(2),))
-
-    async def test_remove_rechecks_position_and_requester_under_panel_lock(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, _, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            first, second = _music_track(1), _music_track(2)
-            player.queue.extend((first, second))
-            denied = _MusicInteraction(guild, user_id=999)
-            await cog.remove_selected(denied, 1, first)
-            stale = _MusicInteraction(guild, user_id=_music_track(1).requester_id)
-            await cog.remove_selected(stale, 3, first)
-            allowed = _MusicInteraction(guild, user_id=_music_track(1).requester_id)
-            await cog.remove_selected(allowed, 1, first)
-
-        self.assertEqual(player.snapshot().queue, (_music_track(2),))
-        self.assertIn("요청자", denied.followup.messages[0][0][0])
-        self.assertIn("바뀌", stale.followup.messages[0][0][0])
-        self.assertIn("제거", allowed.followup.messages[0][0][0])
-
-    async def test_remove_select_rejects_a_shifted_but_still_valid_snapshot_item(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, _, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            first, selected, shifted = _music_track(1), _music_track(2), _music_track(3)
-            player.queue.extend((first, selected, shifted))
-            select = MusicRemoveView(cog, player.snapshot().queue).children[0]
-            player.queue.popleft()
-            select._values = ["2"]
-            interaction = _MusicInteraction(guild, manager=True)
-
-            await select.callback(interaction)
-
-        self.assertEqual(player.snapshot().queue, (selected, shifted))
-        self.assertIn("바뀌", interaction.followup.messages[0][0][0])
-
-    async def test_voice_api_stop_failure_is_ephemeral_logged_and_preserves_metadata(self):
-        class FailingVoice(_FakeVoiceClient):
-            async def disconnect(self, *, force=False):
-                raise discord.ClientException("voice unavailable")
-
-        with tempfile.TemporaryDirectory() as directory:
-            cog, guild, _, _ = self._cog(directory)
-            player = cog.get_player(guild.id)
-            player.voice_client = FailingVoice()
-            player.current = _music_track(1)
-            player.queue.append(_music_track(2))
-            before = player.snapshot()
-            interaction = _MusicInteraction(guild, manager=True)
-
-            with self.assertLogs(music_cog.logger, level="ERROR"):
-                await cog.stop(interaction)
-
-        self.assertEqual(player.snapshot(), before)
-        self.assertIs(cog.players[guild.id], player)
-        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
-
-    async def test_empty_channel_renders_idle_and_evicts_player(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value=None
-        ):
-            cog, guild, settings, _ = self._cog(directory)
-            bot_member = _FakeVoiceMember(bot=True, user_id=BOT_USER_ID)
-            leaving = _FakeVoiceMember(user_id=1)
-            channel = _FakeVoiceChannel([bot_member, leaving])
-            player = cog.get_player(guild.id)
-            voice = _FakeVoiceClient(channel)
-            await player.enqueue(voice, _music_track(1))
-            channel.members.remove(leaving)
-            advance_finished = asyncio.Event()
-            original_advance = player._advance
-
-            async def observed_advance():
-                try:
-                    await original_advance()
-                finally:
-                    advance_finished.set()
-
-            with patch.object(player, "_advance", side_effect=observed_advance):
-                await cog.on_voice_state_update(
-                    leaving, _FakeVoiceState(channel), _FakeVoiceState(None)
-                )
-                await asyncio.wait_for(advance_finished.wait(), timeout=1)
-            panel_message_id = settings.get_music_panel_msg(guild.id)
-            self.assertIsNotNone(panel_message_id)
-            message = guild.channel.messages[panel_message_id]
-
-        self.assertNotIn(guild.id, cog.players)
-        embed = message.edits[-1]["embed"]
-        self.assertEqual(embed.fields[0].value, "⏹️ 대기 중")
-
-    async def test_startup_restores_each_configured_panel_once(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cog, guild, _, _ = self._cog(directory)
-            with patch.object(cog, "ensure_panel") as ensure:
-                await cog.on_ready()
-                await cog.on_ready()
-
-        ensure.assert_awaited_once_with(guild)
 
 
 class RecordingResponse:
     def __init__(self):
         self.messages = []
         self.deferred = False
+        self.defer_kwargs = []
         self.modal = None
 
     async def send_message(self, *args, **kwargs):
@@ -1492,6 +130,7 @@ class RecordingResponse:
 
     async def defer(self, **kwargs):
         self.deferred = True
+        self.defer_kwargs.append(kwargs)
 
     async def send_modal(self, modal):
         self.modal = modal
@@ -1562,106 +201,11 @@ class FakeInteraction:
         self.message = SimpleNamespace(id=message_id) if message_id is not None else None
 
 
-class FinanceCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def test_all_tickers_start_before_any_result_is_released(self):
-        cog = FinanceCog(bot=None)
-        interaction = FakeInteraction(channel_id=1)
-        started = 0
-        all_started = asyncio.Event()
-
-        async def controlled_to_thread(function, symbol):
-            nonlocal started
-            started += 1
-            if started == len(cog.tickers):
-                all_started.set()
-            await all_started.wait()
-            return function(symbol)
-
-        with patch.object(
-            FinanceCog,
-            "get_stock_data",
-            return_value={"price": 1.0, "change": 0.0, "change_percent": 0.0},
-        ) as get_stock_data, patch(
-            "module.finance_cog.asyncio.to_thread", side_effect=controlled_to_thread
-        ):
-            await asyncio.wait_for(
-                FinanceCog.stock_price.callback(cog, interaction), timeout=1
-            )
-
-        self.assertEqual(started, len(cog.tickers))
-        self.assertEqual(get_stock_data.call_count, len(cog.tickers))
-        self.assertTrue(interaction.response.deferred)
-        self.assertEqual(len(interaction.followup.messages), 1)
-        self.assertEqual(len(interaction.followup.messages[0][1]["embed"].fields), len(cog.tickers))
-
-
-class FinanceTimeoutAndCacheTests(unittest.IsolatedAsyncioTestCase):
-    async def test_slow_ticker_does_not_block_the_other_results(self):
-        cog = FinanceCog(bot=None)
-        slow_symbol = list(cog.tickers.values())[0]
-
-        def fetch(symbol):
-            return {"price": 1.0, "change": 0.0, "change_percent": 0.0}
-
-        async def maybe_hang(function, symbol):
-            if symbol == slow_symbol:
-                await asyncio.sleep(10)
-            return function(symbol)
-
-        interaction = FakeInteraction(channel_id=1)
-        with patch.object(FinanceCog, "get_stock_data", side_effect=fetch), patch(
-            "module.finance_cog.FETCH_TIMEOUT_SECONDS", 0.05
-        ), patch("module.finance_cog.asyncio.to_thread", side_effect=maybe_hang):
-            await asyncio.wait_for(
-                FinanceCog.stock_price.callback(cog, interaction), timeout=2
-            )
-
-        fields = interaction.followup.messages[0][1]["embed"].fields
-        failed = [field for field in fields if field.value == "데이터 조회 실패"]
-        self.assertEqual(len(fields), len(cog.tickers))
-        self.assertEqual(len(failed), 1)
-
-    async def test_second_call_within_ttl_uses_cache(self):
-        cog = FinanceCog(bot=None)
-        calls = []
-
-        def fetch(symbol):
-            calls.append(symbol)
-            return {"price": 1.0, "change": 0.0, "change_percent": 0.0}
-
-        with patch.object(FinanceCog, "get_stock_data", side_effect=fetch):
-            await FinanceCog.stock_price.callback(cog, FakeInteraction(channel_id=1))
-            self.assertEqual(len(calls), len(cog.tickers))
-            await FinanceCog.stock_price.callback(cog, FakeInteraction(channel_id=1))
-            self.assertEqual(len(calls), len(cog.tickers))
-
-    async def test_expired_cache_is_served_when_the_fetch_times_out(self):
-        cog = FinanceCog(bot=None)
-        symbol = list(cog.tickers.values())[0]
-        cog._cache[symbol] = (0.0, {"price": 9.0, "change": 0.0, "change_percent": 0.0})
-
-        async def always_hang(function, argument):
-            await asyncio.sleep(10)
-
-        with patch("module.finance_cog.CACHE_TTL_SECONDS", 0.0), patch(
-            "module.finance_cog.FETCH_TIMEOUT_SECONDS", 0.05
-        ), patch("module.finance_cog.asyncio.to_thread", side_effect=always_hang):
-            data = await cog._fetch(symbol)
-
-        self.assertEqual(data["price"], 9.0)
-
-
-class RecordingAttendance:
-    def __init__(self, refund_error=None, reserve_result=("2026-08-04", 1), deduct_result=True, usage=None):
-        self.deductions = []
-        self.refunds = []
-        self.refund_attempts = []
-        self.reasons = []
+class RecordingUsage:
+    def __init__(self, reserve_result=("2026-08-04", 1), usage=None):
         self.reservations = []
         self.releases = []
-        self.refund_error = refund_error
         self.reserve_result = reserve_result
-        self.deduct_result = deduct_result
         self.usage = usage or {}
 
     async def reserve_ai_usage(self, user_id, command, limit):
@@ -1675,21 +219,6 @@ class RecordingAttendance:
     async def get_ai_usage(self, user_id, command):
         return self.usage.get(command, 0)
 
-    async def deduct_points(self, guild_id, user_id, amount, reason="unspecified"):
-        self.deductions.append((user_id, amount))
-        self.reasons.append(reason)
-        return self.deduct_result
-
-    async def get_points(self, guild_id, user_id):
-        return 0
-
-    async def add_points(self, guild_id, user_id, amount, reason="unspecified"):
-        self.reasons.append(reason)
-        self.refund_attempts.append((user_id, amount))
-        if self.refund_error:
-            raise self.refund_error
-        self.refunds.append((user_id, amount))
-
 
 class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1697,8 +226,8 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.google_key.start()
         self.addCleanup(self.google_key.stop)
 
-    async def test_daily_limit_stops_before_points_and_provider(self):
-        attendance = RecordingAttendance(reserve_result=None)
+    async def test_daily_limit_stops_before_the_provider_call(self):
+        attendance = RecordingUsage(reserve_result=None)
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
         provider_calls = []
@@ -1714,22 +243,11 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
             attendance.reservations,
             [(123, "image", config.LIMIT_IMAGE)],
         )
-        self.assertEqual(attendance.deductions, [])
         self.assertEqual(provider_calls, [])
         self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
 
-    async def test_insufficient_points_releases_reserved_slot(self):
-        attendance = RecordingAttendance(deduct_result=False)
-        interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-        self.assertIn("포인트가 부족", interaction.response.messages[-1][0][0])
-
-    async def test_defer_failure_refunds_points_and_releases_slot(self):
-        attendance = RecordingAttendance()
+    async def test_defer_failure_releases_the_reserved_slot(self):
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
 
@@ -1742,110 +260,10 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await HyacineImageCog._image.callback(cog, interaction, "test")
 
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
         self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-
-    async def test_defer_and_refund_failures_request_manual_reconciliation_once(self):
-        attendance = RecordingAttendance(
-            refund_error=RuntimeError("database unavailable")
-        )
-        interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        async def fail_defer():
-            raise RuntimeError("defer transport failed")
-
-        interaction.response.defer = fail_defer
-        escaped = None
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            try:
-                await HyacineImageCog._image.callback(cog, interaction, "test")
-            except Exception as exc:
-                escaped = exc
-
-        self.assertIsNone(escaped)
-        self.assertEqual(attendance.refund_attempts, [(123, 30_000)])
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
-        messages = interaction.response.messages + interaction.followup.messages
-        self.assertTrue(messages)
-        message = messages[-1][0][0]
-        self.assertIn("자동 환불에 실패", message)
-        self.assertIn("관리자", message)
-        self.assertIn("수동 정산", message)
-
-    async def test_generation_exception_refunds_once_when_error_message_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-
-        def fail_generation(**_):
-            raise RuntimeError("provider failed")
-
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(generate_content=fail_generation)
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
-        self.assertEqual(attendance.releases, [])
-
-    async def test_empty_image_response_refunds_only_once_when_error_message_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(
-                generate_content=lambda **_: SimpleNamespace(parts=[])
-            )
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [(123, 30_000)])
-
-    async def test_generated_image_is_not_refunded_when_discord_upload_fails(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
-        part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
-        cog.client = SimpleNamespace(
-            models=SimpleNamespace(
-                generate_content=lambda **_: SimpleNamespace(parts=[part])
-            )
-        )
-
-        with patch("module.hyacine_image_cog.print"), patch(
-            "module.hyacine_image_cog.traceback.print_exc"
-        ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
-
-        self.assertEqual(attendance.refunds, [])
-        self.assertIn(
-            "이미지는 생성되었지만 Discord 전송에 실패했습니다.",
-            interaction.followup.messages[-1][0][0],
-        )
-        self.assertNotIn("환불", interaction.followup.messages[-1][0][0])
 
     async def test_long_prompt_is_truncated_in_embed(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
         temp_dir = tempfile.TemporaryDirectory()
@@ -1874,7 +292,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["contents"], [prompt])
 
     async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         interaction.followup = RecordingFollowup(fail_on_call=1)
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
@@ -1896,7 +314,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(pathlib.Path(temp_dir.name).iterdir()), [])
 
 
-class DisappearingAttendanceBot:
+class DisappearingUsageBot:
     def __init__(self, attendance):
         self.attendance = attendance
         self.calls = 0
@@ -1911,7 +329,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
-        self.attendance = RecordingAttendance()
+        self.attendance = RecordingUsage()
         self.cog = HyacineChatCog(
             bot=SimpleNamespace(get_cog=lambda _: self.attendance)
         )
@@ -1938,8 +356,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
-                (basic, "기본 대화", None, "gpt-5.6-terra", "none", 200, "light", config.LIMIT_LIGHT),
-                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000, "deep", config.LIMIT_DEEP),
+                (basic, "기본 대화", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+                (advanced, "고급 대화", None, "gpt-5.6-sol", "medium", "deep", config.LIMIT_DEEP),
             ],
         )
 
@@ -1958,7 +376,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
                 return self.counts[command]
 
         repository = RecordingUsageRepository()
-        attendance = AttendanceCog(bot=None, repository=repository)
+        attendance = UsageCog(bot=None, repository=repository)
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
         self.cog.get_session(1).last_usage = {
@@ -1968,7 +386,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 46,
         }
 
-        with patch("module.attendance_cog.datetime") as mocked_datetime:
+        with patch("module.usage_cog.datetime") as mocked_datetime:
             mocked_datetime.now.return_value = datetime(2026, 8, 5, 0, 1, tzinfo=KST)
             await HyacineChatCog._status.callback(self.cog, interaction)
 
@@ -2011,8 +429,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("46", message)
         self.assertIn("확인할 수 없어요", message)
 
-    async def test_daily_limit_stops_before_points_and_provider(self):
-        attendance = RecordingAttendance(reserve_result=None)
+    async def test_daily_limit_stops_before_the_provider_call(self):
+        attendance = RecordingUsage(reserve_result=None)
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
         provider_calls = []
@@ -2025,23 +443,30 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.cog._run_talk(
-            interaction, "test", None, "gpt-5.6-terra", "none", 200,
+            interaction, "test", None, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
 
-        self.assertEqual(attendance.deductions, [])
         self.assertEqual(provider_calls, [])
         self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
 
-    async def test_insufficient_points_releases_reserved_slot(self):
-        attendance = RecordingAttendance(deduct_result=False)
+    async def test_pre_api_failure_releases_the_reserved_slot(self):
+        """API 호출 전에 실패하면 일일 한도를 돌려준다."""
+        attendance = RecordingUsage()
         self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
         interaction = FakeInteraction(channel_id=1)
 
-        await self.cog._run_talk(
-            interaction, "test", None, "gpt-5.6-terra", "none", 200,
-            "light", config.LIMIT_LIGHT,
-        )
+        async def fail_defer():
+            raise RuntimeError("defer transport failed")
+
+        interaction.response.defer = fail_defer
+        with patch("module.hyacine_chat_cog.print"), patch(
+            "module.hyacine_chat_cog.traceback.print_exc"
+        ):
+            await self.cog._run_talk(
+                interaction, "test", None, "gpt-5.6-terra", "none",
+                "light", config.LIMIT_LIGHT,
+            )
 
         self.assertEqual(attendance.releases, [(123, "2026-08-04", "light")])
 
@@ -2066,7 +491,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             responses=SimpleNamespace(create=response)
         )
         await self.cog._run_talk(
-            interaction, "", attachment, "gpt-5.6-terra", "none", 0,
+            interaction, "", attachment, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
 
@@ -2075,98 +500,6 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             attachment.url, repr(list(self.cog.get_session(1).history))
         )
 
-    async def test_pre_api_exception_refunds_with_the_original_attendance_cog(self):
-        attendance = RecordingAttendance()
-        bot = DisappearingAttendanceBot(attendance)
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = bot
-
-        def fail_before_api(*args):
-            raise RuntimeError("attachment processing failed")
-
-        self.cog.build_user_parts = fail_before_api
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.deductions, [(123, 2_000)])
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(bot.calls, 1)
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
-        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_empty_response_refunds_charged_points(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def empty_response(**kwargs):
-            return SimpleNamespace(output_text="")
-
-        self.cog.client = SimpleNamespace(
-            responses=SimpleNamespace(create=empty_response)
-        )
-
-        with patch("module.hyacine_chat_cog.traceback.print_exc"):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_refund_note_is_omitted_when_refund_fails(self):
-        attendance = RecordingAttendance(refund_error=RuntimeError("database unavailable"))
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def empty_response(**kwargs):
-            return SimpleNamespace(output_text="")
-
-        self.cog.client = SimpleNamespace(
-            responses=SimpleNamespace(create=empty_response)
-        )
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertNotIn("포인트 환불됨", interaction.followup.messages[-1][0][0])
-
-    async def test_failed_defer_refunds_and_uses_initial_response(self):
-        attendance = RecordingAttendance()
-        interaction = FakeInteraction(channel_id=1)
-        self.cog.bot = DisappearingAttendanceBot(attendance)
-
-        async def fail_defer():
-            raise RuntimeError("defer transport failed")
-
-        interaction.response.defer = fail_defer
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await self.cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "deep")])
-        self.assertEqual(interaction.followup.messages, [])
-        self.assertIn("포인트 환불됨", interaction.response.messages[-1][0][0])
-
-
 class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
@@ -2174,7 +507,7 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.openai_key.stop)
 
     async def test_same_channel_calls_do_not_interleave_history(self):
-        attendance = RecordingAttendance()
+        attendance = RecordingUsage()
         cog = HyacineChatCog(bot=SimpleNamespace(get_cog=lambda _: attendance))
         # 첫 호출의 응답이 두 번째보다 늦게 끝나도록 지연시킨다.
         delays = {"first": 0.05, "second": 0.0}
@@ -2191,8 +524,8 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(responses=SimpleNamespace(create=delayed))
 
         await asyncio.gather(
-            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
-            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", 0, "light", config.LIMIT_LIGHT),
+            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
         )
 
         roles = [m["role"] for m in cog.get_session(1).history if m["role"] != "system"]
@@ -2254,8 +587,8 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(model_label, descriptions)
 
     async def test_cooldown_notice_is_ephemeral_and_charges_nothing(self):
-        attendance = RecordingAttendance()
-        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
+        attendance = RecordingUsage()
+        cog = HyacineChatCog(bot=DisappearingUsageBot(attendance))
         interaction = FakeInteraction(channel_id=1)
         error = discord.app_commands.CommandOnCooldown(
             discord.app_commands.Cooldown(1, 15), 7.4
@@ -2266,85 +599,24 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = interaction.response.messages[-1]
         self.assertIs(kwargs.get("ephemeral"), True)
         self.assertIn("7초", args[0])
-        self.assertEqual(attendance.deductions, [])
-
-    async def test_rate_limit_error_gets_its_own_notice_and_refund(self):
-        attendance = RecordingAttendance()
-        cog = HyacineChatCog(bot=DisappearingAttendanceBot(attendance))
-        interaction = FakeInteraction(channel_id=1)
-
-        async def rate_limited(**kwargs):
-            raise openai.RateLimitError(
-                "rate limited",
-                response=httpx.Response(
-                    429, request=httpx.Request("POST", "https://api.openai.com")
-                ),
-                body=None,
-            )
-
-        cog.client = SimpleNamespace(responses=SimpleNamespace(create=rate_limited))
-
-        with patch("module.hyacine_chat_cog.print"), patch(
-            "module.hyacine_chat_cog.traceback.print_exc"
-        ):
-            await cog._run_talk(
-                interaction, "고급 대화", None, "gpt-5.6-sol", "medium", 2_000,
-                "deep", config.LIMIT_DEEP,
-            )
-
-        message = interaction.followup.messages[-1][0][0]
-        self.assertIn("요청이 몰려", message)
-        self.assertIn("포인트 환불됨", message)
-        self.assertEqual(attendance.refunds, [(123, 2_000)])
-        self.assertEqual(attendance.releases, [])
-
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         root = pathlib.Path(self.temp_dir.name)
-        self.attendance = AttendanceCog(
+        self.usage = UsageCog(
             bot=None,
-            repository=SQLiteAttendanceRepository(root / "attendance.db"),
+            repository=SQLiteUsageRepository(root / "usage.db"),
         )
         self.party_repository = SQLitePartyRepository(root / "party.db")
         with patch("discord.ext.tasks.Loop.start"):
             self.play = PlayWithCog(bot=None, repository=self.party_repository)
 
-    async def test_attendance_wallet_and_profile_successes_are_ephemeral(self):
-        for command in (
-            AttendanceCog._attend,
-            AttendanceCog._wallet,
-            AttendanceCog._profile,
-        ):
-            interaction = FakeInteraction(channel_id=1)
-            await command.callback(self.attendance, interaction)
-            self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
-
-    async def test_attendance_balance_matches_db_and_duplicate_only_responds_duplicate(self):
-        self.attendance.db.add_points(TEST_GUILD_ID, FakeUser.id, 2_000)
-
-        success = FakeInteraction(channel_id=1)
-        with patch("module.attendance_cog.random.randint", return_value=7_000):
-            await AttendanceCog._attend.callback(self.attendance, success)
-
-        success_args, success_kwargs = success.response.messages[0]
-        self.assertEqual(success_args, ())
-        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
-        self.assertEqual(success_kwargs["embed"].fields[0].value, "9,000 P")
-
-        duplicate = FakeInteraction(channel_id=1)
-        with patch("module.attendance_cog.random.randint", return_value=30_000):
-            await AttendanceCog._attend.callback(self.attendance, duplicate)
-
-        duplicate_args, duplicate_kwargs = duplicate.response.messages[0]
-        self.assertEqual(len(duplicate.response.messages), 1)
-        self.assertEqual(len(duplicate_args), 1)
-        self.assertIn("이미 출석", duplicate_args[0])
-        self.assertNotIn("embed", duplicate_kwargs)
-        self.assertIs(duplicate_kwargs.get("ephemeral"), True)
-        self.assertEqual(self.attendance.db.get_points(TEST_GUILD_ID, FakeUser.id), 9_000)
+    async def test_profile_success_is_ephemeral(self):
+        interaction = FakeInteraction(channel_id=1)
+        await UsageCog._profile.callback(self.usage, interaction)
+        self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
 
     async def test_legacy_party_slash_commands_are_removed(self):
         for command in ("모집", "파티", "나가기", "변경"):
@@ -2852,15 +1124,17 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeMessage:
-    def __init__(self, content, guild_id=None):
+    def __init__(self, content, guild_id=None, channel_id=1, author_is_bot=False):
         self.content = content
-        self.author = SimpleNamespace(bot=False, id=FakeUser.id, mention=FakeUser.mention)
+        self.author = SimpleNamespace(
+            bot=author_is_bot, id=FakeUser.id, mention=FakeUser.mention
+        )
         self.guild = (
             None
             if guild_id is None
             else SimpleNamespace(id=guild_id)
         )
-        self.channel = SimpleNamespace(send=self._send)
+        self.channel = SimpleNamespace(id=channel_id, send=self._send)
         self.sent = []
 
     async def _send(self, text):
@@ -2875,16 +1149,30 @@ class RecordingForbiddenCounts:
         self.counts.append(user_id)
 
 
-def make_forbidden_cog(counter, words=("나쁜말",)):
+class RecordingFilterSettings:
+    """금지어 on/off만 기억하는 GuildSettingsRepository 대역."""
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.reads = 0
+
+    def get_forbidden_filter_enabled(self, guild_id):
+        self.reads += 1
+        return self.enabled
+
+
+def make_forbidden_cog(counter, words=("나쁜말",), document=None, settings=None):
     with tempfile.TemporaryDirectory() as directory:
         pathlib.Path(directory, "forbidden_words.json").write_text(
-            json.dumps(list(words)), encoding="utf-8"
+            json.dumps(list(words) if document is None else document),
+            encoding="utf-8",
         )
         with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)), patch(
             "module.forbiddenfilter_cog.print"
         ):
             cog = forbiddenfilter_cog.ForbiddenFilterCog(
-                SimpleNamespace(get_cog=lambda _: counter)
+                SimpleNamespace(get_cog=lambda name: counter),
+                settings or RecordingFilterSettings(),
             )
     return cog
 
@@ -2898,7 +1186,9 @@ class ForbiddenFilterDegradesTest(unittest.TestCase):
     def test_cog_constructs_without_word_file(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                cog = forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+                cog = forbiddenfilter_cog.ForbiddenFilterCog(
+                    bot=None, settings=RecordingFilterSettings()
+                )
         self.assertIsNone(cog._find_match("아무 말이나"))
 
 
@@ -3055,10 +1345,10 @@ class _SetupGuild:
 
 
 class _SetupBot:
-    def __init__(self, play_cog=None, music_cog=None):
+    def __init__(self, play_cog=None, filter_cog=None):
         self.views = []
         self.play_cog = play_cog
-        self.music_cog = music_cog
+        self.filter_cog = filter_cog
 
     def add_view(self, view):
         self.views.append(view)
@@ -3066,9 +1356,7 @@ class _SetupBot:
     def get_cog(self, name):
         if name == "PlayWithCog":
             return self.play_cog
-        if name == "MusicCog":
-            return self.music_cog
-        return None
+        return self.filter_cog if name == "ForbiddenFilterCog" else None
 
 
 class _DeferredSetupResponse:
@@ -3090,6 +1378,90 @@ class _DeferredSetupFollowup:
         self.events.append(("followup", args, kwargs))
 
 
+class ForbiddenFilterSettingCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_toggle_persists_and_invalidates_the_filter_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            invalidated = []
+            filter_cog = SimpleNamespace(invalidate_guild=invalidated.append)
+            cog = GuildSettingsCog(_SetupBot(filter_cog=filter_cog), settings)
+
+            self.assertTrue(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+
+            self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+            self.assertEqual(invalidated, [TEST_GUILD_ID])
+            self.assertIn("껐", interaction.response.messages[0][0][0])
+
+            await GuildSettingsCog._forbidden_filter.callback(
+                cog, SimpleNamespace(guild_id=TEST_GUILD_ID, response=RecordingResponse()), True
+            )
+            self.assertTrue(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+    async def test_show_reports_the_filter_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            settings.set_forbidden_filter_enabled(TEST_GUILD_ID, False)
+
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._show.callback(cog, interaction)
+
+        embed = interaction.response.messages[0][1]["embed"]
+        field = next(f for f in embed.fields if f.name == "금지어 필터")
+        self.assertEqual(field.value, "꺼짐")
+
+    async def test_toggle_survives_a_missing_filter_cog(self):
+        """금지어 확장이 로드되지 않은 인스턴스에서도 설정은 저장돼야 한다."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID, response=RecordingResponse()
+            )
+            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+            self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
+
+
+class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
+    def test_greeting_loads_without_any_ai_key(self):
+        env = {"ADMIN_TOKEN": "t", "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
+        with patch.object(bot_main, "ENV_VALUES", env):
+            names = bot_main.available_extensions()
+        self.assertIn("module.greeting_cog", names)
+        self.assertNotIn("module.hyacine_chat_cog", names)
+
+    async def test_greeting_reads_the_current_persona(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "persona.json").write_text(
+                json.dumps({"greeting": "첫 인사"}), encoding="utf-8"
+            )
+            cog = greeting_cog.GreetingCog(bot=None)
+            interaction = FakeInteraction(channel_id=1)
+            with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
+                await greeting_cog.GreetingCog._hello.callback(cog, interaction)
+                (pathlib.Path(directory) / "persona.json").write_text(
+                    json.dumps({"greeting": "바뀐 인사"}), encoding="utf-8"
+                )
+                later = FakeInteraction(channel_id=1)
+                await greeting_cog.GreetingCog._hello.callback(cog, later)
+
+        self.assertIn("첫 인사", interaction.response.messages[0][0][0])
+        self.assertIn("바뀐 인사", later.response.messages[0][0][0])
+
+
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_settings_reject_unsupported_ambient_channels(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -3100,84 +1472,44 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
             guild = _SetupGuild()
             thread = SimpleNamespace(id=77, mention="<#77>")
 
-            for command in (GuildSettingsCog._party_channel, GuildSettingsCog._music_channel):
-                interaction = SimpleNamespace(
-                    guild=guild,
-                    guild_id=guild.id,
-                    channel=thread,
-                    response=RecordingResponse(),
-                    followup=RecordingFollowup(),
-                )
-                await command.callback(cog, interaction, None)
-                self.assertIn("텍스트 채널", interaction.response.messages[0][0][0])
-                self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
-
+            interaction = SimpleNamespace(
+                guild=guild,
+                guild_id=guild.id,
+                channel=thread,
+                response=RecordingResponse(),
+                followup=RecordingFollowup(),
+            )
+            await GuildSettingsCog._party_channel.callback(cog, interaction, None)
+            self.assertIn("텍스트 채널", interaction.response.messages[0][0][0])
+            self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
             self.assertIsNone(settings.get_party_channel(guild.id))
-            self.assertIsNone(settings.get_music_channel(guild.id))
 
             explicit = _SetupChannel(88, "explicit")
-            for command in (GuildSettingsCog._party_channel, GuildSettingsCog._music_channel):
-                interaction = SimpleNamespace(
-                    guild=guild,
-                    guild_id=guild.id,
-                    channel=thread,
-                    response=RecordingResponse(),
-                    followup=RecordingFollowup(),
-                )
-                await command.callback(cog, interaction, explicit)
-                self.assertIn("지정했습니다", interaction.followup.messages[0][0][0])
-
+            interaction = SimpleNamespace(
+                guild=guild,
+                guild_id=guild.id,
+                channel=thread,
+                response=RecordingResponse(),
+                followup=RecordingFollowup(),
+            )
+            await GuildSettingsCog._party_channel.callback(cog, interaction, explicit)
+            self.assertIn("지정했습니다", interaction.followup.messages[0][0][0])
             self.assertEqual(settings.get_party_channel(guild.id), explicit.id)
-            self.assertEqual(settings.get_music_channel(guild.id), explicit.id)
 
-    async def test_setup_completion_ensures_party_and_music_panels(self):
+    async def test_setup_completion_ensures_party_panels(self):
         party_calls = []
-        music_calls = []
 
         async def ensure_panels(guild):
             party_calls.append(guild)
 
-        async def ensure_panel(guild):
-            music_calls.append(guild)
-
         play_cog = SimpleNamespace(ensure_panels=ensure_panels)
-        music_panel_cog = SimpleNamespace(ensure_panel=ensure_panel)
         with tempfile.TemporaryDirectory() as directory:
             settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
             guild = _SetupGuild()
-            cog = GuildSettingsCog(_SetupBot(play_cog, music_panel_cog), settings)
+            cog = GuildSettingsCog(_SetupBot(play_cog), settings)
             await cog._ensure_bot_channels(guild)
 
         self.assertEqual(party_calls, [guild])
-        self.assertEqual(music_calls, [guild])
-
-    async def test_setup_and_settings_show_optional_music_dependency_failure(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            music_cog, "music_dependency_error", return_value="yt-dlp 미설치"
-        ), patch(
-            "module.guildsettings_cog.music_dependency_error",
-            return_value="yt-dlp 미설치",
-        ):
-            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
-            cog = GuildSettingsCog(_SetupBot(), settings)
-            guild = _SetupGuild()
-            interaction = SimpleNamespace(
-                guild=guild,
-                guild_id=guild.id,
-                response=RecordingResponse(),
-                followup=RecordingFollowup(),
-            )
-            await GuildSettingsCog._start.callback(cog, interaction)
-
-            show = SimpleNamespace(
-                guild_id=guild.id,
-                response=RecordingResponse(),
-            )
-            await GuildSettingsCog._show.callback(cog, show)
-
-        self.assertIn("음악 기능 비활성", interaction.followup.messages[0][0][0])
-        music_field = show.response.messages[0][1]["embed"].fields[1]
-        self.assertIn("yt-dlp 미설치", music_field.value)
 
     async def test_deleted_party_channel_is_recreated_with_panels_on_next_setup(self):
         calls = []
@@ -3189,10 +1521,8 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
             settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
             guild = _SetupGuild()
             old_party = _SetupChannel(30, "old-party")
-            music = _SetupChannel(31, "music")
-            guild.channels = {30: old_party, 31: music}
+            guild.channels = {30: old_party}
             settings.set_party_channel(guild.id, 30)
-            settings.set_music_channel(guild.id, 31)
             cog = GuildSettingsCog(
                 _SetupBot(SimpleNamespace(ensure_panels=ensure_panels)), settings
             )
@@ -3201,10 +1531,9 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(id=30, guild=guild)
             )
             guild.channels.pop(30)
-            party, returned_music = await cog._ensure_bot_channels(guild)
+            party = await cog._ensure_bot_channels(guild)
 
         self.assertIsNone(guild.get_channel(30))
-        self.assertIs(returned_music, music)
         self.assertNotEqual(party.id, 30)
         self.assertEqual(calls, [guild])
 
@@ -3225,7 +1554,7 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([category.name for category in guild.created_categories], ["🤖 봇"])
         self.assertEqual(
-            [channel.name for channel, _ in guild.created_channels], ["🎮-파티", "🎵-음악"]
+            [channel.name for channel, _ in guild.created_channels], ["🎮-파티"]
         )
         self.assertEqual(first, second)
         category = guild.created_categories[0]
@@ -3241,7 +1570,7 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot.views[0].is_persistent())
         self.assertEqual(bot.views[0].children[0].custom_id, "setup:start")
         self.assertEqual(len(concurrent_guild.created_categories), 1)
-        self.assertEqual(len(concurrent_guild.created_channels), 2)
+        self.assertEqual(len(concurrent_guild.created_channels), 1)
         self.assertEqual(concurrent[0], concurrent[1])
 
     async def test_setup_reuses_stored_live_channels_without_renaming_them(self):
@@ -3250,15 +1579,13 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
             cog = GuildSettingsCog(_SetupBot(), settings)
             guild = _SetupGuild()
             party = _SetupChannel(30, "party-custom-name")
-            music = _SetupChannel(31, "music-custom-name")
-            guild.channels = {party.id: party, music.id: music}
+            guild.channels = {party.id: party}
             settings.set_party_channel(guild.id, party.id)
-            settings.set_music_channel(guild.id, music.id)
 
             result = await cog.ensure_bot_channels(guild)
 
-        self.assertEqual(result, (party, music))
-        self.assertEqual((party.name, music.name), ("party-custom-name", "music-custom-name"))
+        self.assertIs(result, party)
+        self.assertEqual(party.name, "party-custom-name")
         self.assertEqual(guild.created_categories, [])
         self.assertEqual(guild.created_channels, [])
 
@@ -3341,36 +1668,180 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
 
 
-class RankingCommandTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        repository = SQLiteAttendanceRepository(
-            pathlib.Path(self.temp_dir.name) / "attendance.db"
+class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
+    """채널 버킷은 5개/5초다. 연타에 응답을 그대로 내보내면 레이트리밋에 걸린다."""
+
+    async def test_burst_answers_once_but_counts_every_hit(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        messages = [FakeMessage("나쁜말", guild_id=TEST_GUILD_ID) for _ in range(5)]
+
+        for message in messages:
+            await cog.on_message(message)
+
+        self.assertEqual([len(m.sent) for m in messages], [1, 0, 0, 0, 0])
+        self.assertEqual(counter.counts, [FakeUser.id] * 5)
+
+    async def test_cooldown_is_per_channel(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=1)
+        other = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=2)
+
+        await cog.on_message(first)
+        await cog.on_message(other)
+
+        self.assertEqual(len(first.sent), 1)
+        self.assertEqual(len(other.sent), 1)
+
+    async def test_window_expiry_lets_the_next_hit_answer(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(first)
+
+        # 창이 지난 상황을 시계 대신 마지막 응답 시각으로 만든다.
+        cog._last_response[(TEST_GUILD_ID, 1)] -= (
+            forbiddenfilter_cog.RESPONSE_COOLDOWN_SECONDS + 1
         )
-        repository.add_points(TEST_GUILD_ID, 1, 500)
-        repository.add_points(TEST_GUILD_ID, 2, 400)
-        self.cog = AttendanceCog(bot=None, repository=repository)
+        later = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(later)
 
-    async def test_guild_nickname_wins_and_cache_miss_hides_the_raw_id(self):
-        class PartialGuild:
-            def get_member(self, user_id):
-                return (
-                    SimpleNamespace(display_name="서버 닉네임")
-                    if user_id == 1
-                    else None
-                )
+        self.assertEqual(len(later.sent), 1)
 
-        interaction = FakeInteraction(channel_id=1, guild=PartialGuild())
+    async def test_leaving_a_guild_drops_its_process_state(self):
+        cog = make_forbidden_cog(RecordingForbiddenCounts())
+        await cog.on_message(FakeMessage("나쁜말", guild_id=TEST_GUILD_ID))
+        await cog.on_message(FakeMessage("나쁜말", guild_id=99, channel_id=3))
 
-        await AttendanceCog._ranking.callback(self.cog, interaction)
+        await cog.on_guild_remove(SimpleNamespace(id=TEST_GUILD_ID))
 
-        names = [
-            field.name for field in interaction.response.messages[0][1]["embed"].fields
-        ]
-        self.assertIn("서버 닉네임", names[0])
-        self.assertIn("알 수 없는 유저", names[1])
-        self.assertNotIn("2", names[1].replace("2️⃣", ""))
+        self.assertEqual(list(cog._last_response), [(99, 3)])
+        self.assertNotIn(TEST_GUILD_ID, cog._enabled_cache)
+
+    async def test_bot_messages_are_never_screened(self):
+        """봇 응답이 다시 걸리면 봇끼리 핑퐁이 돈다. 회귀 방지."""
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(counter)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, author_is_bot=True)
+
+        await cog.on_message(message)
+
+        self.assertEqual(message.sent, [])
+        self.assertEqual(counter.counts, [])
+
+
+class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
+    """배열(구형)과 객체(신형) 두 형태를 모두 받는다."""
+
+    def test_legacy_array_keeps_working(self):
+        policy = forbiddenfilter_cog.canonicalize_forbidden_policy(["Bad", " ", 1])
+        self.assertEqual(policy.words, ["bad", "1"])
+        self.assertEqual(policy.template, forbiddenfilter_cog.DEFAULT_TEMPLATE)
+        self.assertEqual(policy.allow, [])
+
+    def test_object_form_reads_template_and_allow(self):
+        policy = forbiddenfilter_cog.canonicalize_forbidden_policy(
+            {"words": ["시장"], "template": "{mention} 금지: {word}", "allow": ["시장님"]}
+        )
+        self.assertEqual((policy.words, policy.allow), (["시장"], ["시장님"]))
+        self.assertEqual(policy.template, "{mention} 금지: {word}")
+
+    def test_document_canonicalization_preserves_shape(self):
+        self.assertEqual(
+            forbiddenfilter_cog.canonicalize_forbidden_document(["A"]), ["a"]
+        )
+        self.assertEqual(
+            forbiddenfilter_cog.canonicalize_forbidden_document({"words": ["A"]}),
+            {
+                "words": ["a"],
+                "template": forbiddenfilter_cog.DEFAULT_TEMPLATE,
+                "allow": [],
+            },
+        )
+
+    def test_strict_rejects_malformed_objects(self):
+        for invalid in ({}, {"words": "not a list"}, {"words": [], "template": ""},
+                        {"words": [], "allow": "no"}, "string"):
+            with self.subTest(document=invalid), self.assertRaises(ValueError):
+                forbiddenfilter_cog.canonicalize_forbidden_policy(invalid, strict=True)
+
+    async def test_template_substitutes_only_two_placeholders(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter,
+            document={
+                "words": ["나쁜말"],
+                "template": "{mention}: {word} / {bot.token} {0}",
+            },
+        )
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        # {mention}·{word}만 치환되고 나머지 중괄호는 문자 그대로 남는다.
+        self.assertEqual(message.sent, ["<@123>: 나쁜말 / {bot.token} {0}"])
+
+    async def test_allow_list_beats_a_substring_hit(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter, document={"words": ["시장"], "allow": ["시장님"]}
+        )
+        allowed = FakeMessage("시장님 안녕하세요", guild_id=TEST_GUILD_ID)
+        caught = FakeMessage("시장 갑니다", guild_id=TEST_GUILD_ID, channel_id=2)
+
+        await cog.on_message(allowed)
+        await cog.on_message(caught)
+
+        self.assertEqual(allowed.sent, [])
+        self.assertEqual(len(caught.sent), 1)
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+    async def test_allow_list_still_catches_a_hit_outside_it(self):
+        counter = RecordingForbiddenCounts()
+        cog = make_forbidden_cog(
+            counter, document={"words": ["시장"], "allow": ["시장님"]}
+        )
+        message = FakeMessage("시장님과 시장 사람들", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        self.assertEqual(counter.counts, [FakeUser.id])
+
+
+class ForbiddenGuildToggleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_guild_is_not_screened(self):
+        counter = RecordingForbiddenCounts()
+        settings = RecordingFilterSettings(enabled=False)
+        cog = make_forbidden_cog(counter, settings=settings)
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+
+        await cog.on_message(message)
+
+        self.assertEqual(message.sent, [])
+        self.assertEqual(counter.counts, [])
+
+    async def test_setting_is_read_once_per_guild_then_cached(self):
+        settings = RecordingFilterSettings()
+        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+
+        for _ in range(3):
+            await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
+
+        self.assertEqual(settings.reads, 1)
+
+    async def test_invalidate_guild_forces_a_reread(self):
+        settings = RecordingFilterSettings()
+        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+        await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
+
+        cog.invalidate_guild(TEST_GUILD_ID)
+        settings.enabled = False
+        message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
+        await cog.on_message(message)
+
+        self.assertEqual(settings.reads, 2)
+        self.assertEqual(message.sent, [])
 
 
 class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
@@ -3389,10 +1860,15 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reload_prepares_off_loop_then_publishes_state(self):
         pattern = forbiddenfilter_cog._build_pattern(["새금지어"])
+        policy = forbiddenfilter_cog.ForbiddenPolicy(
+            words=["새금지어"],
+            template=forbiddenfilter_cog.DEFAULT_TEMPLATE,
+            allow=[],
+        )
         with patch.object(
             forbiddenfilter_cog.asyncio,
             "to_thread",
-            AsyncMock(return_value=(["새금지어"], pattern)),
+            AsyncMock(return_value=(policy, pattern, None)),
         ) as to_thread, patch("module.forbiddenfilter_cog.print"):
             loaded = await self.cog.reload_prohibited_words()
         to_thread.assert_awaited_once_with(forbiddenfilter_cog._load_prohibited_pattern)
@@ -3656,7 +2132,6 @@ class PersonaExternalizationTest(unittest.TestCase):
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
                 cog = HyacineChatCog(bot=None)
         self.assertEqual(cog.system_prompt, "테스트 프롬프트")
-        self.assertEqual(cog.greeting, "테스트 인사")
 
     def test_missing_persona_keys_fall_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3666,7 +2141,6 @@ class PersonaExternalizationTest(unittest.TestCase):
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
                 cog = HyacineChatCog(bot=None)
         self.assertEqual(cog.system_prompt, "프롬프트만")
-        self.assertTrue(cog.greeting)
 
     def test_missing_system_prompt_keeps_hyacine_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3678,7 +2152,6 @@ class PersonaExternalizationTest(unittest.TestCase):
 
         self.assertIn("히아킨", cog.system_prompt)
         self.assertIn("회색둥이 씨", cog.system_prompt)
-        self.assertEqual(cog.greeting, "테스트 인사")
 
     def test_constructors_take_no_nickname(self):
         with self.assertRaises(TypeError):
@@ -3698,7 +2171,7 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                attendance = RecordingAttendance()
+                attendance = RecordingUsage()
                 cog = HyacineChatCog(
                     bot=SimpleNamespace(get_cog=lambda _: attendance)
                 )
@@ -3707,7 +2180,6 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"system_prompt": "new prompt", "greeting": "new greeting"}),
                     encoding="utf-8",
                 )
-                self.assertEqual(cog.greeting, "old greeting")
                 new_session = cog.get_session(2)
 
                 captured_instructions = []
@@ -3726,26 +2198,494 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                     responses=SimpleNamespace(create=response)
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=1), "old", None, "test-model", "none", 0,
+                    FakeInteraction(channel_id=1), "old", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
                 await cog._run_talk(
-                    FakeInteraction(channel_id=2), "new", None, "test-model", "none", 0,
+                    FakeInteraction(channel_id=2), "new", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
-                old_hello = FakeInteraction(channel_id=1)
-                new_hello = FakeInteraction(channel_id=2)
-                await HyacineChatCog._hello.callback(cog, old_hello)
-                await HyacineChatCog._hello.callback(cog, new_hello)
-
         self.assertEqual(old_session.system_prompt, "old prompt")
         self.assertEqual(new_session.system_prompt, "new prompt")
-        self.assertEqual(old_session.greeting, "old greeting")
-        self.assertEqual(new_session.greeting, "new greeting")
-        self.assertEqual(cog.greeting, "new greeting")
         self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
-        self.assertIn("old greeting", old_hello.response.messages[0][0][0])
-        self.assertIn("new greeting", new_hello.response.messages[0][0][0])
+
+
+class _StubShowcase:
+    """ProfileService 대역. 네트워크 없이 명령 경로만 확인한다."""
+
+    def __init__(self, results=None):
+        # {(game, uid): Showcase 또는 예외}
+        self.results = results or {}
+        self.calls = []
+        self.art_calls = []
+        self.art = None
+
+    def adapter(self, game):
+        return game_profile.ADAPTERS[game]
+
+    async def fetch_art(self, url):
+        self.art_calls.append(url)
+        return self.art
+
+    async def fetch(self, game, uid, *, use_cache=True):
+        self.calls.append((game, uid))
+        result = self.results.get((game, uid))
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise game_profile.ProfileLookupError("없는 계정")
+        return result
+
+    async def close(self):
+        pass
+
+
+def _showcase(nickname="플레이어", level=70, characters=()):
+    return game_profile.Showcase(
+        nickname=nickname, level=level, characters=list(characters)
+    )
+
+
+def _character(name="에버나이트", level=80, art="https://example.invalid/a.png"):
+    return game_profile.ShowcaseCharacter(name=name, level=level, art_url=art)
+
+
+class _ProfileInteraction:
+    def __init__(self, guild_id=TEST_GUILD_ID, user_id=FakeUser.id):
+        self.guild_id = guild_id
+        self.user = SimpleNamespace(id=user_id, display_name="테스트 유저")
+        self.response = RecordingResponse()
+        self.followup = RecordingFollowup()
+
+
+def _choice(value):
+    return discord.app_commands.Choice(name=value, value=value)
+
+
+class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repository = SQLiteProfileRepository(
+            pathlib.Path(self.directory.name) / "profile.db"
+        )
+        self.service = _StubShowcase()
+        self.cog = profile_cog.ProfileCog(
+            bot=None, repository=self.repository, service=self.service
+        )
+
+    async def test_registration_defers_then_stores_a_validated_uid(self):
+        self.service.results[("hsr", "800333171")] = _showcase(
+            characters=[_character()]
+        )
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), " 800333171 "
+        )
+
+        # Enka 조회가 3초를 넘길 수 있으므로 먼저 ACK해야 한다.
+        self.assertEqual(interaction.response.defer_kwargs, [{"ephemeral": True}])
+        self.assertEqual(
+            self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"), "800333171"
+        )
+        self.assertIn("800333171", interaction.followup.messages[0][0][0])
+
+    async def test_bad_uid_format_never_reaches_the_network(self):
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), "12ab"
+        )
+
+        self.assertEqual(self.service.calls, [])
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
+        self.assertIn("9자리", interaction.followup.messages[0][0][0])
+
+    async def test_a_uid_that_does_not_exist_is_refused_at_registration(self):
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), "800333171"
+        )
+
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
+        self.assertIn("❌", interaction.followup.messages[0][0][0])
+
+    async def test_empty_showcase_registers_but_explains_the_game_menu(self):
+        self.service.results[("zzz", "1000032854")] = _showcase(characters=[])
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("zzz"), "1000032854"
+        )
+
+        self.assertEqual(
+            self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "zzz"), "1000032854"
+        )
+        text = interaction.followup.messages[0][0][0]
+        self.assertIn(game_profile.ADAPTERS["zzz"].showcase_help, text)
+
+    async def test_uids_are_partitioned_per_guild(self):
+        self.service.results[("hsr", "800333171")] = _showcase()
+        self.service.results[("hsr", "800000001")] = _showcase()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, _ProfileInteraction(guild_id=1), _choice("hsr"), "800333171"
+        )
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, _ProfileInteraction(guild_id=2), _choice("hsr"), "800000001"
+        )
+
+        self.assertEqual(self.repository.get_uid(1, FakeUser.id, "hsr"), "800333171")
+        self.assertEqual(self.repository.get_uid(2, FakeUser.id, "hsr"), "800000001")
+
+        await self.cog.on_guild_remove(SimpleNamespace(id=1))
+
+        self.assertIsNone(self.repository.get_uid(1, FakeUser.id, "hsr"))
+        self.assertEqual(self.repository.get_uid(2, FakeUser.id, "hsr"), "800000001")
+
+    async def test_unregister_reports_whether_anything_was_removed(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "gi", "618285856")
+
+        first = _ProfileInteraction()
+        await profile_cog.ProfileCog._unregister.callback(
+            self.cog, first, _choice("gi")
+        )
+        second = _ProfileInteraction()
+        await profile_cog.ProfileCog._unregister.callback(
+            self.cog, second, _choice("gi")
+        )
+
+        self.assertIn("지웠습니다", first.response.messages[0][0][0])
+        self.assertIn("없습니다", second.response.messages[0][0][0])
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "gi"))
+
+
+class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repository = SQLiteProfileRepository(
+            pathlib.Path(self.directory.name) / "profile.db"
+        )
+        self.service = _StubShowcase()
+        self.cog = profile_cog.ProfileCog(
+            bot=None, repository=self.repository, service=self.service
+        )
+
+    async def _run_card(self, game="hsr", interaction=None):
+        interaction = interaction or _ProfileInteraction()
+        await profile_cog.ProfileCog._card.callback(
+            self.cog, interaction, _choice(game)
+        )
+        return interaction
+
+    def _seed(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase(
+            nickname="Visions",
+            level=70,
+            characters=[_character("에버나이트", 80), _character("은랑", 79)],
+        )
+
+    async def test_card_sends_a_rendered_png(self):
+        self._seed()
+        self.service.art = b"art-bytes"
+        with patch.object(
+            profile_cog, "render_card", return_value=b"\x89PNG-rendered"
+        ) as render:
+            interaction = await self._run_card()
+
+        attachment = interaction.followup.messages[0][1]["file"]
+        self.assertEqual(attachment.filename, "profile_card.png")
+        self.assertEqual(attachment.fp.getvalue(), b"\x89PNG-rendered")
+        self.assertEqual(render.call_args.kwargs["art_bytes"], b"art-bytes")
+        self.assertEqual(
+            render.call_args.kwargs["lines"],
+            ["에버나이트 Lv.80", "은랑 Lv.79"],
+        )
+
+    async def test_card_falls_back_to_the_embed_without_a_font(self):
+        """폰트가 없어도 명령이 사라지면 안 된다. 텍스트는 항상 나갈 수 있다."""
+        self._seed()
+        with patch.object(
+            profile_cog,
+            "render_card",
+            side_effect=profile_cog.CardRenderUnavailable("no font"),
+        ):
+            interaction = await self._run_card()
+
+        embed = interaction.followup.messages[0][1]["embed"]
+        self.assertEqual(embed.title, "Visions · 붕괴: 스타레일")
+        self.assertIn("**에버나이트** Lv.80", embed.description)
+        self.assertIn("**은랑** Lv.79", embed.description)
+        self.assertEqual(embed.thumbnail.url, "https://example.invalid/a.png")
+
+    async def test_a_broken_renderer_still_answers(self):
+        self._seed()
+        with patch.object(
+            profile_cog, "render_card", side_effect=ValueError("boom")
+        ), patch("module.profile_cog.print"):
+            interaction = await self._run_card()
+
+        self.assertIn("embed", interaction.followup.messages[0][1])
+
+    async def test_missing_art_still_renders(self):
+        self._seed()
+        self.service.art = None
+        with patch.object(profile_cog, "render_card", return_value=b"png") as render:
+            await self._run_card()
+        self.assertIsNone(render.call_args.kwargs["art_bytes"])
+
+    async def test_render_never_runs_on_the_event_loop(self):
+        """Pillow 합성이 루프를 잡으면 렌더링 동안 봇 전체가 멈춘다."""
+        self._seed()
+        loop_thread = asyncio.get_running_loop()._thread_id
+        seen = {}
+
+        def slow_render(**kwargs):
+            seen["thread"] = threading.get_ident()
+            time.sleep(0.2)
+            return b"png"
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        with patch.object(profile_cog, "render_card", side_effect=slow_render):
+            await self._run_card()
+        task.cancel()
+
+        self.assertNotEqual(seen["thread"], loop_thread)
+        # 0.2초 렌더링 동안 루프가 계속 돌았다면 tick이 여러 번 찍힌다.
+        self.assertGreater(ticks, 5)
+
+    async def test_empty_showcase_explains_the_in_game_menu(self):
+        """UID가 멀쩡해도 진열장이 비어 있을 수 있다. 그때가 최우선 UX다."""
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "gi", "618285856")
+        self.service.results[("gi", "618285856")] = _showcase(characters=[])
+
+        interaction = await self._run_card("gi")
+
+        embed = interaction.followup.messages[0][1]["embed"]
+        self.assertIn("진열장이 비어 있습니다", embed.description)
+        self.assertIn(game_profile.ADAPTERS["gi"].showcase_help, embed.description)
+
+    async def test_showcase_help_is_written_per_game(self):
+        helps = {a.key: a.showcase_help for a in game_profile.ADAPTERS.values()}
+        self.assertEqual(len(set(helps.values())), len(helps))
+
+    async def test_card_without_registration_points_at_the_register_command(self):
+        interaction = await self._run_card()
+
+        self.assertEqual(self.service.calls, [])
+        self.assertIn("/등록", interaction.followup.messages[0][0][0])
+        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
+
+    async def test_lookup_failure_is_reported_without_leaking_internals(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = game_profile.ProfileLookupError(
+            "Enka Network에 연결하지 못했습니다."
+        )
+
+        interaction = await self._run_card()
+
+        text = interaction.followup.messages[0][0][0]
+        self.assertIn("Enka Network에 연결하지 못했습니다.", text)
+        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
+
+    async def test_card_defers_before_any_network_work(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase()
+
+        interaction = await self._run_card()
+
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.response.messages, [])
+
+    async def test_registration_is_read_from_this_guild_only(self):
+        self.repository.set_uid(1, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase()
+
+        elsewhere = await self._run_card(interaction=_ProfileInteraction(guild_id=2))
+
+        self.assertIn("/등록", elsewhere.followup.messages[0][0][0])
+
+
+class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
+    """네트워크 계층의 캐시·백오프. enka 클라이언트는 대역으로 세운다."""
+
+    class _FakeClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = 0
+            self.closed = False
+
+        async def start(self):
+            pass
+
+        async def fetch_showcase(self, uid):
+            self.calls += 1
+            result = self.responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        async def close(self):
+            self.closed = True
+
+    def _service(self, responses, convert=None):
+        client = self._FakeClient(responses)
+        adapter = dataclasses.replace(
+            game_profile.ADAPTERS["hsr"],
+            _client_factory=lambda: client,
+            _convert=convert or (lambda response: response),
+        )
+        return game_profile.ProfileService({"hsr": adapter}), client
+
+    async def test_repeat_lookups_inside_the_window_hit_the_cache(self):
+        showcase = _showcase()
+        service, client = self._service([showcase])
+
+        first = await service.fetch("hsr", "800333171")
+        second = await service.fetch("hsr", "800333171")
+
+        self.assertIs(first, second)
+        self.assertEqual(client.calls, 1)
+
+    async def test_expired_cache_refetches(self):
+        service, client = self._service([_showcase("A"), _showcase("B")])
+        await service.fetch("hsr", "800333171")
+        # 창이 지난 상황을 시계 대신 만료 시각으로 만든다.
+        expires_at, showcase = service._cache[("hsr", "800333171")]
+        service._cache[("hsr", "800333171")] = (
+            expires_at - game_profile.CACHE_TTL_SECONDS - 1,
+            showcase,
+        )
+
+        again = await service.fetch("hsr", "800333171")
+
+        self.assertEqual(again.nickname, "B")
+        self.assertEqual(client.calls, 2)
+
+    async def test_missing_player_does_not_trip_the_backoff(self):
+        import enka
+
+        service, _ = self._service([enka.errors.PlayerDoesNotExistError()] * 4)
+        for _ in range(4):
+            with self.assertRaises(game_profile.ProfileLookupError):
+                await service.fetch("hsr", "800333171")
+        self.assertEqual(service._failures, {})
+
+    async def test_repeated_transport_failures_back_off(self):
+        import enka
+
+        service, client = self._service(
+            [enka.errors.GeneralServerError()] * game_profile.BACKOFF_FAILURE_THRESHOLD
+        )
+        for _ in range(game_profile.BACKOFF_FAILURE_THRESHOLD):
+            with self.assertRaises(game_profile.ProfileLookupError):
+                await service.fetch("hsr", "800333171")
+
+        calls_before = client.calls
+        with self.assertRaises(game_profile.ProfileLookupError) as caught:
+            await service.fetch("hsr", "800333171")
+
+        self.assertIn("잠시 쉬는 중", str(caught.exception))
+        self.assertEqual(client.calls, calls_before)
+
+    async def test_cache_is_bounded(self):
+        responses = [_showcase(str(n)) for n in range(game_profile.CACHE_MAX_ENTRIES + 5)]
+        service, _ = self._service(responses)
+        for index in range(game_profile.CACHE_MAX_ENTRIES + 5):
+            await service.fetch("hsr", f"80000{index:04d}")
+        self.assertLessEqual(len(service._cache), game_profile.CACHE_MAX_ENTRIES)
+
+    async def test_close_releases_the_client(self):
+        service, client = self._service([_showcase()])
+        await service.fetch("hsr", "800333171")
+        await service.close()
+        self.assertTrue(client.closed)
+
+    async def test_unknown_game_is_refused(self):
+        service, _ = self._service([])
+        with self.assertRaises(game_profile.ProfileLookupError):
+            service.adapter("wuwa")
+
+    def test_construction_touches_no_network(self):
+        """회선 없이도 봇은 기동해야 한다. 클라이언트는 첫 조회에서 열린다."""
+        self.assertEqual(game_profile.ProfileService()._clients, {})
+
+    def test_profile_extension_needs_no_api_key(self):
+        env = {"ADMIN_TOKEN": None, "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
+        with patch.object(bot_main, "ENV_VALUES", env):
+            self.assertIn("module.profile_cog", bot_main.available_extensions())
+
+
+class ProfileCardRendererTests(unittest.TestCase):
+    """Pillow 합성 자체. 폰트가 없는 환경에서도 스위트가 통과해야 한다."""
+
+    def setUp(self):
+        self.font = profile_card.find_font_path()
+
+    def test_render_produces_a_png(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        payload = profile_card.render_card(
+            title="Visions · 붕괴: 스타레일",
+            subtitle="계정 레벨 70",
+            lines=["에버나이트 Lv.80"],
+            footer="Enka Network",
+        )
+        self.assertTrue(payload.startswith(b"\x89PNG"))
+
+    def test_broken_art_still_yields_a_card(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        payload = profile_card.render_card(
+            title="제목",
+            subtitle="부제",
+            lines=["줄"],
+            footer="footer",
+            art_bytes=b"not an image",
+        )
+        self.assertTrue(payload.startswith(b"\x89PNG"))
+
+    def test_missing_font_raises_the_documented_error(self):
+        with patch.object(profile_card, "find_font_path", return_value=None):
+            with self.assertRaises(profile_card.CardRenderUnavailable):
+                profile_card.render_card(
+                    title="t", subtitle="s", lines=[], footer="f"
+                )
+
+    def test_font_override_wins_and_a_bad_override_falls_through(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        with patch.dict(os.environ, {"CARD_FONT_PATH": str(self.font)}):
+            self.assertEqual(profile_card.find_font_path(), self.font)
+        with patch.dict(os.environ, {"CARD_FONT_PATH": "/nonexistent/font.ttf"}):
+            self.assertIsNotNone(profile_card.find_font_path())
+
+    def test_card_does_not_bundle_assets_in_the_repository(self):
+        """캐릭터 아트와 폰트는 재배포하지 않는다. 런타임에 받아 쓴다."""
+        root = pathlib.Path(__file__).resolve().parent.parent
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout.split()
+        binaries = [
+            name
+            for name in tracked
+            if pathlib.Path(name).suffix.lower()
+            in {".ttf", ".ttc", ".otf", ".png", ".jpg", ".webp"}
+        ]
+        self.assertEqual(binaries, [])
 
 
 class _WebSettingsRepository:
@@ -3762,14 +2702,17 @@ class _WebSettingsRepository:
             raise value
         return value
 
+    def get_allow_host_announce(self, guild_id):
+        return guild_id in self.guild_ids
+
 
 class _WebBot:
     def __init__(self):
-        self.guilds = {}
+        self.guilds = []
         self.cogs = {}
 
     def get_guild(self, guild_id):
-        return self.guilds.get(guild_id)
+        return next((guild for guild in self.guilds if guild.id == guild_id), None)
 
     def get_cog(self, name):
         return self.cogs.get(name)
@@ -4350,11 +3293,12 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
             "admin_index.html",
             csrf="csrf",
             notice="",
-            persona='{"system_prompt":"{{games}}"}',
+            persona_prompt="{{games}}",
+            persona_greeting="{{games}}",
             forbidden_words='["{{games}}"]',
             games='{"Game":{"max_players":2}}',
         )
-        self.assertEqual(page.count("{{games}}"), 2)
+        self.assertEqual(page.count("{{games}}"), 3)
         self.assertIn("{&quot;Game&quot;:{&quot;max_players&quot;:2}}", page)
 
     async def test_content_length_and_actual_body_bytes_are_bounded(self):
@@ -4431,7 +3375,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         response = await self.client.post(
             "/settings/persona.json",
-            data={"csrf": csrf, "document": json.dumps(document, ensure_ascii=False)},
+            data={"csrf": csrf, "system_prompt": prompt, "greeting": "안녕"},
         )
         self.assertEqual(response.status, 200)
         self.assertIn("새 AI 세션부터 적용", await response.text())
@@ -4440,13 +3384,53 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved["system_prompt"], prompt)
 
+    async def test_persona_form_round_trips_quotes_and_newlines_without_json_escaping(self):
+        """persona는 값만 입력받는다. JSON 이스케이프는 운영자 몫이 아니다."""
+        _, csrf = await self._login()
+        prompt = '따옴표 "회색둥이 씨"와 역슬래시 \\ 그리고\n줄바꿈이 들어간 프롬프트'
+        response = await self.client.post(
+            "/settings/persona.json",
+            data={"csrf": csrf, "system_prompt": prompt, "greeting": "안녕하세요~"},
+        )
+        self.assertEqual(response.status, 200)
+        saved = json.loads(
+            (self.settings_dir / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved, {"system_prompt": prompt, "greeting": "안녕하세요~"})
+
+        # 저장한 값이 다음 화면에 그대로 돌아오고, HTML로 새지 않아야 한다.
+        page = await (await self.client.get("/")).text()
+        self.assertIn("따옴표 &quot;회색둥이 씨&quot;", page)
+        self.assertNotIn('"회색둥이 씨"', page)
+
+    async def test_persona_rejects_blank_fields_and_preserves_previous_file(self):
+        _, csrf = await self._login()
+        original = (self.settings_dir / "persona.json").read_bytes()
+        response = await self.client.post(
+            "/settings/persona.json",
+            data={"csrf": csrf, "system_prompt": "prompt", "greeting": ""},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn("저장 실패", await response.text())
+        self.assertEqual((self.settings_dir / "persona.json").read_bytes(), original)
+
+    async def test_unparseable_persona_file_reports_reason_instead_of_defaults(self):
+        """깨진 파일을 코드 기본값으로 덮어 보여주면 운영자가 손실을 눈치채지 못한다."""
+        await self._login()
+        (self.settings_dir / "persona.json").write_text("{not json", encoding="utf-8")
+        page = await (await self.client.get("/")).text()
+        self.assertIn("persona.json", page)
+        self.assertIn("설정을 읽지 못했습니다", page)
+        self.assertNotIn("놀빛 정원", page)
+
 
 class _AnnouncementChannel:
     type = discord.ChannelType.text
 
-    def __init__(self, error=None, allowed=True):
+    def __init__(self, error=None, allowed=True, name="채널"):
         self.error = error
         self.allowed = allowed
+        self.name = name
         self.embeds = []
 
     def permissions_for(self, member):
@@ -4463,8 +3447,10 @@ class _AnnouncementChannel:
 
 
 class _AnnouncementGuild:
-    def __init__(self, channels):
+    def __init__(self, channels, guild_id=0, name="길드"):
         self.channels = channels
+        self.id = guild_id
+        self.name = name
         self.me = object()
 
     def get_channel(self, channel_id):
@@ -4483,14 +3469,14 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         broken = _AnnouncementChannel(error=RuntimeError("discord unavailable"))
         self.repository.guild_ids = [1, 2, 3, 4, 5]
         self.repository.channels = {1: 11, 2: 22, 3: 33, 4: 44, 5: 55}
-        self.bot.guilds = {
-            1: _AnnouncementGuild({11: sent}),
-            2: _AnnouncementGuild({22: forbidden}),
-            3: _AnnouncementGuild({}),
-            4: _AnnouncementGuild({44: broken}),
+        self.bot.guilds = [
+            _AnnouncementGuild({11: sent}, 1),
+            _AnnouncementGuild({22: forbidden}, 2),
+            _AnnouncementGuild({}, 3),
+            _AnnouncementGuild({44: broken}, 4),
             # guild 5 is inaccessible
-            999: _AnnouncementGuild({999: _AnnouncementChannel()}),  # opted out
-        }
+            _AnnouncementGuild({999: _AnnouncementChannel()}, 999),  # opted out
+        ]
         with patch.object(webadmin_cog.logger, "exception") as logged:
             response = await self.client.post(
                 "/announce",
@@ -4517,10 +3503,10 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         delivered = _AnnouncementChannel()
         self.repository.guild_ids = [1, 2]
         self.repository.channels = {1: 11, 2: 22}
-        self.bot.guilds = {
-            1: _AnnouncementGuild({11: _HangingChannel()}),
-            2: _AnnouncementGuild({22: delivered}),
-        }
+        self.bot.guilds = [
+            _AnnouncementGuild({11: _HangingChannel()}, 1),
+            _AnnouncementGuild({22: delivered}, 2),
+        ]
         with patch.object(webadmin_cog, "ANNOUNCE_SEND_TIMEOUT", 0.2), patch.object(
             webadmin_cog.logger, "exception"
         ):
@@ -4543,6 +3529,112 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         page = await response.text()
         self.assertIn("성공 1, 건너뜀 0, 실패 1", page)
         self.assertEqual(len(delivered.embeds), 1)
+
+    async def test_selected_guild_receives_announcement_alone_with_chosen_colour(self):
+        """대상을 고르면 그 길드에만, 고른 색으로 간다."""
+        _, csrf = await self._login()
+        picked = _AnnouncementChannel()
+        other = _AnnouncementChannel()
+        self.repository.guild_ids = [1, 2]
+        self.repository.channels = {1: 11, 2: 22}
+        self.bot.guilds = [
+            _AnnouncementGuild({11: picked}, 1),
+            _AnnouncementGuild({22: other}, 2),
+        ]
+        response = await self.client.post(
+            "/announce",
+            data={
+                "csrf": csrf,
+                "guild_id": "2",
+                "title": "Title",
+                "body": "Body",
+                "color": "#a1b2c3",
+            },
+        )
+        self.assertIn("성공 1, 건너뜀 0, 실패 0", await response.text())
+        self.assertEqual(picked.embeds, [])
+        self.assertEqual(len(other.embeds), 1)
+        self.assertEqual(other.embeds[0].colour, discord.Colour(0xA1B2C3))
+
+    async def test_announcement_to_opted_out_or_malformed_guild_sends_nothing(self):
+        """드롭다운에 없는 길드를 form에 박아 넣어도 옵트인 경계를 넘지 못한다."""
+        _, csrf = await self._login()
+        opted_in = _AnnouncementChannel()
+        opted_out = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11, 999: 999}
+        self.bot.guilds = [
+            _AnnouncementGuild({11: opted_in}, 1),
+            _AnnouncementGuild({999: opted_out}, 999),
+        ]
+        for guild_id, expected in (
+            ("999", "공지를 허용하지 않은 길드입니다."),
+            ("nope", "공지 대상 길드가 올바르지 않습니다."),
+        ):
+            with self.subTest(guild_id=guild_id):
+                response = await self.client.post(
+                    "/announce",
+                    data={
+                        "csrf": csrf,
+                        "guild_id": guild_id,
+                        "title": "Title",
+                        "body": "Body",
+                    },
+                )
+                self.assertIn(expected, await response.text())
+        self.assertEqual(opted_out.embeds, [])
+        self.assertEqual(opted_in.embeds, [])
+
+    async def test_malformed_colour_is_rejected_before_any_guild_is_contacted(self):
+        _, csrf = await self._login()
+        channel = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11}
+        self.bot.guilds = [_AnnouncementGuild({11: channel}, 1)]
+        response = await self.client.post(
+            "/announce",
+            data={
+                "csrf": csrf,
+                "title": "Title",
+                "body": "Body",
+                "color": "red; drop",
+            },
+        )
+        self.assertIn("공지 색상은 #RRGGBB 형식이어야 합니다.", await response.text())
+        self.assertEqual(channel.embeds, [])
+
+    async def test_index_lists_guild_settings_and_offers_only_opted_in_targets(self):
+        """운영자가 공지 대상과 패널 채널을 화면에서 확인할 수 있어야 한다."""
+        await self._login()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 11, 2: 22}
+        party = SimpleNamespace(name="🎮-파티")
+        self.bot.guilds = [
+            _AnnouncementGuild({11: party}, 1, "공지 켠 길드"),
+            _AnnouncementGuild({}, 2, "<공지 끈 길드>"),
+        ]
+        page = await (await self.client.get("/")).text()
+
+        self.assertIn("#🎮-파티", page)
+        # 길드 2는 party_channel_id 22가 있지만 채널이 사라졌다.
+        self.assertIn("삭제됨 (22)", page)
+        self.assertIn('<option value="1">공지 켠 길드</option>', page)
+        self.assertNotIn('value="2"', page)
+        # 길드 이름은 운영자가 통제하지 않는 외부 문자열이다.
+        self.assertNotIn("<공지 끈 길드>", page)
+        self.assertIn("&lt;공지 끈 길드&gt;", page)
+
+    async def test_unreadable_guild_settings_surface_instead_of_breaking_the_page(self):
+        await self._login()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: RuntimeError("db unavailable")}
+        self.bot.guilds = [_AnnouncementGuild({}, 1)]
+        with patch.object(webadmin_cog.logger, "exception") as logged:
+            response = await self.client.get("/")
+        page = await response.text()
+        self.assertEqual(response.status, 200)
+        self.assertIn("길드 설정을 읽지 못했습니다", page)
+        logged.assert_called_once()
 
     async def test_announcement_rejects_empty_and_discord_overlimit_text(self):
         _, csrf = await self._login()

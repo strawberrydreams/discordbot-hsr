@@ -8,11 +8,18 @@ services:
     command: ["python", "-m", "module.main"]
     restart: unless-stopped
     stop_grace_period: 30s
+    ports:
+      # 웹 관리는 container loopback에만 bind한다. host 쪽도 127.0.0.1로 못 박아
+      # 다른 interface에는 노출하지 않는다. 신뢰 경계는 봇을 host에서 직접
+      # 실행할 때와 같다. ADMIN_TOKEN이 없으면 listener 자체가 뜨지 않는다.
+      - "127.0.0.1:8080:8080"
     volumes:
-      # 웹 관리는 container loopback에만 bind하며 ports를 publish하지 않는다.
       - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
+      # enka가 CWD(/app) 기준 .enka_py/에 게임 데이터를 캐시한다. 컨테이너를
+      # 다시 만들 때마다 수십 MB를 재다운로드하지 않도록 host에 남긴다.
+      - ./runtime/enka:/app/.enka_py
     logging:
       driver: json-file
       options:
