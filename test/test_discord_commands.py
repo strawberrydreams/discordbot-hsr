@@ -7,8 +7,10 @@ import json
 import os
 import pathlib
 import secrets
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from datetime import datetime, timezone
@@ -43,6 +45,7 @@ import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.greeting_cog as greeting_cog
 import module.game_profile as game_profile
 import module.profile_cog as profile_cog
+import module.profile_card as profile_card
 from module.database import SQLiteProfileRepository
 import module.backup as backup
 import module.webadmin_cog as webadmin_cog
@@ -2214,9 +2217,15 @@ class _StubShowcase:
         # {(game, uid): Showcase 또는 예외}
         self.results = results or {}
         self.calls = []
+        self.art_calls = []
+        self.art = None
 
     def adapter(self, game):
         return game_profile.ADAPTERS[game]
+
+    async def fetch_art(self, url):
+        self.art_calls.append(url)
+        return self.art
 
     async def fetch(self, game, uid, *, use_cache=True):
         self.calls.append((game, uid))
@@ -2372,7 +2381,7 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
         )
         return interaction
 
-    async def test_card_lists_characters_with_levels(self):
+    def _seed(self):
         self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
         self.service.results[("hsr", "800333171")] = _showcase(
             nickname="Visions",
@@ -2380,13 +2389,82 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
             characters=[_character("에버나이트", 80), _character("은랑", 79)],
         )
 
-        interaction = await self._run_card()
+    async def test_card_sends_a_rendered_png(self):
+        self._seed()
+        self.service.art = b"art-bytes"
+        with patch.object(
+            profile_cog, "render_card", return_value=b"\x89PNG-rendered"
+        ) as render:
+            interaction = await self._run_card()
+
+        attachment = interaction.followup.messages[0][1]["file"]
+        self.assertEqual(attachment.filename, "profile_card.png")
+        self.assertEqual(attachment.fp.getvalue(), b"\x89PNG-rendered")
+        self.assertEqual(render.call_args.kwargs["art_bytes"], b"art-bytes")
+        self.assertEqual(
+            render.call_args.kwargs["lines"],
+            ["에버나이트 Lv.80", "은랑 Lv.79"],
+        )
+
+    async def test_card_falls_back_to_the_embed_without_a_font(self):
+        """폰트가 없어도 명령이 사라지면 안 된다. 텍스트는 항상 나갈 수 있다."""
+        self._seed()
+        with patch.object(
+            profile_cog,
+            "render_card",
+            side_effect=profile_cog.CardRenderUnavailable("no font"),
+        ):
+            interaction = await self._run_card()
 
         embed = interaction.followup.messages[0][1]["embed"]
         self.assertEqual(embed.title, "Visions · 붕괴: 스타레일")
         self.assertIn("**에버나이트** Lv.80", embed.description)
         self.assertIn("**은랑** Lv.79", embed.description)
         self.assertEqual(embed.thumbnail.url, "https://example.invalid/a.png")
+
+    async def test_a_broken_renderer_still_answers(self):
+        self._seed()
+        with patch.object(
+            profile_cog, "render_card", side_effect=ValueError("boom")
+        ), patch("module.profile_cog.print"):
+            interaction = await self._run_card()
+
+        self.assertIn("embed", interaction.followup.messages[0][1])
+
+    async def test_missing_art_still_renders(self):
+        self._seed()
+        self.service.art = None
+        with patch.object(profile_cog, "render_card", return_value=b"png") as render:
+            await self._run_card()
+        self.assertIsNone(render.call_args.kwargs["art_bytes"])
+
+    async def test_render_never_runs_on_the_event_loop(self):
+        """Pillow 합성이 루프를 잡으면 렌더링 동안 봇 전체가 멈춘다."""
+        self._seed()
+        loop_thread = asyncio.get_running_loop()._thread_id
+        seen = {}
+
+        def slow_render(**kwargs):
+            seen["thread"] = threading.get_ident()
+            time.sleep(0.2)
+            return b"png"
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        with patch.object(profile_cog, "render_card", side_effect=slow_render):
+            await self._run_card()
+        task.cancel()
+
+        self.assertNotEqual(seen["thread"], loop_thread)
+        # 0.2초 렌더링 동안 루프가 계속 돌았다면 tick이 여러 번 찍힌다.
+        self.assertGreater(ticks, 5)
 
     async def test_empty_showcase_explains_the_in_game_menu(self):
         """UID가 멀쩡해도 진열장이 비어 있을 수 있다. 그때가 최우선 UX다."""
@@ -2427,6 +2505,7 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
         self.service.results[("hsr", "800333171")] = _showcase()
 
         interaction = await self._run_card()
+
 
         self.assertTrue(interaction.response.deferred)
         self.assertEqual(interaction.response.messages, [])
@@ -2548,6 +2627,65 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         env = {"ADMIN_TOKEN": None, "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
         with patch.object(bot_main, "ENV_VALUES", env):
             self.assertIn("module.profile_cog", bot_main.available_extensions())
+
+
+class ProfileCardRendererTests(unittest.TestCase):
+    """Pillow 합성 자체. 폰트가 없는 환경에서도 스위트가 통과해야 한다."""
+
+    def setUp(self):
+        self.font = profile_card.find_font_path()
+
+    def test_render_produces_a_png(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        payload = profile_card.render_card(
+            title="Visions · 붕괴: 스타레일",
+            subtitle="계정 레벨 70",
+            lines=["에버나이트 Lv.80"],
+            footer="Enka Network",
+        )
+        self.assertTrue(payload.startswith(b"\x89PNG"))
+
+    def test_broken_art_still_yields_a_card(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        payload = profile_card.render_card(
+            title="제목",
+            subtitle="부제",
+            lines=["줄"],
+            footer="footer",
+            art_bytes=b"not an image",
+        )
+        self.assertTrue(payload.startswith(b"\x89PNG"))
+
+    def test_missing_font_raises_the_documented_error(self):
+        with patch.object(profile_card, "find_font_path", return_value=None):
+            with self.assertRaises(profile_card.CardRenderUnavailable):
+                profile_card.render_card(
+                    title="t", subtitle="s", lines=[], footer="f"
+                )
+
+    def test_font_override_wins_and_a_bad_override_falls_through(self):
+        if self.font is None:
+            self.skipTest("CJK 폰트가 없는 환경")
+        with patch.dict(os.environ, {"CARD_FONT_PATH": str(self.font)}):
+            self.assertEqual(profile_card.find_font_path(), self.font)
+        with patch.dict(os.environ, {"CARD_FONT_PATH": "/nonexistent/font.ttf"}):
+            self.assertIsNotNone(profile_card.find_font_path())
+
+    def test_card_does_not_bundle_assets_in_the_repository(self):
+        """캐릭터 아트와 폰트는 재배포하지 않는다. 런타임에 받아 쓴다."""
+        root = pathlib.Path(__file__).resolve().parent.parent
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout.split()
+        binaries = [
+            name
+            for name in tracked
+            if pathlib.Path(name).suffix.lower()
+            in {".ttf", ".ttc", ".otf", ".png", ".jpg", ".webp"}
+        ]
+        self.assertEqual(binaries, [])
 
 
 class _WebSettingsRepository:

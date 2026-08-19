@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import aiohttp
 import enka
 
 # 응답 캐시 수명. Enka도 ttl을 주지만 게임마다 수 분 단위라 보수적으로 잡는다.
@@ -23,6 +25,11 @@ CACHE_MAX_ENTRIES = 256
 # 연속 실패한 게임은 잠시 쉬게 둔다. 죽은 API를 매 명령마다 두드리지 않는다.
 BACKOFF_FAILURE_THRESHOLD = 3
 BACKOFF_SECONDS = 60.0
+# 캐릭터 아트는 원격 CDN에 있다. 저장소에도 디스크에도 남기지 않고 프로세스
+# 안에서만 재사용한다. 한 장이 수 MB까지 가므로 개수를 묶는다.
+ART_CACHE_MAX = 24
+ART_MAX_BYTES = 8 * 1024 * 1024
+ART_TIMEOUT_SECONDS = 15
 
 
 class ProfileLookupError(Exception):
@@ -175,6 +182,8 @@ class ProfileService:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._cache: Dict[Tuple[str, str], Tuple[float, Showcase]] = {}
         self._failures: Dict[str, _Failure] = {}
+        self._art: "OrderedDict[str, bytes]" = OrderedDict()
+        self._art_session: Optional[aiohttp.ClientSession] = None
 
     def adapter(self, game: str) -> GameAdapter:
         try:
@@ -258,7 +267,34 @@ class ProfileService:
         self._store(game, uid, showcase)
         return showcase
 
+    async def fetch_art(self, url: str) -> Optional[bytes]:
+        """캐릭터 아트를 받아 온다. 실패하면 None — 카드는 아트 없이도 나간다."""
+        cached = self._art.get(url)
+        if cached is not None:
+            return cached
+        if self._art_session is None:
+            self._art_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=ART_TIMEOUT_SECONDS)
+            )
+        try:
+            async with self._art_session.get(url) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.content.read(ART_MAX_BYTES + 1)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return None
+        if len(payload) > ART_MAX_BYTES:
+            return None
+        # ponytail: 삽입 순서로 가장 오래된 것부터 버린다. LRU가 필요할 규모가 아니다.
+        while len(self._art) >= ART_CACHE_MAX:
+            self._art.popitem(last=False)
+        self._art[url] = payload
+        return payload
+
     async def close(self) -> None:
+        session, self._art_session = self._art_session, None
+        if session is not None:
+            await session.close()
         clients, self._clients = self._clients, {}
         for client in clients.values():
             try:

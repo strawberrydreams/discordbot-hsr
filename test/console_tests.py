@@ -256,6 +256,7 @@ def test_public_env_contract():
         "LIMIT_LIGHT",
         "LIMIT_DEEP",
         "LIMIT_IMAGE",
+        "CARD_FONT_PATH",
     }
     check("공개 env 변수 계약", set(example) == expected)
     check("관리 토큰 env 예제는 빈 값", example["ADMIN_TOKEN"] == "")
@@ -615,8 +616,14 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
     )
     check(
-        "Docker runtime은 apt 설치 없이 main healthcheck",
-        "apt-get install" not in dockerfile
+        # apt는 프로필 카드용 CJK 폰트 하나에만 허용한다. healthcheck는 여전히
+        # 순수 Python이어야 한다 — curl 같은 것을 넣으려고 apt를 여는 게 아니다.
+        "Docker runtime은 폰트 외 apt 없이 main healthcheck",
+        [
+            line for line in dockerfile.splitlines() if "apt-get install" in line
+        ] == ["    && apt-get install --no-install-recommends -y fonts-noto-cjk \\"]
+        and "apt-get clean" not in dockerfile
+        and "rm -rf /var/lib/apt/lists/*" in dockerfile
         and expected_healthcheck in dockerfile
         and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
     )

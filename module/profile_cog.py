@@ -4,6 +4,8 @@ UID 매핑은 길드별로 나뉜다. 같은 사람이 서버마다 다른 계�
 어느 서버에 무엇을 등록했는지가 다른 서버로 새면 안 된다.
 """
 
+import asyncio
+import io
 from typing import Optional
 
 import discord
@@ -12,6 +14,7 @@ from discord.ext import commands
 
 from module.database import ProfileRepository, create_profile_repository, run_db
 from module.game_profile import ADAPTERS, GameAdapter, ProfileLookupError, ProfileService, Showcase
+from module.profile_card import CardRenderUnavailable, render_card
 
 GAME_CHOICES = [
     app_commands.Choice(name=adapter.label, value=adapter.key)
@@ -93,7 +96,41 @@ class ProfileCog(commands.Cog):
             await inter.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
-        await inter.followup.send(embed=self._build_embed(adapter, showcase))
+        if not showcase.characters:
+            await inter.followup.send(embed=self._build_embed(adapter, showcase))
+            return
+
+        card = await self._render(adapter, showcase)
+        if card is None:
+            # 폰트가 없거나 합성이 실패했다. 텍스트 임베드는 항상 나갈 수 있다.
+            await inter.followup.send(embed=self._build_embed(adapter, showcase))
+            return
+        await inter.followup.send(
+            file=discord.File(io.BytesIO(card), filename="profile_card.png")
+        )
+
+    async def _render(
+        self, adapter: GameAdapter, showcase: Showcase
+    ) -> Optional[bytes]:
+        art = await self.service.fetch_art(showcase.characters[0].art_url)
+        try:
+            # Pillow 합성은 CPU 바운드다. 루프에서 돌리면 렌더링 동안 봇이 멈춘다.
+            return await asyncio.to_thread(
+                render_card,
+                title=f"{showcase.nickname} · {adapter.label}",
+                subtitle=f"계정 레벨 {showcase.level}",
+                lines=[
+                    f"{character.name} Lv.{character.level}"
+                    for character in showcase.characters
+                ],
+                footer="Enka Network",
+                art_bytes=art,
+            )
+        except CardRenderUnavailable:
+            return None
+        except Exception as exc:  # noqa: BLE001 - 렌더링 실패로 명령을 잃지 않는다
+            print(f"⚠️ 프로필 카드 합성 실패: {exc}")
+            return None
 
     @staticmethod
     def _build_embed(adapter: GameAdapter, showcase: Showcase) -> discord.Embed:

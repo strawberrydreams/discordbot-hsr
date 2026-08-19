@@ -5,3 +5,4 @@ openai==2.41.0 # 2.14.0 -> 2.41.0
 google-genai==2.8.0 # 1.56.0 -> 2.8.0 (Breaking change는 Interactions API 한정, generate_images 영향 없음)
 tiktoken==0.13.0 # 0.12.0 -> 0.13.0
 enka==2.5.20 # GPL-3.0. 이 의존성 때문에 저장소 전체가 GPL-3.0이다
+Pillow==12.1.0 # 프로필 카드 이미지 합성

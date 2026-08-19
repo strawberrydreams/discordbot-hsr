@@ -5,6 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# 프로필 카드가 한국어를 그리려면 CJK 글리프가 필요하다. python:3.12-slim에는
+# 없다. 폰트를 저장소에 번들해 재배포하는 대신 배포판 패키지(OFL)를 설치한다.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
