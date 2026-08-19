@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from module.database import ProfileRepository, create_profile_repository, run_db
-from module.game_profile import ADAPTERS, ProfileLookupError, ProfileService
+from module.game_profile import ADAPTERS, GameAdapter, ProfileLookupError, ProfileService, Showcase
 
 GAME_CHOICES = [
     app_commands.Choice(name=adapter.label, value=adapter.key)
@@ -66,6 +66,55 @@ class ProfileCog(commands.Cog):
         if not showcase.characters:
             message += f"\n\nℹ️ 진열장이 비어 있습니다. {adapter.showcase_help}"
         await inter.followup.send(message, ephemeral=True)
+
+    @app_commands.command(name="프로필카드", description="등록한 게임 계정의 진열 캐릭터를 봅니다.")
+    @app_commands.describe(게임="카드를 볼 게임")
+    @app_commands.choices(게임=GAME_CHOICES)
+    @app_commands.guild_only()
+    async def _card(
+        self, inter: discord.Interaction, 게임: app_commands.Choice[str]
+    ):
+        await inter.response.defer()
+        adapter = self.service.adapter(게임.value)
+        uid = await run_db(
+            self.db.get_uid, inter.guild_id, inter.user.id, adapter.key
+        )
+        if uid is None:
+            await inter.followup.send(
+                f"ℹ️ 이 서버에 등록된 {adapter.label} UID가 없습니다. "
+                f"`/등록 게임:{adapter.label}` 으로 먼저 등록해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            showcase = await self.service.fetch(adapter.key, uid)
+        except ProfileLookupError as exc:
+            await inter.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+
+        await inter.followup.send(embed=self._build_embed(adapter, showcase))
+
+    @staticmethod
+    def _build_embed(adapter: GameAdapter, showcase: Showcase) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"{showcase.nickname} · {adapter.label}",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="계정 레벨", value=str(showcase.level), inline=True)
+
+        if not showcase.characters:
+            # UID가 멀쩡해도 진열장이 비어 있을 수 있다. Enka는 인게임에서 올린
+            # 캐릭터만 돌려주므로 "데이터 없음"이 아니라 올리는 방법을 알려야 한다.
+            embed.description = f"진열장이 비어 있습니다.\n\n{adapter.showcase_help}"
+            return embed
+
+        embed.description = "\n".join(
+            f"- **{character.name}** Lv.{character.level}"
+            for character in showcase.characters
+        )
+        embed.set_thumbnail(url=showcase.characters[0].art_url)
+        return embed
 
     @app_commands.command(name="등록해제", description="이 서버에 등록한 게임 UID를 지웁니다.")
     @app_commands.describe(게임="등록을 지울 게임")

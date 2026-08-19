@@ -2353,6 +2353,203 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "gi"))
 
 
+class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repository = SQLiteProfileRepository(
+            pathlib.Path(self.directory.name) / "profile.db"
+        )
+        self.service = _StubShowcase()
+        self.cog = profile_cog.ProfileCog(
+            bot=None, repository=self.repository, service=self.service
+        )
+
+    async def _run_card(self, game="hsr", interaction=None):
+        interaction = interaction or _ProfileInteraction()
+        await profile_cog.ProfileCog._card.callback(
+            self.cog, interaction, _choice(game)
+        )
+        return interaction
+
+    async def test_card_lists_characters_with_levels(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase(
+            nickname="Visions",
+            level=70,
+            characters=[_character("에버나이트", 80), _character("은랑", 79)],
+        )
+
+        interaction = await self._run_card()
+
+        embed = interaction.followup.messages[0][1]["embed"]
+        self.assertEqual(embed.title, "Visions · 붕괴: 스타레일")
+        self.assertIn("**에버나이트** Lv.80", embed.description)
+        self.assertIn("**은랑** Lv.79", embed.description)
+        self.assertEqual(embed.thumbnail.url, "https://example.invalid/a.png")
+
+    async def test_empty_showcase_explains_the_in_game_menu(self):
+        """UID가 멀쩡해도 진열장이 비어 있을 수 있다. 그때가 최우선 UX다."""
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "gi", "618285856")
+        self.service.results[("gi", "618285856")] = _showcase(characters=[])
+
+        interaction = await self._run_card("gi")
+
+        embed = interaction.followup.messages[0][1]["embed"]
+        self.assertIn("진열장이 비어 있습니다", embed.description)
+        self.assertIn(game_profile.ADAPTERS["gi"].showcase_help, embed.description)
+
+    async def test_showcase_help_is_written_per_game(self):
+        helps = {a.key: a.showcase_help for a in game_profile.ADAPTERS.values()}
+        self.assertEqual(len(set(helps.values())), len(helps))
+
+    async def test_card_without_registration_points_at_the_register_command(self):
+        interaction = await self._run_card()
+
+        self.assertEqual(self.service.calls, [])
+        self.assertIn("/등록", interaction.followup.messages[0][0][0])
+        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
+
+    async def test_lookup_failure_is_reported_without_leaking_internals(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = game_profile.ProfileLookupError(
+            "Enka Network에 연결하지 못했습니다."
+        )
+
+        interaction = await self._run_card()
+
+        text = interaction.followup.messages[0][0][0]
+        self.assertIn("Enka Network에 연결하지 못했습니다.", text)
+        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
+
+    async def test_card_defers_before_any_network_work(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase()
+
+        interaction = await self._run_card()
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.response.messages, [])
+
+    async def test_registration_is_read_from_this_guild_only(self):
+        self.repository.set_uid(1, FakeUser.id, "hsr", "800333171")
+        self.service.results[("hsr", "800333171")] = _showcase()
+
+        elsewhere = await self._run_card(interaction=_ProfileInteraction(guild_id=2))
+
+        self.assertIn("/등록", elsewhere.followup.messages[0][0][0])
+
+
+class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
+    """네트워크 계층의 캐시·백오프. enka 클라이언트는 대역으로 세운다."""
+
+    class _FakeClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = 0
+            self.closed = False
+
+        async def start(self):
+            pass
+
+        async def fetch_showcase(self, uid):
+            self.calls += 1
+            result = self.responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        async def close(self):
+            self.closed = True
+
+    def _service(self, responses, convert=None):
+        client = self._FakeClient(responses)
+        adapter = dataclasses.replace(
+            game_profile.ADAPTERS["hsr"],
+            _client_factory=lambda: client,
+            _convert=convert or (lambda response: response),
+        )
+        return game_profile.ProfileService({"hsr": adapter}), client
+
+    async def test_repeat_lookups_inside_the_window_hit_the_cache(self):
+        showcase = _showcase()
+        service, client = self._service([showcase])
+
+        first = await service.fetch("hsr", "800333171")
+        second = await service.fetch("hsr", "800333171")
+
+        self.assertIs(first, second)
+        self.assertEqual(client.calls, 1)
+
+    async def test_expired_cache_refetches(self):
+        service, client = self._service([_showcase("A"), _showcase("B")])
+        await service.fetch("hsr", "800333171")
+        # 창이 지난 상황을 시계 대신 만료 시각으로 만든다.
+        expires_at, showcase = service._cache[("hsr", "800333171")]
+        service._cache[("hsr", "800333171")] = (
+            expires_at - game_profile.CACHE_TTL_SECONDS - 1,
+            showcase,
+        )
+
+        again = await service.fetch("hsr", "800333171")
+
+        self.assertEqual(again.nickname, "B")
+        self.assertEqual(client.calls, 2)
+
+    async def test_missing_player_does_not_trip_the_backoff(self):
+        import enka
+
+        service, _ = self._service([enka.errors.PlayerDoesNotExistError()] * 4)
+        for _ in range(4):
+            with self.assertRaises(game_profile.ProfileLookupError):
+                await service.fetch("hsr", "800333171")
+        self.assertEqual(service._failures, {})
+
+    async def test_repeated_transport_failures_back_off(self):
+        import enka
+
+        service, client = self._service(
+            [enka.errors.GeneralServerError()] * game_profile.BACKOFF_FAILURE_THRESHOLD
+        )
+        for _ in range(game_profile.BACKOFF_FAILURE_THRESHOLD):
+            with self.assertRaises(game_profile.ProfileLookupError):
+                await service.fetch("hsr", "800333171")
+
+        calls_before = client.calls
+        with self.assertRaises(game_profile.ProfileLookupError) as caught:
+            await service.fetch("hsr", "800333171")
+
+        self.assertIn("잠시 쉬는 중", str(caught.exception))
+        self.assertEqual(client.calls, calls_before)
+
+    async def test_cache_is_bounded(self):
+        responses = [_showcase(str(n)) for n in range(game_profile.CACHE_MAX_ENTRIES + 5)]
+        service, _ = self._service(responses)
+        for index in range(game_profile.CACHE_MAX_ENTRIES + 5):
+            await service.fetch("hsr", f"80000{index:04d}")
+        self.assertLessEqual(len(service._cache), game_profile.CACHE_MAX_ENTRIES)
+
+    async def test_close_releases_the_client(self):
+        service, client = self._service([_showcase()])
+        await service.fetch("hsr", "800333171")
+        await service.close()
+        self.assertTrue(client.closed)
+
+    async def test_unknown_game_is_refused(self):
+        service, _ = self._service([])
+        with self.assertRaises(game_profile.ProfileLookupError):
+            service.adapter("wuwa")
+
+    def test_construction_touches_no_network(self):
+        """회선 없이도 봇은 기동해야 한다. 클라이언트는 첫 조회에서 열린다."""
+        self.assertEqual(game_profile.ProfileService()._clients, {})
+
+    def test_profile_extension_needs_no_api_key(self):
+        env = {"ADMIN_TOKEN": None, "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
+        with patch.object(bot_main, "ENV_VALUES", env):
+            self.assertIn("module.profile_cog", bot_main.available_extensions())
+
+
 class _WebSettingsRepository:
     def __init__(self, guild_ids=(), channels=None):
         self.guild_ids = list(guild_ids)
