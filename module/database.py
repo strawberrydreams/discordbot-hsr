@@ -4,13 +4,14 @@
 # Cog들은 Repository 인터페이스만 사용하므로, 외부 DB로 교체해도 Cog 코드는 바뀌지 않는다.
 #
 # 외부 DB(MySQL, Oracle 등)로 교체하는 방법:
-#   1. UsageRepository / PartyRepository / GuildSettingsRepository를 상속한
+#   1. UsageRepository / PartyRepository / GuildSettingsRepository /
+#      ProfileRepository를 상속한
 #      구현 클래스를 이 파일에 작성 (SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리)
 #   2. 아래 create_* 팩토리에 분기 추가
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
 #
 # ── 멀티 길드 ──
-# 금지어 카운트·파티·설정은 스키마의 guild_id로 길드별 격리된다.
+# 금지어 카운트·파티·설정·프로필 UID는 스키마의 guild_id로 길드별 격리된다.
 # AI 일일 사용량은 하나의 인스턴스 안에서 유저별 전역이므로 guild_id를 저장하지 않는다.
 #
 # ── 동시성 ──
@@ -231,6 +232,34 @@ class GuildSettingsRepository(ABC):
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
         """봇이 길드에서 제거됐을 때 해당 길드 설정을 지운다."""
+
+
+class ProfileRepository(ABC):
+    """게임 프로필 UID 매핑. 길드별로 격리된다.
+
+    같은 사람이 서버마다 다른 UID를 쓸 수 있고, 어느 서버에 등록했는지가
+    다른 서버로 새면 안 된다. 인스턴스 전역으로 두지 않는 이유다.
+    """
+
+    @abstractmethod
+    def get_uid(self, guild_id: int, user_id: int, game: str) -> Optional[str]:
+        """등록한 UID. 없으면 None."""
+
+    @abstractmethod
+    def set_uid(self, guild_id: int, user_id: int, game: str, uid: str) -> None:
+        """UID를 등록하거나 교체한다."""
+
+    @abstractmethod
+    def delete_uid(self, guild_id: int, user_id: int, game: str) -> bool:
+        """등록을 해제한다. 지운 게 있으면 True."""
+
+    @abstractmethod
+    def list_uids(self, guild_id: int, user_id: int) -> Dict[str, str]:
+        """이 서버에서 이 유저가 등록한 게임별 UID."""
+
+    @abstractmethod
+    def delete_guild(self, guild_id: int) -> None:
+        """봇이 길드에서 제거됐을 때 해당 길드 등록을 모두 지운다."""
 
 
 # ─────────── SQLite 구현 ─────────── #
@@ -937,6 +966,85 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.commit()
 
 
+class SQLiteProfileRepository(ProfileRepository):
+    _SCHEMA_VERSION = 1
+    _COLUMN_ORDER = ("guild_id", "user_id", "game", "uid")
+
+    def __init__(self, db_path: pathlib.Path):
+        self.db_path = pathlib.Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with closing(_connect(self.db_path)) as conn:
+            _prepare_schema(conn, self._SCHEMA_VERSION, "profile")
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS game_uids (
+                        guild_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        game TEXT NOT NULL,
+                        uid TEXT NOT NULL,
+                        PRIMARY KEY (guild_id, user_id, game)
+                    )
+                """)
+                actual = list(conn.execute('PRAGMA table_info("game_uids")'))
+                columns = tuple(row[1] for row in actual)
+                primary_key = tuple(
+                    row[1] for row in sorted(actual, key=lambda row: row[5]) if row[5]
+                )
+                if columns != self._COLUMN_ORDER or primary_key != (
+                    "guild_id",
+                    "user_id",
+                    "game",
+                ):
+                    raise RuntimeError("지원하지 않는 game_uids 스키마입니다.")
+                _set_schema_version(conn, self._SCHEMA_VERSION)
+
+    def get_uid(self, guild_id: int, user_id: int, game: str) -> Optional[str]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT uid FROM game_uids WHERE guild_id = ? AND user_id = ? AND game = ?",
+                (guild_id, user_id, game),
+            ).fetchone()
+            return row[0] if row else None
+
+    def set_uid(self, guild_id: int, user_id: int, game: str, uid: str) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO game_uids (guild_id, user_id, game, uid) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, game) DO UPDATE SET uid = excluded.uid
+                """,
+                (guild_id, user_id, game, uid),
+            )
+            conn.commit()
+
+    def delete_uid(self, guild_id: int, user_id: int, game: str) -> bool:
+        with closing(_connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                "DELETE FROM game_uids WHERE guild_id = ? AND user_id = ? AND game = ?",
+                (guild_id, user_id, game),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def list_uids(self, guild_id: int, user_id: int) -> Dict[str, str]:
+        with closing(_connect(self.db_path)) as conn:
+            return {
+                game: uid
+                for game, uid in conn.execute(
+                    "SELECT game, uid FROM game_uids WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+            }
+
+    def delete_guild(self, guild_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM game_uids WHERE guild_id = ?", (guild_id,))
+            conn.commit()
+
+
 # ─────────── 팩토리 ─────────── #
 
 _UNSUPPORTED_MSG = (
@@ -957,6 +1065,14 @@ def create_party_repository() -> PartyRepository:
     if DB_BACKEND == "sqlite":
         return SQLitePartyRepository(DATA_DIR / "party_data.db")
     raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="PartyRepository"))
+
+
+def create_profile_repository() -> ProfileRepository:
+    if DB_BACKEND == "sqlite":
+        return SQLiteProfileRepository(DATA_DIR / "profile_data.db")
+    raise NotImplementedError(
+        _UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="ProfileRepository")
+    )
 
 
 def create_guild_settings_repository() -> GuildSettingsRepository:

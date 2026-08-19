@@ -28,6 +28,7 @@ from module.database import (
     SQLITE_TIMEOUT_SECONDS,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
+    SQLiteProfileRepository,
     SQLiteUsageRepository,
 )
 
@@ -35,11 +36,13 @@ DATABASES = {
     "attendance_data.db": {"users", "ai_usage"},
     "party_data.db": {"parties", "participants"},
     "guild_settings.db": {"guild_settings", "party_panels"},
+    "profile_data.db": {"game_uids"},
 }
 _SQLITE_REPOSITORIES = {
     "attendance_data.db": SQLiteUsageRepository,
     "party_data.db": SQLitePartyRepository,
     "guild_settings.db": SQLiteGuildSettingsRepository,
+    "profile_data.db": SQLiteProfileRepository,
 }
 _CURRENT_SCHEMA_VERSIONS = {
     name: repository._SCHEMA_VERSION

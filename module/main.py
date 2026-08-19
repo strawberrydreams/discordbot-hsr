@@ -34,6 +34,7 @@ EXTENSIONS = (
     ("module.hyacine_chat_cog", ("OPENAI_API_KEY",)),
     ("module.hyacine_image_cog", ("GOOGLE_API_KEY",)),
     ("module.usage_cog", ()),
+    ("module.profile_cog", ()),
 )
 
 ENV_VALUES = {

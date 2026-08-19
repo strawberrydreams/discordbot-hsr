@@ -41,6 +41,9 @@ from module.panel import drop_panel_locks, panel_lock, upsert_panel
 import module.playwith_cog as playwith_cog
 import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.greeting_cog as greeting_cog
+import module.game_profile as game_profile
+import module.profile_cog as profile_cog
+from module.database import SQLiteProfileRepository
 import module.backup as backup
 import module.webadmin_cog as webadmin_cog
 
@@ -111,6 +114,7 @@ class RecordingResponse:
     def __init__(self):
         self.messages = []
         self.deferred = False
+        self.defer_kwargs = []
         self.modal = None
 
     async def send_message(self, *args, **kwargs):
@@ -123,6 +127,7 @@ class RecordingResponse:
 
     async def defer(self, **kwargs):
         self.deferred = True
+        self.defer_kwargs.append(kwargs)
 
     async def send_modal(self, modal):
         self.modal = modal
@@ -2200,6 +2205,152 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_session.system_prompt, "old prompt")
         self.assertEqual(new_session.system_prompt, "new prompt")
         self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
+
+
+class _StubShowcase:
+    """ProfileService 대역. 네트워크 없이 명령 경로만 확인한다."""
+
+    def __init__(self, results=None):
+        # {(game, uid): Showcase 또는 예외}
+        self.results = results or {}
+        self.calls = []
+
+    def adapter(self, game):
+        return game_profile.ADAPTERS[game]
+
+    async def fetch(self, game, uid, *, use_cache=True):
+        self.calls.append((game, uid))
+        result = self.results.get((game, uid))
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise game_profile.ProfileLookupError("없는 계정")
+        return result
+
+    async def close(self):
+        pass
+
+
+def _showcase(nickname="플레이어", level=70, characters=()):
+    return game_profile.Showcase(
+        nickname=nickname, level=level, characters=list(characters)
+    )
+
+
+def _character(name="에버나이트", level=80, art="https://example.invalid/a.png"):
+    return game_profile.ShowcaseCharacter(name=name, level=level, art_url=art)
+
+
+class _ProfileInteraction:
+    def __init__(self, guild_id=TEST_GUILD_ID, user_id=FakeUser.id):
+        self.guild_id = guild_id
+        self.user = SimpleNamespace(id=user_id, display_name="테스트 유저")
+        self.response = RecordingResponse()
+        self.followup = RecordingFollowup()
+
+
+def _choice(value):
+    return discord.app_commands.Choice(name=value, value=value)
+
+
+class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repository = SQLiteProfileRepository(
+            pathlib.Path(self.directory.name) / "profile.db"
+        )
+        self.service = _StubShowcase()
+        self.cog = profile_cog.ProfileCog(
+            bot=None, repository=self.repository, service=self.service
+        )
+
+    async def test_registration_defers_then_stores_a_validated_uid(self):
+        self.service.results[("hsr", "800333171")] = _showcase(
+            characters=[_character()]
+        )
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), " 800333171 "
+        )
+
+        # Enka 조회가 3초를 넘길 수 있으므로 먼저 ACK해야 한다.
+        self.assertEqual(interaction.response.defer_kwargs, [{"ephemeral": True}])
+        self.assertEqual(
+            self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"), "800333171"
+        )
+        self.assertIn("800333171", interaction.followup.messages[0][0][0])
+
+    async def test_bad_uid_format_never_reaches_the_network(self):
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), "12ab"
+        )
+
+        self.assertEqual(self.service.calls, [])
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
+        self.assertIn("9자리", interaction.followup.messages[0][0][0])
+
+    async def test_a_uid_that_does_not_exist_is_refused_at_registration(self):
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("hsr"), "800333171"
+        )
+
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
+        self.assertIn("❌", interaction.followup.messages[0][0][0])
+
+    async def test_empty_showcase_registers_but_explains_the_game_menu(self):
+        self.service.results[("zzz", "1000032854")] = _showcase(characters=[])
+        interaction = _ProfileInteraction()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, interaction, _choice("zzz"), "1000032854"
+        )
+
+        self.assertEqual(
+            self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "zzz"), "1000032854"
+        )
+        text = interaction.followup.messages[0][0][0]
+        self.assertIn(game_profile.ADAPTERS["zzz"].showcase_help, text)
+
+    async def test_uids_are_partitioned_per_guild(self):
+        self.service.results[("hsr", "800333171")] = _showcase()
+        self.service.results[("hsr", "800000001")] = _showcase()
+
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, _ProfileInteraction(guild_id=1), _choice("hsr"), "800333171"
+        )
+        await profile_cog.ProfileCog._register.callback(
+            self.cog, _ProfileInteraction(guild_id=2), _choice("hsr"), "800000001"
+        )
+
+        self.assertEqual(self.repository.get_uid(1, FakeUser.id, "hsr"), "800333171")
+        self.assertEqual(self.repository.get_uid(2, FakeUser.id, "hsr"), "800000001")
+
+        await self.cog.on_guild_remove(SimpleNamespace(id=1))
+
+        self.assertIsNone(self.repository.get_uid(1, FakeUser.id, "hsr"))
+        self.assertEqual(self.repository.get_uid(2, FakeUser.id, "hsr"), "800000001")
+
+    async def test_unregister_reports_whether_anything_was_removed(self):
+        self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "gi", "618285856")
+
+        first = _ProfileInteraction()
+        await profile_cog.ProfileCog._unregister.callback(
+            self.cog, first, _choice("gi")
+        )
+        second = _ProfileInteraction()
+        await profile_cog.ProfileCog._unregister.callback(
+            self.cog, second, _choice("gi")
+        )
+
+        self.assertIn("지웠습니다", first.response.messages[0][0][0])
+        self.assertIn("없습니다", second.response.messages[0][0][0])
+        self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "gi"))
 
 
 class _WebSettingsRepository:

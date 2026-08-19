@@ -4,7 +4,7 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 
 각 운영자가 자신의 Discord Application과 토큰을 만들어 직접 운영합니다. 저장소 소유자는 다른 사람에게 봇을 호스팅하거나 Discord 서버를 대신 관리하지 않습니다. Hyacine은 *Honkai: Star Rail* 비공식 팬 프로젝트이며 HoYoverse와 제휴하거나 승인받지 않았습니다.
 
-금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`로 서버별 분리됩니다. AI 사용량 한도만 사용자별·봇 인스턴스 전역으로 공유되는 명시적 예외입니다.
+금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`로 서버별 분리됩니다. AI 사용량 한도만 사용자별·봇 인스턴스 전역으로 공유되는 명시적 예외입니다.
 
 ## 주요 기능
 
@@ -14,6 +14,7 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 - `/기본대화`, `/고급대화`, `/이미지`
 - 금지어 경고 — 서버별로 끌 수 있고, 응답 문구와 예외 목록을 설정할 수 있습니다
 - `/인사` — AI 키 없이도 동작하는 정적 인삿말
+- `/등록`, `/등록해제` — 원신 · 붕괴: 스타레일 · 젠레스 존 제로 계정 UID를 이 서버에 등록
 - `/설정` — `Manage Guild` 권한이 있는 서버 관리자가 파티 채널, 파티 호스트 공지 수신, 금지어 필터 사용 여부를 설정
 
 ## 빠른 시작
@@ -42,7 +43,7 @@ chmod 600 .env.secrets .env.runtime
 cp settings/persona.example.json settings/persona.json
 cp settings/forbidden_words.example.json settings/forbidden_words.json
 cp settings/games.example.json settings/games.json
-mkdir -p runtime/data runtime/backups runtime/logs
+mkdir -p runtime/data runtime/backups runtime/logs runtime/enka
 ```
 
 ### 4. host test 환경과 이미지 빌드
@@ -93,7 +94,7 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 설치 후 `Manage Guild` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`은 이 Guild의 파티 호스트 공지 수신만, `/설정 금지어`는 이 Guild의 금지어 필터 사용 여부만 바꿉니다. `/설정 확인`으로 현재 상태를 볼 수 있습니다.
 
-슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 금지어 카운트·파티·설정은 자동으로 삭제됩니다.
+슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 금지어 카운트·파티·설정·게임 UID 등록은 자동으로 삭제됩니다.
 
 ### 패널과 선택 기능
 

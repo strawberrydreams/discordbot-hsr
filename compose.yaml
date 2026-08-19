@@ -17,6 +17,9 @@ services:
       - ./settings:/app/settings
       - ./runtime/data:/app/runtime/data
       - ./runtime/backups:/app/runtime/backups
+      # enka가 CWD(/app) 기준 .enka_py/에 게임 데이터를 캐시한다. 컨테이너를
+      # 다시 만들 때마다 수십 MB를 재다운로드하지 않도록 host에 남긴다.
+      - ./runtime/enka:/app/.enka_py
     logging:
       driver: json-file
       options:

@@ -46,6 +46,7 @@ from module.database import (
     SQLiteUsageRepository,
     SQLitePartyRepository,
     SQLiteGuildSettingsRepository,
+    SQLiteProfileRepository,
     create_usage_repository,
     create_party_repository,
 )
@@ -342,7 +343,7 @@ def test_readme_public_distribution_contract():
         "provider 계정에도 예산 상한",
         "Docker Compose를 권장",
         "launchd 선택 사항",
-        "금지어 카운트, 파티, 길드 설정 데이터는 `guild_id`",
+        "금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`",
         "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
         "`Manage Guild` 권한",
     )
@@ -1082,6 +1083,8 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
             if extension == "module.usage_cog":
                 SQLiteUsageRepository(attendance_path)
                 events.append("migrate:attendance")
+            if extension == "module.profile_cog":
+                SQLiteProfileRepository(data_dir / "profile_data.db")
 
     with patch.object(main, "DATA_DIR", data_dir):
         try:
@@ -1975,6 +1978,8 @@ def test_imports():
         "module.eventnotice_cog",
         "module.forbiddenfilter_cog",
         "module.greeting_cog",
+        "module.game_profile",
+        "module.profile_cog",
         "module.webadmin_cog",
         "module.hyacine_chat_cog",
         "module.hyacine_image_cog",
@@ -2035,11 +2040,15 @@ def test_backup_round_trip():
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(_TMP_DIR / "guild_settings.db")
+    SQLiteProfileRepository(_TMP_DIR / "profile_data.db").set_uid(
+        _TEST_GUILD, 77, "hsr", "800333171"
+    )
 
     manifest = backup.create_backup_set()
     result = backup.verify_backup_set(manifest)
     check("출석 DB 백업 검증", result["attendance_data.db"]["users"] == 1)
     check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
+    check("프로필 DB 백업 검증", result["profile_data.db"]["game_uids"] == 1)
     backup.restore_test(manifest)
     check("백업 복구 테스트", True)
 
@@ -2058,6 +2067,7 @@ def test_settings_backup_round_trip():
         SQLiteUsageRepository(data_dir / "attendance_data.db")
         SQLitePartyRepository(data_dir / "party_data.db")
         SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
+        SQLiteProfileRepository(data_dir / "profile_data.db")
         expected = {
             "persona.json": b'{"system_prompt":"p","greeting":"g"}\n',
             "forbidden_words.json": b'["x"]\n',
@@ -2381,6 +2391,10 @@ def test_legacy_backup_restore_and_prune():
         conn.commit()
     with closing(sqlite3.connect(party_path)) as conn:
         conn.execute("PRAGMA user_version = 0")
+    # profile_data.db는 구버전이 없다. 현재 스키마 그대로 함께 백업된다.
+    SQLiteProfileRepository(data_dir / "profile_data.db").set_uid(
+        _TEST_GUILD, 8, "hsr", "800333171"
+    )
     backup_dir.mkdir(parents=True)
 
     items = []
@@ -2581,6 +2595,7 @@ def test_invalid_retention_prevents_pruning():
             backup.DATA_DIR / "party_data.db"
         ).create_party(_TEST_GUILD, "LOL", 2_000_000_000)
         SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+        SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
         created_at = datetime.datetime(
             2026,
             1,
@@ -2981,6 +2996,7 @@ def test_backup_same_timestamp_rejected():
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
 
@@ -3009,6 +3025,7 @@ def test_prune_requires_timestamp_bound_filenames():
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(current)
     copied = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
@@ -3039,6 +3056,7 @@ def test_backup_publication_is_synced():
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
+    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
     events = []
     synced_directories = []
     real_fsync = backup.os.fsync
