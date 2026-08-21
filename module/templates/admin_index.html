@@ -22,11 +22,11 @@
 
   <h2>길드별 설정</h2>
   <table>
-    <thead><tr><th>길드</th><th>파티 채널</th><th>공지 허용</th></tr></thead>
+    <thead><tr><th>길드</th><th>파티 채널</th><th>공지 채널</th><th>공지 허용</th></tr></thead>
     <tbody>{{guild_rows}}</tbody>
   </table>
 
   <h2>옵트인 공지</h2>
-  <form method="post" action="/announce"><input type="hidden" name="csrf" value="{{csrf}}"><label>대상<select name="guild_id">{{guild_options}}</select></label><label>제목<input name="title" required maxlength="256"></label><label>본문<textarea name="body" required maxlength="4096"></textarea></label><label>색상<input type="color" name="color" value="#5865f2"></label><button type="submit">공지 보내기</button></form>
+  <form method="post" action="/announce" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{csrf}}"><label>대상<select name="guild_id">{{guild_options}}</select></label><label>제목<input name="title" required maxlength="256"></label><label>본문<textarea name="body" required maxlength="4096"></textarea></label><label>이미지 (선택, 1개·최대 8 MiB)<input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp"></label><label>색상<input type="color" name="color" value="#5865f2"></label><button type="submit">공지 보내기</button></form>
 </body>
 </html>

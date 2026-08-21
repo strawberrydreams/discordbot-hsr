@@ -10,6 +10,34 @@ The repository did not use release tags during the period covered below. The
 version numbers are therefore retrospective milestone labels, and each date is
 the last change included in that milestone.
 
+## [0.7.0] - 2026-08-21 — Game cards and selective party recruitment
+
+### Added
+
+- Added one game selector to the party channel; a recruitment panel now appears
+  only for the selected game. Every active panel has an explicit leave button.
+- Added per-guild web announcement channels and one optional image attachment.
+
+### Improved
+
+- Renamed `/프로필카드` to `/게임카드` and now display the first in-game showcase
+  character's Enka image directly in a Discord embed.
+- Made `/상태` private to the invoking user and clarified that daily quotas are
+  per-user across the bot instance.
+- Existing default `🎮-파티` channels are renamed to `🎮-디스코-파티` on restart.
+
+### Fixed
+
+- Removed the ten-second forbidden-word response cooldown.
+- Distinguished exhausted OpenAI credit from transient rate limiting and explain
+  that the separate Gemini image command remains available.
+
+### Breaking Changes
+
+- `/프로필카드` has been replaced by `/게임카드`.
+- Guild settings migrate automatically to schema v5. Guilds using web
+  announcements must select a channel once with `/설정 공지채널`.
+
 ## [0.6.0] - 2026-08-11 — Host-operated community service
 
 Hyacine grew from a Discord-only bot into a service that an operator can manage

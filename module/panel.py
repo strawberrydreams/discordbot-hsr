@@ -29,6 +29,12 @@ def is_sendable_panel_channel(guild, channel) -> bool:
     )
 
 
+def is_sendable_announcement_channel(guild, channel) -> bool:
+    if not is_sendable_panel_channel(guild, channel):
+        return False
+    return bool(getattr(channel.permissions_for(guild.me), "attach_files", False))
+
+
 def panel_lock(guild_id: int, panel_key: str) -> asyncio.Lock:
     return _LOCKS.setdefault((guild_id, panel_key), asyncio.Lock())
 

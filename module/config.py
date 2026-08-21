@@ -74,8 +74,15 @@ def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
         if strict:
             raise ValueError("games.json 최상단은 객체여야 합니다.")
         return {}
+    if len(raw) > 25:
+        message = "games.json의 게임은 최대 25개여야 합니다."
+        if strict:
+            raise ValueError(message)
+        print(f"⚠️ {message} 앞 항목만 사용합니다.")
     games = {}
     for name, info in raw.items():
+        if len(games) == 25:
+            break
         if not isinstance(name, str) or not 1 <= len(name) <= 89:
             message = f"games.json의 게임 이름이 1~89자가 아닙니다: {name}"
             if strict:
@@ -98,12 +105,12 @@ def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
             continue
         if (
             not isinstance(roles, list)
-            or len(roles) > 25
+            or len(roles) > 24
             or not all(isinstance(role, str) and 1 <= len(role) <= 100 for role in roles)
             or len(", ".join(roles)) > 1_024
         ):
             message = (
-                "games.json의 roles가 최대 25개·각 1~100자·합계 1,024자 이내가 "
+                "games.json의 roles가 최대 24개·각 1~100자·합계 1,024자 이내가 "
                 f"아닙니다: {name}"
             )
             if strict:

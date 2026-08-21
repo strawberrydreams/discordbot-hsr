@@ -7,10 +7,7 @@ import json
 import os
 import pathlib
 import secrets
-import subprocess
 import tempfile
-import threading
-import time
 import unittest
 import warnings
 from datetime import datetime, timezone
@@ -21,7 +18,7 @@ from unittest.mock import AsyncMock, call, patch
 import discord
 import httpx
 import openai
-from aiohttp import CookieJar
+from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 from discord.ext import commands
 
@@ -47,7 +44,6 @@ import module.forbiddenfilter_cog as forbiddenfilter_cog
 import module.greeting_cog as greeting_cog
 import module.game_profile as game_profile
 import module.profile_cog as profile_cog
-import module.profile_card as profile_card
 from module.database import SQLiteProfileRepository
 import module.backup as backup
 import module.webadmin_cog as webadmin_cog
@@ -393,6 +389,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             await HyacineChatCog._status.callback(self.cog, interaction)
 
         message = interaction.response.messages[-1][0][0]
+        self.assertIs(interaction.response.messages[-1][1].get("ephemeral"), True)
+        self.assertIn("사용자별 · 봇 인스턴스 전체", message)
         for text in ("/기본대화", "gpt-5.6-terra", "/고급대화", "gpt-5.6-sol", "직전 사용 모델", "46"):
             self.assertIn(text, message)
         lines = message.splitlines()
@@ -471,6 +469,42 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(attendance.releases, [(123, "2026-08-04", "light")])
+
+    async def test_exhausted_openai_credit_has_actionable_message_without_traceback(self):
+        interaction = FakeInteraction(channel_id=1)
+        error = openai.RateLimitError(
+            "quota exhausted",
+            response=httpx.Response(
+                429,
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            ),
+            body={
+                "error": {
+                    "type": "insufficient_quota",
+                    "code": "credit_balance_exhausted",
+                }
+            },
+        )
+
+        async def response(**kwargs):
+            raise error
+
+        self.cog.client = SimpleNamespace(
+            responses=SimpleNamespace(create=response)
+        )
+        with patch("module.hyacine_chat_cog.traceback.print_exc") as print_exc, patch(
+            "module.hyacine_chat_cog.logger.warning"
+        ) as warning:
+            await self.cog._run_talk(
+                interaction, "test", None, "gpt-5.6-terra", "none",
+                "light", config.LIMIT_LIGHT,
+            )
+
+        message = interaction.followup.messages[-1][0][0]
+        self.assertIn("OpenAI API 크레딧", message)
+        self.assertIn("/이미지", message)
+        print_exc.assert_not_called()
+        warning.assert_called_once()
 
     async def test_image_url_is_sent_once_but_not_saved_in_history(self):
         interaction = FakeInteraction(channel_id=1)
@@ -800,13 +834,27 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             cog = PlayWithCog(bot, party, settings)
         return cog, party, settings, bot
 
+    async def _select(self, cog, settings, guild, game, user=None):
+        selector_id = settings.get_party_panels(guild.id)[
+            playwith_cog.SELECTOR_PANEL_KEY
+        ]
+        button = next(
+            child for child in cog.selector_view.children if child.game == game
+        )
+        interaction = FakeInteraction(
+            guild.channel.id, guild, message_id=selector_id, user=user
+        )
+        await button.callback(interaction)
+        return interaction, settings.get_party_panels(guild.id).get(game)
+
     def test_views_use_digest_ids_and_stay_within_component_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             guild = _PartyGuild()
             cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild)
 
         self.assertEqual(set(cog.views), set(playwith_cog.GAMES))
-        self.assertEqual(len(bot.registered), len(playwith_cog.GAMES))
+        self.assertEqual(len(bot.registered), len(playwith_cog.GAMES) + 1)
+        self.assertEqual(len(cog.selector_view.children), len(playwith_cog.GAMES))
         for game, view in cog.views.items():
             self.assertTrue(view.is_persistent())
             self.assertLessEqual(len(view.children), 25)
@@ -816,7 +864,65 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(game, child.custom_id)
                 self.assertLess(len(child.custom_id), 100)
             expected_count = len(playwith_cog.GAMES[game]["roles"]) + 1
-            self.assertEqual(len(view.children), expected_count if expected_count > 1 else 1)
+            self.assertEqual(len(view.children), expected_count if expected_count > 1 else 2)
+
+    async def test_initial_panel_is_only_the_game_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, _, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+
+            await cog.ensure_panels(guild)
+
+            panels = settings.get_party_panels(guild.id)
+            self.assertEqual(set(panels), {playwith_cog.SELECTOR_PANEL_KEY})
+            self.assertEqual(len(guild.channel.sent), 1)
+            self.assertIn("게임 선택", guild.channel.sent[0][1]["embed"].title)
+
+    async def test_selecting_a_game_creates_the_party_and_its_panel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            selector_id = settings.get_party_panels(guild.id)[
+                playwith_cog.SELECTOR_PANEL_KEY
+            ]
+
+            button = next(
+                child
+                for child in cog.selector_view.children
+                if child.game == "League of Legends"
+            )
+            await button.callback(FakeInteraction(50, guild, message_id=selector_id))
+
+            self.assertEqual(
+                party.get_participants(guild.id, "League of Legends"),
+                {FakeUser.id: None},
+            )
+            self.assertIn("League of Legends", settings.get_party_panels(guild.id))
+
+    async def test_active_panel_has_a_dedicated_leave_button(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guild = _PartyGuild()
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            await cog.ensure_panels(guild)
+            selector_id = settings.get_party_panels(guild.id)[
+                playwith_cog.SELECTOR_PANEL_KEY
+            ]
+            selector = next(
+                child for child in cog.selector_view.children if child.game == "PUBG"
+            )
+            await selector.callback(FakeInteraction(50, guild, message_id=selector_id))
+            panel_id = settings.get_party_panels(guild.id)["PUBG"]
+            leave = next(
+                child for child in cog.views["PUBG"].children if child.action == "leave"
+            )
+
+            interaction = FakeInteraction(50, guild, message_id=panel_id)
+            await leave.callback(interaction)
+
+            self.assertIsNone(party.get_user_party(guild.id, FakeUser.id))
+            self.assertNotIn("PUBG", settings.get_party_panels(guild.id))
+            self.assertIn("나갔습니다", interaction.followup.messages[0][0][0])
 
     def test_role_ids_survive_reordering_and_change_on_rename(self):
         original = {"Game": {"max_players": 2, "roles": ["A", "B"]}}
@@ -827,7 +933,11 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
         def role_ids(games):
             with patch.object(playwith_cog, "GAMES", games):
                 view = playwith_cog.PartyPanelView(dummy, "Game")
-            return {button.role: button.custom_id for button in view.children[1:]}
+            return {
+                button.role: button.custom_id
+                for button in view.children
+                if button.role is not None
+            }
 
         first = role_ids(original)
         second = role_ids(reordered)
@@ -836,10 +946,10 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["B"], second["B"])
         self.assertNotIn(first["B"], third.values())
 
-    async def test_every_configured_game_gets_its_own_panel(self):
+    async def test_twenty_five_games_share_one_selector_panel(self):
         games = {
             f"Game {index}": {"max_players": 2, "roles": []}
-            for index in range(30)
+            for index in range(25)
         }
         with tempfile.TemporaryDirectory() as directory:
             guild = _PartyGuild()
@@ -849,11 +959,12 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await cog.ensure_panels(guild)
             panel_count = len(settings.get_party_panels(guild.id))
 
-        self.assertEqual(len(cog.views), 30)
-        self.assertEqual(len(bot.registered), 30)
-        self.assertEqual(panel_count, 30)
+        self.assertEqual(len(cog.views), 25)
+        self.assertEqual(len(cog.selector_view.children), 25)
+        self.assertEqual(len(bot.registered), 26)
+        self.assertEqual(panel_count, 1)
 
-    async def test_over_limit_game_is_disabled_without_stopping_other_panels(self):
+    async def test_over_limit_role_view_is_not_registered(self):
         games = {
             "Too Many": {"max_players": 25, "roles": [f"r{i}" for i in range(25)]},
             "Okay": {"max_players": 2, "roles": []},
@@ -861,15 +972,11 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             guild = _PartyGuild()
             cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild, games)
-            await cog.ensure_panels(guild)
+        self.assertEqual(len(bot.registered), 2)
+        self.assertEqual(cog.views["Too Many"].children, [])
+        self.assertTrue(cog.views["Okay"].children)
 
-        self.assertEqual(len(bot.registered), 1)
-        disabled = guild.channel.sent[0][1]
-        self.assertIn("비활성", disabled["embed"].title)
-        self.assertIsNone(disabled["view"])
-        self.assertIsNotNone(guild.channel.sent[1][1]["view"])
-
-    async def test_role_and_no_role_buttons_cover_create_change_leave_and_toggle(self):
+    async def test_role_and_no_role_panels_cover_join_change_and_leave(self):
         with tempfile.TemporaryDirectory() as directory:
             second_user = SimpleNamespace(id=456, mention="<@456>")
             guild = _PartyGuild(members={FakeUser.id: FakeUser(), 456: second_user})
@@ -877,31 +984,33 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await cog.ensure_panels(guild)
 
             game = "League of Legends"
-            panel_id = settings.get_party_panels(guild.id)[game]
-            inactive, top = cog.views[game].children[:2]
-            premature = FakeInteraction(50, guild, message_id=panel_id)
-            await top.callback(premature)
-            self.assertIsNone(party.get_party(guild.id, game))
-            self.assertIn("모집 시작", premature.followup.messages[0][0][0])
-
-            await inactive.callback(FakeInteraction(50, guild, message_id=panel_id))
+            _, panel_id = await self._select(cog, settings, guild, game)
             self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: None})
-            status_click = FakeInteraction(
-                50, guild, message_id=panel_id, user=second_user
+            top = next(child for child in cog.views[game].children if child.role == "탑")
+            jungle = next(child for child in cog.views[game].children if child.role == "정글")
+            leave = next(child for child in cog.views[game].children if child.action == "leave")
+            await top.callback(FakeInteraction(50, guild, message_id=panel_id))
+            await jungle.callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=second_user)
             )
-            await inactive.callback(status_click)
-            self.assertNotIn(456, party.get_participants(guild.id, game))
-            await top.callback(FakeInteraction(50, guild, message_id=panel_id))
-            self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: "탑"})
-            await top.callback(FakeInteraction(50, guild, message_id=panel_id))
+            await leave.callback(FakeInteraction(50, guild, message_id=panel_id))
+            self.assertEqual(party.get_participants(guild.id, game), {456: "정글"})
+            await leave.callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=second_user)
+            )
             self.assertIsNone(party.get_party(guild.id, game))
 
             game = "PUBG"
-            panel_id = settings.get_party_panels(guild.id)[game]
-            toggle = cog.views[game].children[0]
-            await toggle.callback(FakeInteraction(50, guild, message_id=panel_id))
-            self.assertEqual(party.get_user_party(guild.id, FakeUser.id), game)
-            await toggle.callback(FakeInteraction(50, guild, message_id=panel_id))
+            _, panel_id = await self._select(cog, settings, guild, game)
+            join, leave = cog.views[game].children
+            await join.callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=second_user)
+            )
+            self.assertEqual(party.get_user_party(guild.id, 456), game)
+            await leave.callback(
+                FakeInteraction(50, guild, message_id=panel_id, user=second_user)
+            )
+            await leave.callback(FakeInteraction(50, guild, message_id=panel_id))
             self.assertIsNone(party.get_user_party(guild.id, FakeUser.id))
 
     async def test_repository_rejections_and_concurrent_role_clicks_are_reported(self):
@@ -911,13 +1020,14 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
             game = "League of Legends"
-            panel_id = settings.get_party_panels(guild.id)[game]
-            party.create_party(guild.id, game, 1_000)
+            _, panel_id = await self._select(
+                cog, settings, guild, game, user=users[1]
+            )
             for uid, role in zip(range(1, 6), playwith_cog.GAMES[game]["roles"]):
                 party.add_participant(guild.id, game, uid, role, 5)
 
             full = FakeInteraction(50, guild, message_id=panel_id, user=users[6])
-            await cog.views[game].children[1].callback(full)
+            await cog.views[game].children[0].callback(full)
             self.assertIn("가득", full.followup.messages[0][0][0])
             self.assertIsNone(party.get_user_party(guild.id, 6))
 
@@ -926,8 +1036,8 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             first = FakeInteraction(50, guild, message_id=panel_id, user=racer)
             second = FakeInteraction(50, guild, message_id=panel_id, user=racer)
             await asyncio.gather(
-                cog.views[game].children[4].callback(first),
-                cog.views[game].children[5].callback(second),
+                cog.views[game].children[3].callback(first),
+                cog.views[game].children[4].callback(second),
             )
             self.assertEqual(party.get_participants(guild.id, game)[7], "서포터")
             self.assertTrue(first.followup.messages and second.followup.messages)
@@ -940,24 +1050,21 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
             game = "League of Legends"
-            panel_id = settings.get_party_panels(guild.id)[game]
+            _, panel_id = await self._select(cog, settings, guild, game, user=host)
             buttons = cog.views[game].children
 
             await buttons[0].callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=host)
             )
             await buttons[1].callback(
-                FakeInteraction(50, guild, message_id=panel_id, user=host)
-            )
-            await buttons[2].callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=successor)
             )
-            await buttons[3].callback(
+            await buttons[2].callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=host)
             )
             self.assertEqual(party.get_party_host(guild.id, game), 1)
 
-            await buttons[3].callback(
+            await buttons[-1].callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=host)
             )
             transferred_host = party.get_party_host(guild.id, game)
@@ -971,19 +1078,30 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             guild = _PartyGuild()
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
+            selector_id = settings.get_party_panels(guild.id)[
+                playwith_cog.SELECTOR_PANEL_KEY
+            ]
             lol = FakeInteraction(
                 50,
                 guild,
-                message_id=settings.get_party_panels(guild.id)["League of Legends"],
+                message_id=selector_id,
             )
             pubg = FakeInteraction(
                 50,
                 guild,
-                message_id=settings.get_party_panels(guild.id)["PUBG"],
+                message_id=selector_id,
+            )
+            lol_button = next(
+                child
+                for child in cog.selector_view.children
+                if child.game == "League of Legends"
+            )
+            pubg_button = next(
+                child for child in cog.selector_view.children if child.game == "PUBG"
             )
             await asyncio.gather(
-                cog.views["League of Legends"].children[0].callback(lol),
-                cog.views["PUBG"].children[0].callback(pubg),
+                lol_button.callback(lol),
+                pubg_button.callback(pubg),
             )
             joined = party.get_user_party(guild.id, FakeUser.id)
             active = [
@@ -1001,7 +1119,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
             game = "PUBG"
-            panel_id = settings.get_party_panels(guild.id)[game]
+            _, panel_id = await self._select(cog, settings, guild, game)
             interaction = FakeInteraction(50, guild, message_id=panel_id)
             deferred = asyncio.Event()
             original_defer = interaction.response.defer
@@ -1013,14 +1131,14 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             interaction.response.defer = recording_defer
             lock = panel_lock(guild.id, f"party:{game}")
             await lock.acquire()
-            task = asyncio.create_task(cog.views[game].children[0].callback(interaction))
+            task = asyncio.create_task(cog.views[game].children[-1].callback(interaction))
             await deferred.wait()
             settings.set_party_panel(guild.id, game, panel_id + 1)
             lock.release()
             await task
             current_party = party.get_party(guild.id, game)
 
-        self.assertIsNone(current_party)
+        self.assertIsNotNone(current_party)
         self.assertIn("최신", interaction.followup.messages[0][0][0])
 
     async def test_dm_cross_guild_stale_panel_and_deleted_member_do_not_mutate(self):
@@ -1029,8 +1147,8 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             await cog.ensure_panels(guild)
             game = "PUBG"
-            button = cog.views[game].children[0]
-            panel_id = settings.get_party_panels(guild.id)[game]
+            _, panel_id = await self._select(cog, settings, guild, game)
+            button = cog.views[game].children[-1]
 
             dm = FakeInteraction(50, guild=None, guild_id=None, message_id=panel_id)
             await button.callback(dm)
@@ -1043,19 +1161,20 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await button.callback(deleted)
             user_party = party.get_user_party(guild.id, FakeUser.id)
 
-        self.assertIsNone(user_party)
+        self.assertEqual(user_party, game)
         self.assertTrue(dm.response.messages and wrong.response.messages and deleted.response.messages)
         self.assertTrue(stale.followup.messages)
 
     async def test_ensure_panels_edits_recreates_and_cleans_only_bot_stale_messages(self):
         with tempfile.TemporaryDirectory() as directory:
             guild = _PartyGuild()
-            cog, _, settings, _ = self._make_cog(pathlib.Path(directory), guild)
+            cog, party, settings, _ = self._make_cog(pathlib.Path(directory), guild)
             current = next(iter(playwith_cog.GAMES))
             guild.channel.messages[10] = _PartyMessage(10)
             guild.channel.messages[20] = _PartyMessage(20)
             settings.set_party_panel(guild.id, current, 10)
             settings.set_party_panel(guild.id, "Removed", 20)
+            party.create_party(guild.id, current, 1_000, FakeUser.id)
             await cog.ensure_panels(guild)
 
             self.assertTrue(guild.channel.messages[10].edits)
@@ -1063,6 +1182,8 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Removed", settings.get_party_panels(guild.id))
 
             missing_game = list(playwith_cog.GAMES)[1]
+            party.create_party(guild.id, missing_game, 1_000, 456)
+            await cog.render_game_panel(guild.id, missing_game)
             old_id = settings.get_party_panels(guild.id)[missing_game]
             guild.channel.messages.pop(old_id)
             await cog.ensure_panels(guild)
@@ -1395,11 +1516,18 @@ class _SetupChannel:
             "send_messages": True,
             "read_message_history": True,
             "embed_links": True,
+            "attach_files": True,
             **permission_overrides,
         }
+        self.edits = []
 
     def permissions_for(self, member):
         return SimpleNamespace(**self.permissions)
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+        if "name" in kwargs:
+            self.name = kwargs["name"]
 
 
 class _SetupGuild:
@@ -1432,6 +1560,7 @@ class _SetupGuild:
 class _SetupBot:
     def __init__(self, play_cog=None, filter_cog=None):
         self.views = []
+        self.guilds = []
         self.play_cog = play_cog
         self.filter_cog = filter_cog
 
@@ -1548,6 +1677,33 @@ class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_announcement_channel_is_stored_separately_from_party_channel(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            guildsettings_cog.discord, "TextChannel", _SetupChannel
+        ):
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            party = _SetupChannel(11, "party")
+            announcement = _SetupChannel(22, "announcements")
+            settings.set_party_channel(guild.id, party.id)
+            interaction = SimpleNamespace(
+                guild=guild,
+                guild_id=guild.id,
+                channel=announcement,
+                response=RecordingResponse(),
+            )
+
+            await GuildSettingsCog._announcement_channel.callback(
+                cog, interaction, announcement
+            )
+
+            self.assertEqual(settings.get_party_channel(guild.id), party.id)
+            self.assertEqual(
+                settings.get_announcement_channel(guild.id), announcement.id
+            )
+            self.assertIn("공지 채널", interaction.response.messages[0][0][0])
+
     async def test_channel_settings_reject_unsupported_ambient_channels(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             guildsettings_cog.discord, "TextChannel", _SetupChannel
@@ -1686,7 +1842,7 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([category.name for category in guild.created_categories], ["🤖 봇"])
         self.assertEqual(
-            [channel.name for channel, _ in guild.created_channels], ["🎮-파티"]
+            [channel.name for channel, _ in guild.created_channels], ["🎮-디스코-파티"]
         )
         self.assertEqual(first, second)
         category = guild.created_categories[0]
@@ -1720,6 +1876,37 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(party.name, "party-custom-name")
         self.assertEqual(guild.created_categories, [])
         self.assertEqual(guild.created_channels, [])
+
+    async def test_setup_renames_the_legacy_default_party_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            guild = _SetupGuild()
+            party = _SetupChannel(30, "🎮-파티")
+            guild.channels = {party.id: party}
+            settings.set_party_channel(guild.id, party.id)
+
+            result = await cog.ensure_bot_channels(guild)
+
+        self.assertIs(result, party)
+        self.assertEqual(party.name, "🎮-디스코-파티")
+        self.assertEqual(party.edits, [{"name": "🎮-디스코-파티"}])
+
+    async def test_ready_renames_the_legacy_default_party_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(pathlib.Path(directory) / "settings.db")
+            bot = _SetupBot()
+            cog = GuildSettingsCog(bot, settings)
+            guild = _SetupGuild()
+            party = _SetupChannel(30, "🎮-파티")
+            guild.channels = {party.id: party}
+            bot.guilds = [guild]
+            settings.set_party_channel(guild.id, party.id)
+
+            await cog.on_ready()
+
+        self.assertEqual(party.name, "🎮-디스코-파티")
+        self.assertEqual(party.edits, [{"name": "🎮-디스코-파티"}])
 
     async def test_join_notice_requires_a_sendable_system_channel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1800,10 +1987,9 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
 
 
 
-class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
-    """채널 버킷은 5개/5초다. 연타에 응답을 그대로 내보내면 레이트리밋에 걸린다."""
+class ForbiddenResponseTests(unittest.IsolatedAsyncioTestCase):
 
-    async def test_burst_answers_once_but_counts_every_hit(self):
+    async def test_burst_answers_and_counts_every_hit(self):
         counter = RecordingForbiddenCounts()
         cog = make_forbidden_cog(counter)
         messages = [FakeMessage("나쁜말", guild_id=TEST_GUILD_ID) for _ in range(5)]
@@ -1811,35 +1997,8 @@ class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
         for message in messages:
             await cog.on_message(message)
 
-        self.assertEqual([len(m.sent) for m in messages], [1, 0, 0, 0, 0])
+        self.assertEqual([len(m.sent) for m in messages], [1, 1, 1, 1, 1])
         self.assertEqual(counter.counts, [FakeUser.id] * 5)
-
-    async def test_cooldown_is_per_channel(self):
-        counter = RecordingForbiddenCounts()
-        cog = make_forbidden_cog(counter)
-        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=1)
-        other = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID, channel_id=2)
-
-        await cog.on_message(first)
-        await cog.on_message(other)
-
-        self.assertEqual(len(first.sent), 1)
-        self.assertEqual(len(other.sent), 1)
-
-    async def test_window_expiry_lets_the_next_hit_answer(self):
-        counter = RecordingForbiddenCounts()
-        cog = make_forbidden_cog(counter)
-        first = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
-        await cog.on_message(first)
-
-        # 창이 지난 상황을 시계 대신 마지막 응답 시각으로 만든다.
-        cog._last_response[(TEST_GUILD_ID, 1)] -= (
-            forbiddenfilter_cog.RESPONSE_COOLDOWN_SECONDS + 1
-        )
-        later = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
-        await cog.on_message(later)
-
-        self.assertEqual(len(later.sent), 1)
 
     async def test_leaving_a_guild_drops_its_process_state(self):
         cog = make_forbidden_cog(RecordingForbiddenCounts())
@@ -1848,7 +2007,6 @@ class ForbiddenResponseCooldownTests(unittest.IsolatedAsyncioTestCase):
 
         await cog.on_guild_remove(SimpleNamespace(id=TEST_GUILD_ID))
 
-        self.assertEqual(list(cog._last_response), [(99, 3)])
         self.assertNotIn(TEST_GUILD_ID, cog._enabled_cache)
 
     async def test_bot_messages_are_never_screened(self):
@@ -2391,7 +2549,7 @@ class GamesExternalizationTest(unittest.TestCase):
                 games = config.load_games()
 
         self.assertEqual(
-            list(games), ["G" * 89, *(f"Game {index}" for index in range(25))]
+            list(games), ["G" * 89, *(f"Game {index}" for index in range(24))]
         )
 
     def test_boolean_max_players_is_dropped(self):
@@ -2406,13 +2564,13 @@ class GamesExternalizationTest(unittest.TestCase):
         self.assertNotIn("Boolean Capacity", games)
 
     def test_largest_roster_and_aggregate_role_bounds_are_enforced(self):
-        roles = [f"{index:02d}" + "r" * 37 for index in range(25)]
+        roles = [f"{index:02d}" + "r" * 37 for index in range(24)]
         roster = {
             "Largest": {"max_players": 25, "roles": roles},
             "Too Many Players": {"max_players": 26, "roles": []},
             "Too Much Role Text": {
                 "max_players": 25,
-                "roles": [*roles[:-1], roles[-1] + "xx"],
+                "roles": [*roles[:-1], roles[-1] + "x" * 43],
             },
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -2539,15 +2697,9 @@ class _StubShowcase:
         # {(game, uid): Showcase 또는 예외}
         self.results = results or {}
         self.calls = []
-        self.art_calls = []
-        self.art = None
 
     def adapter(self, game):
         return game_profile.ADAPTERS[game]
-
-    async def fetch_art(self, url):
-        self.art_calls.append(url)
-        return self.art
 
     async def fetch(self, game, uid, *, use_cache=True):
         self.calls.append((game, uid))
@@ -2711,82 +2863,21 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
             characters=[_character("에버나이트", 80), _character("은랑", 79)],
         )
 
-    async def test_card_sends_a_rendered_png(self):
-        self._seed()
-        self.service.art = b"art-bytes"
-        with patch.object(
-            profile_cog, "render_card", return_value=b"\x89PNG-rendered"
-        ) as render:
-            interaction = await self._run_card()
+    def test_command_is_named_game_card(self):
+        names = {command.name for command in self.cog.get_app_commands()}
 
-        attachment = interaction.followup.messages[0][1]["file"]
-        self.assertEqual(attachment.filename, "profile_card.png")
-        self.assertEqual(attachment.fp.getvalue(), b"\x89PNG-rendered")
-        self.assertEqual(render.call_args.kwargs["art_bytes"], b"art-bytes")
-        self.assertEqual(
-            render.call_args.kwargs["lines"],
-            ["에버나이트 Lv.80", "은랑 Lv.79"],
-        )
+        self.assertIn("게임카드", names)
+        self.assertNotIn("프로필카드", names)
 
-    async def test_card_falls_back_to_the_embed_without_a_font(self):
-        """폰트가 없어도 명령이 사라지면 안 된다. 텍스트는 항상 나갈 수 있다."""
+    async def test_card_shows_only_the_first_character_with_a_large_image(self):
         self._seed()
-        with patch.object(
-            profile_cog,
-            "render_card",
-            side_effect=profile_cog.CardRenderUnavailable("no font"),
-        ):
-            interaction = await self._run_card()
+        interaction = await self._run_card()
 
         embed = interaction.followup.messages[0][1]["embed"]
         self.assertEqual(embed.title, "Visions · 붕괴: 스타레일")
         self.assertIn("**에버나이트** Lv.80", embed.description)
-        self.assertIn("**은랑** Lv.79", embed.description)
-        self.assertEqual(embed.thumbnail.url, "https://example.invalid/a.png")
-
-    async def test_a_broken_renderer_still_answers(self):
-        self._seed()
-        with patch.object(
-            profile_cog, "render_card", side_effect=ValueError("boom")
-        ), patch("module.profile_cog.print"):
-            interaction = await self._run_card()
-
-        self.assertIn("embed", interaction.followup.messages[0][1])
-
-    async def test_missing_art_still_renders(self):
-        self._seed()
-        self.service.art = None
-        with patch.object(profile_cog, "render_card", return_value=b"png") as render:
-            await self._run_card()
-        self.assertIsNone(render.call_args.kwargs["art_bytes"])
-
-    async def test_render_never_runs_on_the_event_loop(self):
-        """Pillow 합성이 루프를 잡으면 렌더링 동안 봇 전체가 멈춘다."""
-        self._seed()
-        loop_thread = asyncio.get_running_loop()._thread_id
-        seen = {}
-
-        def slow_render(**kwargs):
-            seen["thread"] = threading.get_ident()
-            time.sleep(0.2)
-            return b"png"
-
-        ticks = 0
-
-        async def ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
-
-        task = asyncio.create_task(ticker())
-        with patch.object(profile_cog, "render_card", side_effect=slow_render):
-            await self._run_card()
-        task.cancel()
-
-        self.assertNotEqual(seen["thread"], loop_thread)
-        # 0.2초 렌더링 동안 루프가 계속 돌았다면 tick이 여러 번 찍힌다.
-        self.assertGreater(ticks, 5)
+        self.assertNotIn("은랑", embed.description)
+        self.assertEqual(embed.image.url, "https://example.invalid/a.png")
 
     async def test_empty_showcase_explains_the_in_game_menu(self):
         """UID가 멀쩡해도 진열장이 비어 있을 수 있다. 그때가 최우선 UX다."""
@@ -2930,44 +3021,6 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.fetch("hsr", f"80000{index:04d}")
         self.assertLessEqual(len(service._cache), game_profile.CACHE_MAX_ENTRIES)
 
-    async def test_art_cache_is_bounded_by_bytes_and_cleared_on_close(self):
-        class ArtResponse:
-            status = 200
-
-            def __init__(self, payload):
-                self.content = SimpleNamespace(read=AsyncMock(return_value=payload))
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-        class ArtSession:
-            def __init__(self):
-                self.closed = False
-
-            def get(self, url):
-                return ArtResponse(url.encode() * 3)
-
-            async def close(self):
-                self.closed = True
-
-        service = game_profile.ProfileService()
-        session = ArtSession()
-        service._art_session = session
-
-        with patch.object(game_profile, "ART_CACHE_MAX_BYTES", 10):
-            await service.fetch_art("aa")
-            await service.fetch_art("bb")
-
-        self.assertEqual(list(service._art), ["bb"])
-        self.assertEqual(service._art_bytes, 6)
-        await service.close()
-        self.assertEqual(service._art, {})
-        self.assertEqual(service._art_bytes, 0)
-        self.assertTrue(session.closed)
-
     async def test_close_releases_the_client(self):
         service, client = self._service([_showcase()])
         await service.fetch("hsr", "800333171")
@@ -2989,74 +3042,22 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("module.profile_cog", bot_main.available_extensions())
 
 
-class ProfileCardRendererTests(unittest.TestCase):
-    """Pillow 합성 자체. 폰트가 없는 환경에서도 스위트가 통과해야 한다."""
-
-    def setUp(self):
-        self.font = profile_card.find_font_path()
-
-    def test_render_produces_a_png(self):
-        if self.font is None:
-            self.skipTest("CJK 폰트가 없는 환경")
-        payload = profile_card.render_card(
-            title="Visions · 붕괴: 스타레일",
-            subtitle="계정 레벨 70",
-            lines=["에버나이트 Lv.80"],
-            footer="Enka Network",
-        )
-        self.assertTrue(payload.startswith(b"\x89PNG"))
-
-    def test_broken_art_still_yields_a_card(self):
-        if self.font is None:
-            self.skipTest("CJK 폰트가 없는 환경")
-        payload = profile_card.render_card(
-            title="제목",
-            subtitle="부제",
-            lines=["줄"],
-            footer="footer",
-            art_bytes=b"not an image",
-        )
-        self.assertTrue(payload.startswith(b"\x89PNG"))
-
-    def test_missing_font_raises_the_documented_error(self):
-        with patch.object(profile_card, "find_font_path", return_value=None):
-            with self.assertRaises(profile_card.CardRenderUnavailable):
-                profile_card.render_card(
-                    title="t", subtitle="s", lines=[], footer="f"
-                )
-
-    def test_font_override_wins_and_a_bad_override_falls_through(self):
-        if self.font is None:
-            self.skipTest("CJK 폰트가 없는 환경")
-        with patch.dict(os.environ, {"CARD_FONT_PATH": str(self.font)}):
-            self.assertEqual(profile_card.find_font_path(), self.font)
-        with patch.dict(os.environ, {"CARD_FONT_PATH": "/nonexistent/font.ttf"}):
-            self.assertIsNotNone(profile_card.find_font_path())
-
-    def test_card_does_not_bundle_assets_in_the_repository(self):
-        """캐릭터 아트와 폰트는 재배포하지 않는다. 런타임에 받아 쓴다."""
-        root = pathlib.Path(__file__).resolve().parent.parent
-        tracked = subprocess.run(
-            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
-        ).stdout.split()
-        binaries = [
-            name
-            for name in tracked
-            if pathlib.Path(name).suffix.lower()
-            in {".ttf", ".ttc", ".otf", ".png", ".jpg", ".webp"}
-        ]
-        self.assertEqual(binaries, [])
-
-
 class _WebSettingsRepository:
     def __init__(self, guild_ids=(), channels=None):
         self.guild_ids = list(guild_ids)
         self.channels = dict(channels or {})
+        self.party_channels = {}
 
     def list_announcement_guild_ids(self):
         return list(self.guild_ids)
 
     def get_party_channel(self, guild_id):
+        value = self.party_channels.get(guild_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_announcement_channel(self, guild_id):
         value = self.channels.get(guild_id)
         if isinstance(value, Exception):
             raise value
@@ -3811,6 +3812,7 @@ class _AnnouncementChannel:
         self.allowed = allowed
         self.name = name
         self.embeds = []
+        self.files = []
 
     def permissions_for(self, member):
         return SimpleNamespace(
@@ -3818,12 +3820,14 @@ class _AnnouncementChannel:
             send_messages=self.allowed,
             read_message_history=self.allowed,
             embed_links=self.allowed,
+            attach_files=self.allowed,
         )
 
-    async def send(self, *, embed):
+    async def send(self, *, embed, file=None):
         if self.error:
             raise self.error
         self.embeds.append(embed)
+        self.files.append(file)
 
 
 class _AnnouncementGuild:
@@ -3837,10 +3841,76 @@ class _AnnouncementGuild:
         return self.channels.get(channel_id)
 
 
+class WebAdminImageValidationTests(unittest.TestCase):
+    def test_supported_image_signatures_get_fixed_attachment_names(self):
+        cases = (
+            ("image/png", b"\x89PNG\r\n\x1a\n", "announcement.png"),
+            ("image/jpeg", b"\xff\xd8\xff", "announcement.jpg"),
+            ("image/gif", b"GIF89a", "announcement.gif"),
+            ("image/webp", b"RIFF\x04\x00\x00\x00WEBP", "announcement.webp"),
+        )
+        for content_type, payload, expected in cases:
+            with self.subTest(content_type=content_type):
+                upload = webadmin_cog.AnnouncementUpload(content_type, payload)
+                self.assertEqual(
+                    webadmin_cog.WebAdminCog._announcement_image_name(upload),
+                    expected,
+                )
+
+    def test_mismatched_or_unsupported_image_is_rejected(self):
+        for upload in (
+            webadmin_cog.AnnouncementUpload("image/png", b"not png"),
+            webadmin_cog.AnnouncementUpload("image/svg+xml", b"<svg>"),
+        ):
+            with self.assertRaises(ValueError):
+                webadmin_cog.WebAdminCog._announcement_image_name(upload)
+
+
 class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = WebAdminHTTPTests.asyncSetUp
     asyncTearDown = WebAdminHTTPTests.asyncTearDown
     _login = WebAdminHTTPTests._login
+
+    async def test_announcement_uses_the_guild_announcement_channel_not_party_channel(self):
+        _, csrf = await self._login()
+        party = _AnnouncementChannel()
+        announcement = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.party_channels = {1: 11}
+        self.repository.channels = {1: 22}
+        self.bot.guilds = [_AnnouncementGuild({11: party, 22: announcement}, 1)]
+
+        response = await self.client.post(
+            "/announce",
+            data={"csrf": csrf, "title": "Title", "body": "Body"},
+        )
+
+        self.assertIn("성공 1", await response.text())
+        self.assertEqual(party.embeds, [])
+        self.assertEqual(len(announcement.embeds), 1)
+
+    async def test_announcement_accepts_one_png_attachment(self):
+        _, csrf = await self._login()
+        channel = _AnnouncementChannel()
+        self.repository.guild_ids = [1]
+        self.repository.channels = {1: 22}
+        self.bot.guilds = [_AnnouncementGuild({22: channel}, 1)]
+        data = FormData()
+        data.add_field("csrf", csrf)
+        data.add_field("title", "Title")
+        data.add_field("body", "Body")
+        data.add_field(
+            "image",
+            b"\x89PNG\r\n\x1a\nimage",
+            filename="notice.png",
+            content_type="image/png",
+        )
+
+        response = await self.client.post("/announce", data=data)
+
+        self.assertIn("성공 1", await response.text())
+        self.assertEqual(channel.embeds[0].image.url, "attachment://announcement.png")
+        self.assertEqual(channel.files[0].filename, "announcement.png")
 
     async def test_only_opted_in_accessible_channels_receive_isolated_announcement(self):
         session_id, csrf = await self._login()

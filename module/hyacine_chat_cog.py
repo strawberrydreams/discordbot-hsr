@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import traceback
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,19 @@ PERSONA_FIELD_LIMITS = {
     "system_prompt": SYSTEM_PROMPT_MAX_CHARS,
     "greeting": GREETING_MAX_CHARS,
 }
+logger = logging.getLogger(__name__)
+
+
+def _is_insufficient_quota(exc: Exception) -> bool:
+    if not isinstance(exc, openai.RateLimitError):
+        return False
+    values = {getattr(exc, "code", None), getattr(exc, "type", None)}
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict):
+            values.update((error.get("code"), error.get("type")))
+    return bool({"credit_balance_exhausted", "insufficient_quota"} & values)
 
 
 def canonicalize_persona(data: object, *, strict: bool = False) -> dict:
@@ -268,12 +282,29 @@ class HyacineChatCog(commands.Cog):
                 session.history.append({"role": "assistant", "content": reply})
 
         except Exception as exc:
-            # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
-            print(f"❌ [hyacine_chat] '{model}' 호출 실패 (channel={inter.channel_id})")
-            traceback.print_exc()
-            if isinstance(exc, openai.RateLimitError):
-                error_message = "⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요."
+            quota_exhausted = _is_insufficient_quota(exc)
+            if quota_exhausted:
+                logger.warning(
+                    "[hyacine_chat] OpenAI API credit exhausted "
+                    "(model=%s, channel=%s)",
+                    model,
+                    inter.channel_id,
+                )
+                error_message = (
+                    "💳 OpenAI API 크레딧이 소진되어 텍스트 대화를 사용할 수 "
+                    "없어요. 운영자가 크레딧을 충전한 뒤 다시 시도해 주세요. "
+                    "`/이미지`는 별도 Gemini API를 사용하므로 계속 이용할 수 있어요."
+                )
             else:
+                # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
+                print(
+                    f"❌ [hyacine_chat] '{model}' 호출 실패 "
+                    f"(channel={inter.channel_id})"
+                )
+                traceback.print_exc()
+            if isinstance(exc, openai.RateLimitError) and not quota_exhausted:
+                error_message = "⏳ 지금은 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요."
+            elif not quota_exhausted:
                 error_message = "❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요."
             try:
                 if inter.response.is_done():
@@ -340,7 +371,7 @@ class HyacineChatCog(commands.Cog):
             deep = max(0, LIMIT_DEEP - await usage_cog.get_ai_usage(inter.user.id, "deep"))
             image = max(0, LIMIT_IMAGE - await usage_cog.get_ai_usage(inter.user.id, "image"))
             msg += (
-                " \n- **오늘 남은 횟수 (KST)**\n"
+                " \n- **오늘 남은 횟수 (KST · 사용자별 · 봇 인스턴스 전체)**\n"
                 f"- `/기본대화`: {light}/{LIMIT_LIGHT}회\n"
                 f"- `/고급대화`: {deep}/{LIMIT_DEEP}회\n"
                 f"- `/이미지`: {image}/{LIMIT_IMAGE}회\n"
@@ -353,7 +384,7 @@ class HyacineChatCog(commands.Cog):
                 f"- **직전 사용 모델**: `{session.last_usage.get('model')}`\n"
                 f"직전 토큰: {session.last_usage.get('total_tokens')}\n"
             )
-        await inter.response.send_message(msg)
+        await inter.response.send_message(msg, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HyacineChatCog(bot))

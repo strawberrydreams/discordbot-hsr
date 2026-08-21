@@ -3,10 +3,9 @@ import asyncio
 import discord
 import logging
 import re
-import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from discord.ext import commands
 
 from module.config import load_settings_json
@@ -20,10 +19,6 @@ logger = logging.getLogger(__name__)
 
 # 옵션: 자모 입력(ㅍ ㅔ ㄴ ...)을 완성형으로 결합할지
 COMBINE_JAMO = True
-
-# 채널 메시지 버킷이 5개/5초다. 금지어 연타에 응답을 그대로 내보내면 레이트리밋에
-# 걸려 다른 기능까지 막힌다. 창 안의 추가 적발은 응답만 생략하고 카운트는 남긴다.
-RESPONSE_COOLDOWN_SECONDS = 10.0
 
 DEFAULT_TEMPLATE = "🛑🛑 {mention} 삐삑~~ 나쁜 단어 **{word}** 금지! 금지! 🛑🛑"
 MAX_TERMS_PER_LIST = 1_000
@@ -247,8 +242,6 @@ class ForbiddenFilterCog(commands.Cog):
         # 길드 설정은 메시지마다 조회하게 되므로 프로세스에 캐시한다.
         # /설정 금지어가 invalidate_guild로 무효화한다.
         self._enabled_cache: Dict[int, bool] = {}
-        # (guild_id, channel_id) -> 마지막 응답 시각. 재시작 시 초기화돼도 무해하다.
-        self._last_response: Dict[Tuple[int, int], float] = {}
         self.load_prohibited_words()
 
     @property
@@ -326,15 +319,6 @@ class ForbiddenFilterCog(commands.Cog):
 
         return match.group() if match else None
 
-    def _claim_response_slot(self, guild_id: int, channel_id: int) -> bool:
-        """쿨다운 창 밖이면 슬롯을 잡고 True. 창 안이면 응답하지 않는다."""
-        now = time.monotonic()
-        last = self._last_response.get((guild_id, channel_id))
-        if last is not None and now - last < RESPONSE_COOLDOWN_SECONDS:
-            return False
-        self._last_response[(guild_id, channel_id)] = now
-        return True
-
     def _format_response(self, message: discord.Message, bad_word: str) -> str:
         """template의 placeholder만 치환한다.
 
@@ -358,16 +342,14 @@ class ForbiddenFilterCog(commands.Cog):
         if not bad_word:
             return
 
-        # 쿨다운은 응답만 묶는다. 카운트와 전송 실패도 서로 영향을 주지 않는다.
-        if self._claim_response_slot(message.guild.id, message.channel.id):
-            try:
-                await message.channel.send(self._format_response(message, bad_word))
-            except Exception:
-                logger.exception(
-                    "Failed to send forbidden response for guild_id=%s channel_id=%s",
-                    message.guild.id,
-                    message.channel.id,
-                )
+        try:
+            await message.channel.send(self._format_response(message, bad_word))
+        except Exception:
+            logger.exception(
+                "Failed to send forbidden response for guild_id=%s channel_id=%s",
+                message.guild.id,
+                message.channel.id,
+            )
 
         usage_cog = self.bot.get_cog("UsageCog")
         if usage_cog:
@@ -386,8 +368,6 @@ class ForbiddenFilterCog(commands.Cog):
     async def on_guild_remove(self, guild: discord.Guild):
         """길드를 떠나면 그 길드의 프로세스 상태를 남기지 않는다."""
         self._enabled_cache.pop(guild.id, None)
-        for key in [key for key in self._last_response if key[0] == guild.id]:
-            del self._last_response[key]
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

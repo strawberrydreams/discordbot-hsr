@@ -194,6 +194,16 @@ class GuildSettingsRepository(ABC):
         """파티 패널 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
+    def get_announcement_channel(self, guild_id: int) -> Optional[int]:
+        """웹 공지를 보낼 채널 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def set_announcement_channel(
+        self, guild_id: int, channel_id: Optional[int]
+    ) -> None:
+        """웹 공지 채널을 지정한다. None이면 해제."""
+
+    @abstractmethod
     def get_allow_host_announce(self, guild_id: int) -> bool:
         """파티 호스트 공지를 허용하는지 반환한다."""
 
@@ -698,14 +708,16 @@ class SQLitePartyRepository(PartyRepository):
 class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _PARTY_CHANNEL = "party_channel_id"
+    _ANNOUNCEMENT_CHANNEL = "announcement_channel_id"
     _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
     _FORBIDDEN_FILTER = "forbidden_filter_enabled"
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
     _CURRENT_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
         _FORBIDDEN_FILTER,
+        _ANNOUNCEMENT_CHANNEL,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
     # v2는 음악 컬럼 둘을 더 갖고 있었다. v3는 v4에서 토글만 빠진 모양이다.
@@ -723,11 +735,18 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
     }
+    _V4_COLUMNS = {
+        "guild_id",
+        _PARTY_CHANNEL,
+        _ALLOW_HOST_ANNOUNCE,
+        _FORBIDDEN_FILTER,
+    }
     _GUILD_SETTINGS_COLUMN_ORDER = (
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
         _FORBIDDEN_FILTER,
+        _ANNOUNCEMENT_CHANNEL,
     )
     _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
@@ -756,6 +775,15 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             columns = {
                 row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
             }
+            if version < self._SCHEMA_VERSION and columns == self._V4_COLUMNS:
+                with conn:
+                    conn.execute(
+                        "ALTER TABLE guild_settings ADD COLUMN announcement_channel_id INTEGER"
+                    )
+                    self._create_party_panels_table(conn)
+                    self._require_current_contract(conn)
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                return
             if version < self._SCHEMA_VERSION and self._LEGACY_COLUMNS <= columns:
                 # v1: recruit_channel_id → party_channel_id
                 self._rebuild_guild_settings(
@@ -850,7 +878,8 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                 allow_host_announce INTEGER NOT NULL DEFAULT 0
                     CHECK (allow_host_announce IN (0, 1)),
                 forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
-                    CHECK (forbidden_filter_enabled IN (0, 1))
+                    CHECK (forbidden_filter_enabled IN (0, 1)),
+                announcement_channel_id INTEGER
             )
         """)
         SQLiteGuildSettingsRepository._create_party_panels_table(conn)
@@ -889,6 +918,14 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def set_party_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
         self._set_column(guild_id, self._PARTY_CHANNEL, channel_id)
+
+    def get_announcement_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._ANNOUNCEMENT_CHANNEL)
+
+    def set_announcement_channel(
+        self, guild_id: int, channel_id: Optional[int]
+    ) -> None:
+        self._set_column(guild_id, self._ANNOUNCEMENT_CHANNEL, channel_id)
 
     def get_allow_host_announce(self, guild_id: int) -> bool:
         return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
@@ -943,10 +980,15 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.execute(
                 """
                 UPDATE guild_settings
-                SET party_channel_id = NULL
-                WHERE guild_id = ? AND party_channel_id = ?
+                SET party_channel_id = CASE
+                        WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
+                    announcement_channel_id = CASE
+                        WHEN announcement_channel_id = ? THEN NULL
+                        ELSE announcement_channel_id END
+                WHERE guild_id = ?
+                  AND (party_channel_id = ? OR announcement_channel_id = ?)
                 """,
-                (guild_id, channel_id),
+                (channel_id, channel_id, guild_id, channel_id, channel_id),
             )
             conn.commit()
 

@@ -256,7 +256,6 @@ def test_public_env_contract():
         "LIMIT_LIGHT",
         "LIMIT_DEEP",
         "LIMIT_IMAGE",
-        "CARD_FONT_PATH",
     }
     check("공개 env 변수 계약", set(example) == expected)
     check("관리 토큰 env 예제는 빈 값", example["ADMIN_TOKEN"] == "")
@@ -452,7 +451,7 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "현재 설정과 영속 panel 명령 block 유지",
-        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 채널을 지정할 수도 있습니다. `/설정 공지허용`""" in quick_start,
+        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 파티 채널을, `/설정 공지채널`로 웹 공지를 받을 채널을 지정합니다. `/설정 공지허용`""" in quick_start,
     )
     check(
         "channel permission block 유지",
@@ -472,8 +471,8 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         and "port가 아닌 host-scoped" in operations,
     )
     check(
-        "공지는 opt-in Guild의 configured party channel만 대상",
-        "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 설정된 party channel에만 보냅니다." in operations,
+        "공지는 opt-in Guild의 configured announcement channel만 대상",
+        "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 `/설정 공지채널`에만 보냅니다." in operations,
     )
     check(
         "GPL-3.0과 무기여 정책을 유지",
@@ -618,14 +617,11 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         + "    CMD [\"python\", \"-c\", \"import sys; sys.exit(0 if b'module.main' in open('/proc/1/cmdline', 'rb').read() else 1)\"]"
     )
     check(
-        # apt는 프로필 카드용 CJK 폰트 하나에만 허용한다. healthcheck는 여전히
-        # 순수 Python이어야 한다 — curl 같은 것을 넣으려고 apt를 여는 게 아니다.
-        "Docker runtime은 폰트 외 apt 없이 main healthcheck",
+        "Docker runtime은 apt 없이 main healthcheck",
         [
             line for line in dockerfile.splitlines() if "apt-get install" in line
-        ] == ["    && apt-get install --no-install-recommends -y fonts-noto-cjk \\"]
+        ] == []
         and "apt-get clean" not in dockerfile
-        and "rm -rf /var/lib/apt/lists/*" in dockerfile
         and expected_healthcheck in dockerfile
         and ordered(dockerfile, "USER bot", "HEALTHCHECK", 'CMD ["python", "-m", "module.main"]'),
     )
@@ -1501,7 +1497,7 @@ def test_schema_versions():
 
     check("usage 스키마 버전", _user_version(attendance_path) == 3)
     check("party 스키마 버전", _user_version(party_path) == 2)
-    check("settings 스키마 버전", _user_version(settings_path) == 4)
+    check("settings 스키마 버전", _user_version(settings_path) == 5)
 
     for label, repository in (
         ("attendance", SQLiteUsageRepository),
@@ -1605,7 +1601,7 @@ def test_schema_versions():
         )
 
     for legacy_version in (0, 1):
-        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v4.db"
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v5.db"
         with sqlite3.connect(legacy_path) as conn:
             conn.execute(
                 "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
@@ -1648,15 +1644,15 @@ def test_schema_versions():
                 "party_channel_id",
                 "allow_host_announce",
                 "forbidden_filter_enabled",
+                "announcement_channel_id",
             )
             and panel_columns == ("guild_id", "game", "message_id")
             and panel_primary_key == ("guild_id", "game"),
         )
-        check(f"settings v{legacy_version} 버전", version == 4)
+        check(f"settings v{legacy_version} 버전", version == 5)
 
-    # v2(음악 컬럼 보유)와 v3(토글만 없음) 모두 v4로 올라오고, 기존 서버의
-    # 금지어 필터는 켜진 상태 그대로여야 한다. 마이그레이션이 조용히 동작을
-    # 바꾸면 안 된다.
+    # v2(음악 컬럼 보유), v3(토글 없음), v4(공지 채널 없음)가 모두 v5로
+    # 올라온다. 기존 토글 값은 그대로여야 한다.
     settings_upgrade_schemas = {
         2: """
             CREATE TABLE guild_settings (
@@ -1683,9 +1679,25 @@ def test_schema_versions():
             INSERT INTO guild_settings VALUES (7, 700, 1);
             INSERT INTO party_panels VALUES (7, 'LOL', 900);
         """,
+        4: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 1, 0);
+            INSERT INTO party_panels VALUES (7, 'LOL', 900);
+        """,
     }
     for old_version, schema in settings_upgrade_schemas.items():
-        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v4.db"
+        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v5.db"
         with sqlite3.connect(upgrade_path) as conn:
             conn.executescript(schema)
             conn.execute(f"PRAGMA user_version = {old_version}")
@@ -1695,13 +1707,14 @@ def test_schema_versions():
                 row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
             )
         check(
-            f"settings v{old_version}에서 v4로 마이그레이션",
-            _user_version(upgrade_path) == 4
+            f"settings v{old_version}에서 v5로 마이그레이션",
+            _user_version(upgrade_path) == 5
             and columns == (
                 "guild_id",
                 "party_channel_id",
                 "allow_host_announce",
                 "forbidden_filter_enabled",
+                "announcement_channel_id",
             ),
             f"({_user_version(upgrade_path)}, {columns})",
         )
@@ -1712,7 +1725,7 @@ def test_schema_versions():
         )
         check(
             f"settings v{old_version} 금지어 필터는 켜진 채로 넘어옴",
-            repository.get_forbidden_filter_enabled(7) is True,
+            repository.get_forbidden_filter_enabled(7) == (old_version != 4),
         )
 
     # 미등록 길드도 켜짐이 기본이다. 행이 없다고 필터가 꺼지면 안 된다.
@@ -1772,11 +1785,14 @@ def test_schema_versions():
     panels_after_upsert = settings.get_party_panels(7)
     settings.delete_party_panel(7, "LOL")
     settings.set_party_channel(7, 700)
+    settings.set_announcement_channel(7, 701)
     settings.set_allow_host_announce(7, True)
     settings.set_allow_host_announce(8, True)
-    settings.clear_channel(7, 701)
+    settings.clear_channel(7, 702)
     check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
-    check("무관한 채널 삭제는 파티 설정을 건드리지 않음", settings.get_party_channel(7) == 700)
+    check("무관한 채널 삭제는 채널 설정을 건드리지 않음", settings.get_party_channel(7) == 700 and settings.get_announcement_channel(7) == 701)
+    settings.clear_channel(7, 701)
+    check("삭제된 공지 채널은 해제", settings.get_announcement_channel(7) is None)
     settings.clear_channel(7, 700)
     check("삭제된 파티 채널은 해제", settings.get_party_channel(7) is None)
     check("공지 허용 길드 목록", settings.get_allow_host_announce(7) and settings.list_announcement_guild_ids() == [7, 8])
@@ -2569,7 +2585,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical settings migrates to the panel contract",
-        settings_version == 4
+        settings_version == 5
         and "party_panels" in settings_tables
         and party_channel == (700,),
     )

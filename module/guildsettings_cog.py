@@ -4,6 +4,7 @@
 서버 채널 ID를 모른다). 각 서버 관리자가 이 명령으로 직접 지정한다.
 """
 
+import logging
 from typing import Optional
 
 import discord
@@ -15,7 +16,15 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.panel import drop_panel_locks, is_sendable_panel_channel, panel_lock
+from module.panel import (
+    drop_panel_locks,
+    is_sendable_announcement_channel,
+    is_sendable_panel_channel,
+    panel_lock,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class SetupView(discord.ui.View):
@@ -84,6 +93,30 @@ class GuildSettingsCog(commands.Cog):
                 view=self.setup_view,
             )
 
+    @commands.Cog.listener()
+    async def on_ready(self):
+        for guild in getattr(self.bot, "guilds", ()):
+            try:
+                await self._rename_legacy_party_channel(guild)
+            except Exception:
+                logger.exception(
+                    "기존 파티 채널 이름 확인 실패: guild=%s", guild.id
+                )
+
+    async def _rename_legacy_party_channel(self, guild: discord.Guild):
+        party_id = await run_db(self.settings.get_party_channel, guild.id)
+        party = guild.get_channel(party_id) if party_id else None
+        if party is None or party.name != "🎮-파티":
+            return party
+        try:
+            await party.edit(name="🎮-디스코-파티")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "기존 파티 채널 이름을 바꾸지 못했습니다: guild=%s",
+                guild.id,
+            )
+        return party
+
     async def _ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
         async with panel_lock(guild.id, "setup"):
             channel = await self.ensure_bot_channels(guild)
@@ -97,8 +130,7 @@ class GuildSettingsCog(commands.Cog):
             await play_cog.ensure_panels(guild)
 
     async def ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
-        party_id = await run_db(self.settings.get_party_channel, guild.id)
-        party = guild.get_channel(party_id) if party_id else None
+        party = await self._rename_legacy_party_channel(guild)
         if party:
             return party
 
@@ -116,7 +148,7 @@ class GuildSettingsCog(commands.Cog):
             }
             category = await guild.create_category("🤖 봇", overwrites=overwrites)
 
-        party = await guild.create_text_channel("🎮-파티", category=category)
+        party = await guild.create_text_channel("🎮-디스코-파티", category=category)
         await run_db(self.settings.set_party_channel, guild.id, party.id)
         return party
 
@@ -153,12 +185,37 @@ class GuildSettingsCog(commands.Cog):
             f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
 
-    @설정.command(name="공지허용", description="파티 호스트 공지를 허용하거나 차단합니다.")
-    @app_commands.describe(허용="허용하면 호스트 공지를 받습니다.")
+    @설정.command(name="공지허용", description="웹 관리 공지를 허용하거나 차단합니다.")
+    @app_commands.describe(허용="허용하면 설정한 공지 채널로 웹 관리 공지를 받습니다.")
     async def _allow_host_announce(self, inter: discord.Interaction, 허용: bool):
         await run_db(self.settings.set_allow_host_announce, inter.guild_id, 허용)
         await inter.response.send_message(
-            f"✅ 파티 호스트 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
+            f"✅ 웹 관리 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
+        )
+
+    @설정.command(name="공지채널", description="웹 관리 공지를 받을 채널을 지정합니다.")
+    @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
+    async def _announcement_channel(
+        self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
+    ):
+        target = 채널 or inter.channel
+        if not isinstance(target, discord.TextChannel):
+            await inter.response.send_message(
+                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
+                ephemeral=True,
+            )
+            return
+        if not is_sendable_announcement_channel(inter.guild, target):
+            await inter.response.send_message(
+                "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드, 파일 첨부 권한이 필요합니다.",
+                ephemeral=True,
+            )
+            return
+        await run_db(
+            self.settings.set_announcement_channel, inter.guild_id, target.id
+        )
+        await inter.response.send_message(
+            f"✅ 웹 공지 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
         )
 
     @설정.command(name="금지어", description="이 서버에서 금지어 필터를 켜거나 끕니다.")
@@ -179,6 +236,9 @@ class GuildSettingsCog(commands.Cog):
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show(self, inter: discord.Interaction):
         party = await run_db(self.settings.get_party_channel, inter.guild_id)
+        announcement = await run_db(
+            self.settings.get_announcement_channel, inter.guild_id
+        )
         allow_host_announce = await run_db(
             self.settings.get_allow_host_announce, inter.guild_id
         )
@@ -200,7 +260,12 @@ class GuildSettingsCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="파티 호스트 공지",
+            name="웹 공지 채널",
+            value=f"<#{announcement}>" if announcement else "미지정 — `/설정 공지채널`",
+            inline=False,
+        )
+        embed.add_field(
+            name="웹 관리 공지",
             value="허용" if allow_host_announce else "차단",
             inline=False,
         )

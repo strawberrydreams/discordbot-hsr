@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.panel import is_sendable_panel_channel
+from module.panel import is_sendable_announcement_channel, is_sendable_panel_channel
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -34,6 +35,8 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 # 설정 파일이 파일 한도 안인데도 413으로 막히면 안 된다. 실제 파일 크기는
 # config.atomic_write_settings가 따로 강제하므로 여기는 전송 한도일 뿐이다.
 MAX_BODY_BYTES = config.MAX_SETTINGS_BYTES * 3 + 4_096
+ANNOUNCEMENT_IMAGE_LIMIT = 8 * 1024 * 1024
+MAX_REQUEST_BYTES = ANNOUNCEMENT_IMAGE_LIMIT + 64 * 1024
 ANNOUNCEMENT_TITLE_LIMIT = 256
 ANNOUNCEMENT_BODY_LIMIT = 4_096
 # 길드 하나가 매달려도 나머지 전송과 HTTP 응답까지 끌고 가지 않게 한다.
@@ -75,6 +78,12 @@ class AdminSession:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class AnnouncementUpload:
+    content_type: str
+    payload: bytes
+
+
 @web.middleware
 async def _security_headers(request: web.Request, handler):
     try:
@@ -106,7 +115,7 @@ class WebAdminCog(commands.Cog):
         self._announce_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self.app = web.Application(
-            client_max_size=MAX_BODY_BYTES, middlewares=[_security_headers]
+            client_max_size=MAX_REQUEST_BYTES, middlewares=[_security_headers]
         )
         self.app.add_routes(
             [
@@ -175,6 +184,71 @@ class WebAdminCog(commands.Cog):
         except (UnicodeDecodeError, ValueError) as exc:
             raise web.HTTPBadRequest(text="잘못된 요청입니다.") from exc
         return {key: values[-1] for key, values in parsed.items()}
+
+    async def _read_announcement_form(
+        self, request: web.Request
+    ) -> tuple[dict[str, str], AnnouncementUpload | None]:
+        if request.content_type == "application/x-www-form-urlencoded":
+            return await self._read_form(request), None
+        if request.content_type != "multipart/form-data":
+            raise web.HTTPUnsupportedMediaType(
+                text="multipart/form-data 요청만 허용됩니다."
+            )
+
+        form: dict[str, str] = {}
+        upload: AnnouncementUpload | None = None
+        image_seen = False
+        fields = 0
+        reader = await request.multipart()
+        while part := await reader.next():
+            fields += 1
+            if fields > 10:
+                raise web.HTTPBadRequest(text="폼 필드가 너무 많습니다.")
+            if part.name == "image":
+                if image_seen:
+                    raise web.HTTPBadRequest(text="이미지는 1개만 첨부할 수 있습니다.")
+                image_seen = True
+                payload = bytearray()
+                while chunk := await part.read_chunk():
+                    payload.extend(chunk)
+                    if len(payload) > ANNOUNCEMENT_IMAGE_LIMIT:
+                        raise web.HTTPRequestEntityTooLarge(
+                            max_size=ANNOUNCEMENT_IMAGE_LIMIT,
+                            actual_size=len(payload),
+                        )
+                if payload:
+                    upload = AnnouncementUpload(
+                        content_type=part.headers.get("Content-Type", "").lower(),
+                        payload=bytes(payload),
+                    )
+                continue
+
+            payload = await part.read(decode=True)
+            if len(payload) > 16 * 1024:
+                raise web.HTTPBadRequest(text="폼 필드가 너무 큽니다.")
+            try:
+                form[part.name or ""] = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise web.HTTPBadRequest(text="잘못된 요청입니다.") from exc
+        return form, upload
+
+    @staticmethod
+    def _announcement_image_name(upload: AnnouncementUpload) -> str:
+        signatures = {
+            "image/png": ("png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
+            "image/jpeg": ("jpg", lambda data: data.startswith(b"\xff\xd8\xff")),
+            "image/gif": ("gif", lambda data: data.startswith((b"GIF87a", b"GIF89a"))),
+            "image/webp": (
+                "webp",
+                lambda data: len(data) >= 12
+                and data.startswith(b"RIFF")
+                and data[8:12] == b"WEBP",
+            ),
+        }
+        extension_and_check = signatures.get(upload.content_type)
+        if extension_and_check is None or not extension_and_check[1](upload.payload):
+            raise ValueError("공지 이미지는 PNG, JPEG, GIF, WebP 파일이어야 합니다.")
+        return f"announcement.{extension_and_check[0]}"
 
     def _session(self, request: web.Request) -> tuple[str, AdminSession] | None:
         now = time.monotonic()
@@ -268,19 +342,26 @@ class WebAdminCog(commands.Cog):
         return persona["system_prompt"], persona["greeting"], ""
 
     @staticmethod
-    def _channel_label(guild, channel_id: int | None) -> str:
+    def _channel_label(
+        guild, channel_id: int | None, *, announcement: bool = False
+    ) -> str:
         if not channel_id:
             return "미설정"
         channel = guild.get_channel(channel_id)
         if channel is None:
             return f"삭제됨 ({channel_id})"
         label = f"#{channel.name}"
-        return label if is_sendable_panel_channel(guild, channel) else f"{label} (권한 부족)"
+        usable = (
+            is_sendable_announcement_channel(guild, channel)
+            if announcement
+            else is_sendable_panel_channel(guild, channel)
+        )
+        return label if usable else f"{label} (권한 부족)"
 
     async def _guild_overview(self) -> tuple[str, str, str]:
         """(길드 현황 표의 행, 공지 대상 option, 읽기 실패 사유)를 돌려준다.
 
-        운영자는 어느 길드가 공지를 허용했고 패널 채널이 어디인지 확인할 수단이
+        운영자는 어느 길드가 공지를 허용했고 공지 채널이 어디인지 확인할 수단이
         없으면 공지를 보내기 전에 대상을 검증할 수 없다.
 
         ponytail: 길드당 조회 2회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
@@ -292,22 +373,31 @@ class WebAdminCog(commands.Cog):
         for guild in self.bot.guilds:
             try:
                 party = await run_db(self.settings.get_party_channel, guild.id)
+                announcement = await run_db(
+                    self.settings.get_announcement_channel, guild.id
+                )
                 allowed = await run_db(self.settings.get_allow_host_announce, guild.id)
             except Exception:
                 logger.exception("Guild overview lookup failed for guild_id=%s", guild.id)
                 return "", "".join(options), "길드 설정을 읽지 못했습니다."
             name = html.escape(str(guild.name), quote=True)
             rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
                     name,
                     html.escape(self._channel_label(guild, party), quote=True),
+                    html.escape(
+                        self._channel_label(
+                            guild, announcement, announcement=True
+                        ),
+                        quote=True,
+                    ),
                     "허용" if allowed else "차단",
                 )
             )
             if allowed:
                 options.append(f'<option value="{int(guild.id)}">{name}</option>')
         if not rows:
-            rows.append('<tr><td colspan="3">참여 중인 길드가 없습니다.</td></tr>')
+            rows.append('<tr><td colspan="4">참여 중인 길드가 없습니다.</td></tr>')
         return "".join(rows), "".join(options), ""
 
     async def _index_response(self, csrf: str, notice: str = "") -> web.Response:
@@ -427,13 +517,17 @@ class WebAdminCog(commands.Cog):
 
     async def announce_post(self, request: web.Request) -> web.StreamResponse:
         self._require_session(request)
-        form = await self._read_form(request)
+        form, upload = await self._read_announcement_form(request)
         _, session = self._require_csrf(request, form)
         csrf = session.csrf
         title = form.get("title", "").strip()
         body = form.get("body", "").strip()
         target = form.get("guild_id", "").strip()
         colour_text = form.get("color", "").strip()
+        try:
+            image_name = self._announcement_image_name(upload) if upload else None
+        except ValueError as exc:
+            return await self._index_response(csrf, str(exc))
         if not title or len(title) > ANNOUNCEMENT_TITLE_LIMIT:
             return await self._index_response(csrf, "공지 제목은 1~256자여야 합니다.")
         if not body or len(body) > ANNOUNCEMENT_BODY_LIMIT:
@@ -463,20 +557,36 @@ class WebAdminCog(commands.Cog):
                     )
                 guild_ids = [int(target)]
             embed = discord.Embed(title=title, description=body, colour=colour)
+            if image_name:
+                embed.set_image(url=f"attachment://{image_name}")
             for guild_id in guild_ids:
                 try:
                     guild = self.bot.get_guild(guild_id)
                     if guild is None:
                         skipped += 1
                         continue
-                    channel_id = await run_db(self.settings.get_party_channel, guild_id)
+                    channel_id = await run_db(
+                        self.settings.get_announcement_channel, guild_id
+                    )
                     channel = guild.get_channel(channel_id) if channel_id else None
-                    if not is_sendable_panel_channel(guild, channel):
+                    if not is_sendable_announcement_channel(guild, channel):
                         skipped += 1
                         continue
-                    await asyncio.wait_for(
-                        channel.send(embed=embed), timeout=ANNOUNCE_SEND_TIMEOUT
+                    file = (
+                        discord.File(io.BytesIO(upload.payload), filename=image_name)
+                        if upload and image_name
+                        else None
                     )
+                    try:
+                        send = (
+                            channel.send(embed=embed, file=file)
+                            if file is not None
+                            else channel.send(embed=embed)
+                        )
+                        await asyncio.wait_for(send, timeout=ANNOUNCE_SEND_TIMEOUT)
+                    finally:
+                        if file is not None:
+                            file.close()
                     success += 1
                 except Exception:
                     failed += 1
