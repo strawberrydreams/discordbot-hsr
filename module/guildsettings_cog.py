@@ -1,7 +1,7 @@
 """서버별 봇 설정.
 
-봇이 여러 서버에 설치되므로 채널 ID를 환경변수에 둘 수 없다(운영자는 남의
-서버 채널 ID를 모른다). 각 서버 관리자가 이 명령으로 직접 지정한다.
+봇이 여러 서버에 설치되므로 채널 ID를 환경변수에 둘 수 없다. 설정 시작과
+현재 상태 확인은 Discord에서, 나머지 값은 호스트의 로컬 웹 관리에서 다룬다.
 """
 
 import logging
@@ -18,7 +18,6 @@ from module.database import (
 )
 from module.panel import (
     drop_panel_locks,
-    is_sendable_announcement_channel,
     is_sendable_panel_channel,
     panel_lock,
 )
@@ -186,105 +185,6 @@ class GuildSettingsCog(commands.Cog):
             ephemeral=True,
         )
 
-    @설정.command(name="파티채널", description="파티 패널을 표시할 채널을 지정합니다.")
-    @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _party_channel(
-        self,
-        interaction: discord.Interaction,
-        채널: Optional[discord.TextChannel] = None,
-    ):
-        target_channel = 채널 or interaction.channel
-        if not isinstance(target_channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
-                ephemeral=True,
-            )
-            return
-        if not is_sendable_panel_channel(interaction.guild, target_channel):
-            await interaction.response.send_message(
-                "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드 권한이 필요합니다.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
-        await run_db(
-            self.settings_repository.set_party_channel,
-            interaction.guild_id,
-            target_channel.id,
-        )
-        await self._ensure_panels(interaction.guild)
-        await interaction.followup.send(
-            f"✅ 파티 패널 채널을 {target_channel.mention} 으로 지정했습니다.",
-            ephemeral=True,
-        )
-
-    @설정.command(name="공지허용", description="웹 관리 공지를 허용하거나 차단합니다.")
-    @app_commands.describe(허용="허용하면 설정한 공지 채널로 웹 관리 공지를 받습니다.")
-    async def _set_host_announcements(
-        self, interaction: discord.Interaction, 허용: bool
-    ):
-        await run_db(
-            self.settings_repository.set_allow_host_announce,
-            interaction.guild_id,
-            허용,
-        )
-        await interaction.response.send_message(
-            f"✅ 웹 관리 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
-        )
-
-    @설정.command(name="공지채널", description="웹 관리 공지를 받을 채널을 지정합니다.")
-    @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _set_announcement_channel(
-        self,
-        interaction: discord.Interaction,
-        채널: Optional[discord.TextChannel] = None,
-    ):
-        target_channel = 채널 or interaction.channel
-        if not isinstance(target_channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
-                ephemeral=True,
-            )
-            return
-        if not is_sendable_announcement_channel(
-            interaction.guild, target_channel
-        ):
-            await interaction.response.send_message(
-                "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드, 파일 첨부 권한이 필요합니다.",
-                ephemeral=True,
-            )
-            return
-        await run_db(
-            self.settings_repository.set_announcement_channel,
-            interaction.guild_id,
-            target_channel.id,
-        )
-        await interaction.response.send_message(
-            f"✅ 웹 공지 채널을 {target_channel.mention} 으로 지정했습니다.",
-            ephemeral=True,
-        )
-
-    @설정.command(name="금지어", description="이 서버에서 금지어 필터를 켜거나 끕니다.")
-    @app_commands.describe(사용="끄면 이 서버에서만 금지어에 반응하지 않습니다.")
-    async def _set_forbidden_filter(
-        self, interaction: discord.Interaction, 사용: bool
-    ):
-        await run_db(
-            self.settings_repository.set_forbidden_filter_enabled,
-            interaction.guild_id,
-            사용,
-        )
-        # 필터는 메시지마다 DB를 때리지 않으려고 값을 캐시한다. 여기서 무효화하지
-        # 않으면 다음 재시작까지 옛 설정으로 동작한다.
-        forbidden_filter_cog = (
-            self.bot.get_cog("ForbiddenFilterCog") if self.bot else None
-        )
-        if forbidden_filter_cog is not None:
-            forbidden_filter_cog.invalidate_guild(interaction.guild_id)
-        await interaction.response.send_message(
-            f"✅ 금지어 필터를 {'켰' if 사용 else '껐'}습니다.", ephemeral=True
-        )
-
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show_settings(self, interaction: discord.Interaction):
         party_channel_id = await run_db(
@@ -306,7 +206,7 @@ class GuildSettingsCog(commands.Cog):
             self.settings_repository.get_forbidden_filter_enabled,
             interaction.guild_id,
         )
-        party_value = "미지정 — `/설정 파티채널`"
+        party_value = "미지정 — 웹 관리에서 지정"
         if party_channel_id:
             party_value = f"<#{party_channel_id}>"
             guild = getattr(interaction, "guild", None)
@@ -329,7 +229,7 @@ class GuildSettingsCog(commands.Cog):
             value=(
                 f"<#{announcement_channel_id}>"
                 if announcement_channel_id
-                else "미지정 — `/설정 공지채널`"
+                else "미지정 — 웹 관리에서 지정"
             ),
             inline=False,
         )
@@ -351,6 +251,9 @@ class GuildSettingsCog(commands.Cog):
             name="금지어 필터",
             value="켜짐" if forbidden_filter_enabled else "꺼짐",
             inline=False,
+        )
+        embed.set_footer(
+            text="이 설정은 봇 호스트 컴퓨터에서 실행되는 localhost 웹 관리 페이지에서만 변경할 수 있습니다."
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

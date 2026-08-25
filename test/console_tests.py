@@ -450,8 +450,9 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         ),
     )
     check(
-        "현재 설정과 영속 panel 명령 block 유지",
-        """`/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, `/설정 파티채널`로 기존 파티 채널을, `/설정 공지채널`로 웹 공지를 받을 채널을 지정합니다. `/설정 공지허용`""" in quick_start,
+        "Discord 설정은 시작·확인만 남고 나머지는 localhost 웹 관리",
+        "Discord에는 `/설정 시작`과 `/설정 확인`만 남으며" in quick_start
+        and "파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리" in quick_start,
     )
     check(
         "channel permission block 유지",
@@ -472,7 +473,7 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "공지는 opt-in Guild의 configured announcement channel만 대상",
-        "웹 관리 공지는 `/설정 공지허용`으로 opt-in한 Guild의 `/설정 공지채널`에만 보냅니다." in operations,
+        "웹 관리 공지는 같은 화면에서 opt-in하고 지정한 Guild 공지 채널에만 보냅니다." in operations,
     )
     check(
         "GPL-3.0과 무기여 정책을 유지",
@@ -493,6 +494,10 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
                 "/변경",
                 "recruit_channel_id",
                 "event_channel_id",
+                "/설정 파티채널",
+                "/설정 공지채널",
+                "/설정 공지허용",
+                "/설정 금지어",
             )
         ),
     )

@@ -250,7 +250,7 @@ class ForbiddenFilterCog(commands.Cog):
         self._forbidden_pattern: Optional[re.Pattern] = None
         self._allow_pattern: Optional[re.Pattern] = None
         # 길드 설정은 메시지마다 조회하게 되므로 프로세스에 캐시한다.
-        # /설정 금지어가 invalidate_guild로 무효화한다.
+        # 웹 길드 설정 저장이 invalidate_guild로 무효화한다.
         self._enabled_by_guild: Dict[int, bool] = {}
         self.refresh_forbidden_words()
 
@@ -281,7 +281,7 @@ class ForbiddenFilterCog(commands.Cog):
         return self._policy.words
 
     def invalidate_guild(self, guild_id: int) -> None:
-        """/설정 금지어가 값을 바꿨을 때 캐시를 버린다."""
+        """웹 관리가 길드별 사용 여부를 바꿨을 때 캐시를 버린다."""
         self._enabled_by_guild.pop(guild_id, None)
 
     async def _is_filter_enabled(self, guild_id: int) -> bool:

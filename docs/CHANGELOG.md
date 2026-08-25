@@ -14,8 +14,8 @@ the last change included in that milestone.
 
 ### Added
 
-- The web admin can select a dedicated `/이벤트` channel per guild and now
-  includes a Discord syntax guide in the announcement form.
+- The web admin can save party, announcement, and event channels plus announcement
+  and forbidden-filter toggles per guild, and includes a Discord syntax guide.
 
 ### Improved
 
@@ -25,6 +25,10 @@ the last change included in that milestone.
   by the game account and first showcase character on two body lines.
 - Removed the separate image API explanation from exhausted OpenAI credit
   messages.
+- Kept only `/설정 시작` and `/설정 확인`, moving the other guild controls to the
+  localhost web admin. Skipped and failed web operations now include a concise
+  cause.
+- Added actionable guidance for exhausted Gemini image quota or billing limits.
 
 ### Fixed
 

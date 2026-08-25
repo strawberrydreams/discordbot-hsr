@@ -8,11 +8,29 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from module.config import AI_COOLDOWN_SECONDS, DATA_DIR, GOOGLE_API_KEY, IMAGE_MODEL, LIMIT_IMAGE
+from google.genai import errors as genai_errors
+from module.config import (
+    AI_COOLDOWN_SECONDS,
+    DATA_DIR,
+    GOOGLE_API_KEY,
+    IMAGE_MODEL,
+    LIMIT_IMAGE,
+)
 
 # 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패한다.
 MAX_DISPLAYED_PROMPT_CHARS = 1_000
 TEMP_IMAGE_TTL_SECONDS = 300
+GEMINI_QUOTA_MESSAGE = (
+    "💳 Google Gemini API의 요청 할당량 또는 결제 한도에 도달해 이미지를 생성할 수 없어요. "
+    "잠시 후 다시 시도하고, 계속되면 운영자가 Google AI Studio의 사용량·요금제·결제 상태를 확인해 주세요."
+)
+
+
+def _is_gemini_quota_error(error: Exception) -> bool:
+    return isinstance(error, genai_errors.APIError) and (
+        error.code == 429 or error.status == "RESOURCE_EXHAUSTED"
+    )
+
 
 class HyacineImageCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -174,15 +192,19 @@ class HyacineImageCog(commands.Cog):
                 )
             )
 
-        except Exception:
-            # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
+        except Exception as error:
+            quota_error = _is_gemini_quota_error(error)
             print(
                 "❌ [hyacine_image] 이미지 생성 실패 "
                 f"(user={interaction.user.id})"
             )
-            traceback.print_exc()
+            if not quota_error:
+                # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
+                traceback.print_exc()
             if image_generated:
                 message = "❌ 이미지는 생성되었지만 Discord 전송에 실패했습니다."
+            elif quota_error:
+                message = GEMINI_QUOTA_MESSAGE
             else:
                 message = "❌ 이미지 생성 중 오류가 발생했어요."
             try:

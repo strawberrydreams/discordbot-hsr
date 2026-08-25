@@ -236,6 +236,18 @@ class GuildSettingsRepository(ABC):
         """금지어 필터 사용 여부를 지정한다."""
 
     @abstractmethod
+    def set_guild_settings(
+        self,
+        guild_id: int,
+        party_channel_id: Optional[int],
+        announcement_channel_id: Optional[int],
+        event_channel_id: Optional[int],
+        allow_host_announce: bool,
+        forbidden_filter_enabled: bool,
+    ) -> None:
+        """웹 관리에서 다루는 길드 설정을 한 트랜잭션으로 저장한다."""
+
+    @abstractmethod
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
         """게임별 영속 파티 패널 메시지 ID를 반환한다."""
 
@@ -994,6 +1006,52 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def set_forbidden_filter_enabled(self, guild_id: int, enabled: bool) -> None:
         self._set_column(guild_id, self._FORBIDDEN_FILTER, int(enabled))
+
+    def set_guild_settings(
+        self,
+        guild_id: int,
+        party_channel_id: Optional[int],
+        announcement_channel_id: Optional[int],
+        event_channel_id: Optional[int],
+        allow_host_announce: bool,
+        forbidden_filter_enabled: bool,
+    ) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                DELETE FROM party_panels
+                WHERE guild_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM guild_settings
+                      WHERE guild_id = ? AND party_channel_id IS ?
+                  )
+                """,
+                (guild_id, guild_id, party_channel_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO guild_settings (
+                    guild_id, party_channel_id, announcement_channel_id,
+                    event_channel_id, allow_host_announce,
+                    forbidden_filter_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    party_channel_id = excluded.party_channel_id,
+                    announcement_channel_id = excluded.announcement_channel_id,
+                    event_channel_id = excluded.event_channel_id,
+                    allow_host_announce = excluded.allow_host_announce,
+                    forbidden_filter_enabled = excluded.forbidden_filter_enabled
+                """,
+                (
+                    guild_id,
+                    party_channel_id,
+                    announcement_channel_id,
+                    event_channel_id,
+                    int(allow_host_announce),
+                    int(forbidden_filter_enabled),
+                ),
+            )
+            conn.commit()
 
     def get_party_panels(self, guild_id: int) -> Dict[str, int]:
         with closing(_connect(self.db_path)) as conn:

@@ -360,6 +360,7 @@
       margin-bottom: var(--space-9);
       padding: var(--space-4) var(--space-5);
       font-weight: 700;
+      white-space: pre-line;
     }
 
     .notice:empty { display: none; }
@@ -568,15 +569,32 @@
 
     td { color: var(--fog); }
 
-    .channel-form {
+    .guild-settings-form {
       display: flex;
       align-items: center;
       gap: var(--space-2);
     }
 
-    .channel-form select { min-width: 180px; }
+    .guild-settings-fields {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: var(--space-3);
+      flex: 1;
+    }
 
-    .channel-form .button { padding: 9px 12px; }
+    .guild-settings-fields label {
+      display: grid;
+      gap: var(--space-1);
+      color: var(--greyple);
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .guild-settings-form .button {
+      align-self: end;
+      padding: 9px 12px;
+      white-space: nowrap;
+    }
 
     .announcement-layout {
       display: grid;
@@ -706,7 +724,13 @@
       .settings-grid,
       .field-grid,
       .announcement-layout,
-      .compact-grid { grid-template-columns: 1fr; }
+      .compact-grid,
+      .guild-settings-fields { grid-template-columns: 1fr; }
+
+      .guild-settings-form {
+        align-items: stretch;
+        flex-direction: column;
+      }
 
       .metric + .metric {
         border-top: 1px solid var(--border);
@@ -881,19 +905,16 @@
           <div class="section-head">
             <div>
               <h2 class="section-title" id="guild-title">길드별 설정</h2>
-              <p class="section-copy">Discord에서 설정된 채널과 호스트 공지 허용 상태를 확인하고 `/이벤트` 전용 채널을 지정합니다.</p>
+              <p class="section-copy">길드별 파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부를 저장합니다.</p>
             </div>
           </div>
           <div class="table-panel">
             <div class="table-wrap">
-              <table aria-label="길드별 파티·이벤트·공지 설정">
+              <table aria-label="길드별 채널·공지·금지어 설정">
                 <thead>
                   <tr>
                     <th scope="col">길드</th>
-                    <th scope="col">파티 채널</th>
-                    <th scope="col">공지 채널</th>
-                    <th scope="col">이벤트 채널</th>
-                    <th scope="col">공지 허용</th>
+                    <th scope="col">채널 및 기능 설정</th>
                   </tr>
                 </thead>
                 <tbody>{{guild_rows}}</tbody>
