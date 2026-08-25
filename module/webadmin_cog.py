@@ -40,7 +40,7 @@ MAX_REQUEST_BYTES = ANNOUNCEMENT_IMAGE_LIMIT + 64 * 1024
 ANNOUNCEMENT_TITLE_LIMIT = 256
 ANNOUNCEMENT_BODY_LIMIT = 4_096
 # 길드 하나가 매달려도 나머지 전송과 HTTP 응답까지 끌고 가지 않게 한다.
-ANNOUNCE_SEND_TIMEOUT = 10
+ANNOUNCEMENT_SEND_TIMEOUT_SECONDS = 10
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -102,17 +102,19 @@ class WebAdminCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
-        settings: GuildSettingsRepository | None = None,
+        settings_repository: GuildSettingsRepository | None = None,
     ):
         self.bot = bot
-        self.settings = settings or create_guild_settings_repository()
-        self.sessions: dict[str, AdminSession] = {}
-        self.runner: web.AppRunner | None = None
-        self.site: web.TCPSite | None = None
+        self.settings_repository = (
+            settings_repository or create_guild_settings_repository()
+        )
+        self.admin_sessions: dict[str, AdminSession] = {}
+        self.web_runner: web.AppRunner | None = None
+        self.web_site: web.TCPSite | None = None
         self._mutation_lock = asyncio.Lock()
         # 공지는 길드 수에 비례해 오래 걸린다. 설정 저장과 lock을 공유하면 공지 한
         # 번이 관리 화면 전체를 막는다.
-        self._announce_lock = asyncio.Lock()
+        self._announcement_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self.app = web.Application(
             client_max_size=MAX_REQUEST_BYTES, middlewares=[_security_headers]
@@ -124,12 +126,13 @@ class WebAdminCog(commands.Cog):
                 web.post("/logout", self.logout_post),
                 web.get("/", self.index_get),
                 web.post("/settings/{name}", self.settings_post),
+                web.post("/guilds/event-channel", self.event_channel_post),
                 web.post("/announce", self.announce_post),
             ]
         )
 
     async def start(self) -> None:
-        if self.runner is not None:
+        if self.web_runner is not None:
             return
         host = _bind_host()
         runner = web.AppRunner(self.app)
@@ -140,14 +143,14 @@ class WebAdminCog(commands.Cog):
         except BaseException:
             await runner.cleanup()
             raise
-        self.runner = runner
-        self.site = site
+        self.web_runner = runner
+        self.web_site = site
 
     async def close(self) -> None:
         async with self._close_lock:
-            runner, self.runner = self.runner, None
-            self.site = None
-            self.sessions.clear()
+            runner, self.web_runner = self.web_runner, None
+            self.web_site = None
+            self.admin_sessions.clear()
             if runner is not None:
                 await runner.cleanup()
 
@@ -198,11 +201,11 @@ class WebAdminCog(commands.Cog):
         form: dict[str, str] = {}
         upload: AnnouncementUpload | None = None
         image_seen = False
-        fields = 0
+        field_count = 0
         reader = await request.multipart()
         while part := await reader.next():
-            fields += 1
-            if fields > 10:
+            field_count += 1
+            if field_count > 10:
                 raise web.HTTPBadRequest(text="폼 필드가 너무 많습니다.")
             if part.name == "image":
                 if image_seen:
@@ -234,36 +237,47 @@ class WebAdminCog(commands.Cog):
 
     @staticmethod
     def _announcement_image_name(upload: AnnouncementUpload) -> str:
-        signatures = {
-            "image/png": ("png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
-            "image/jpeg": ("jpg", lambda data: data.startswith(b"\xff\xd8\xff")),
-            "image/gif": ("gif", lambda data: data.startswith((b"GIF87a", b"GIF89a"))),
+        image_signatures = {
+            "image/png": (
+                "png",
+                lambda image_data: image_data.startswith(b"\x89PNG\r\n\x1a\n"),
+            ),
+            "image/jpeg": (
+                "jpg",
+                lambda image_data: image_data.startswith(b"\xff\xd8\xff"),
+            ),
+            "image/gif": (
+                "gif",
+                lambda image_data: image_data.startswith((b"GIF87a", b"GIF89a")),
+            ),
             "image/webp": (
                 "webp",
-                lambda data: len(data) >= 12
-                and data.startswith(b"RIFF")
-                and data[8:12] == b"WEBP",
+                lambda image_data: len(image_data) >= 12
+                and image_data.startswith(b"RIFF")
+                and image_data[8:12] == b"WEBP",
             ),
         }
-        extension_and_check = signatures.get(upload.content_type)
+        extension_and_check = image_signatures.get(upload.content_type)
         if extension_and_check is None or not extension_and_check[1](upload.payload):
             raise ValueError("공지 이미지는 PNG, JPEG, GIF, WebP 파일이어야 합니다.")
         return f"announcement.{extension_and_check[0]}"
 
-    def _session(self, request: web.Request) -> tuple[str, AdminSession] | None:
-        now = time.monotonic()
+    def _get_active_session(
+        self, request: web.Request
+    ) -> tuple[str, AdminSession] | None:
+        current_time = time.monotonic()
         for expired_id in [
             session_id
-            for session_id, session in self.sessions.items()
-            if session.expires_at <= now
+            for session_id, session in self.admin_sessions.items()
+            if session.expires_at <= current_time
         ]:
-            self.sessions.pop(expired_id, None)
+            self.admin_sessions.pop(expired_id, None)
         session_id = request.cookies.get(SESSION_COOKIE)
-        session = self.sessions.get(session_id or "")
+        session = self.admin_sessions.get(session_id or "")
         return (session_id, session) if session_id and session else None
 
     def _require_session(self, request: web.Request) -> tuple[str, AdminSession]:
-        session = self._session(request)
+        session = self._get_active_session(request)
         if session is None:
             raise web.HTTPUnauthorized(text="로그인이 필요합니다.")
         return session
@@ -280,21 +294,21 @@ class WebAdminCog(commands.Cog):
         return session
 
     @staticmethod
-    def _template(name: str, **values: str) -> str:
-        source = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
+    def _render_template(name: str, **values: str) -> str:
+        template_source = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
 
         def substitute(match: re.Match[str]) -> str:
-            key = match.group(1)
-            value = values.get(key, "")
-            if key in RAW_PLACEHOLDERS:
-                return value
-            return html.escape(value, quote=True)
+            placeholder_name = match.group(1)
+            placeholder_value = values.get(placeholder_name, "")
+            if placeholder_name in RAW_PLACEHOLDERS:
+                return placeholder_value
+            return html.escape(placeholder_value, quote=True)
 
-        return PLACEHOLDER_PATTERN.sub(substitute, source)
+        return PLACEHOLDER_PATTERN.sub(substitute, template_source)
 
     def _login_response(self, error: str = "", *, status: int = 200) -> web.Response:
         return web.Response(
-            text=self._template("admin_login.html", error=error),
+            text=self._render_template("admin_login.html", error=error),
             content_type="text/html",
             charset="utf-8",
             status=status,
@@ -310,13 +324,13 @@ class WebAdminCog(commands.Cog):
         운영자는 빈 textarea만 보고 원인을 알 수 없다.
         """
         try:
-            data = config.read_settings_bytes(name)
+            settings_bytes = config.read_settings_bytes(name)
         except (OSError, ValueError) as exc:
             return "", f"{name}: {exc}"
-        if data is None:
+        if settings_bytes is None:
             return "", ""
         try:
-            return data.decode("utf-8"), ""
+            return settings_bytes.decode("utf-8"), ""
         except UnicodeDecodeError:
             return "", f"{name}: UTF-8로 읽을 수 없습니다."
 
@@ -358,76 +372,140 @@ class WebAdminCog(commands.Cog):
         )
         return label if usable else f"{label} (권한 부족)"
 
-    async def _guild_overview(self) -> tuple[str, str, str]:
+    @staticmethod
+    def _event_channel_options(guild, selected_channel_id: int | None) -> str:
+        options = [
+            '<option value=""{}>제한 없음</option>'.format(
+                " selected" if selected_channel_id is None else ""
+            )
+        ]
+        selected_channel_found = False
+        for channel in getattr(guild, "text_channels", ()):
+            channel_id = int(channel.id)
+            selected = channel_id == selected_channel_id
+            selected_channel_found |= selected
+            label = f"#{channel.name}"
+            if not is_sendable_panel_channel(guild, channel):
+                label += " (권한 부족)"
+            options.append(
+                '<option value="{}"{}>{}</option>'.format(
+                    channel_id,
+                    " selected" if selected else "",
+                    html.escape(label, quote=True),
+                )
+            )
+        if selected_channel_id and not selected_channel_found:
+            options.append(
+                '<option value="{}" selected>삭제됨 ({})</option>'.format(
+                    int(selected_channel_id), int(selected_channel_id)
+                )
+            )
+        return "".join(options)
+
+    async def _guild_overview(self, csrf: str) -> tuple[str, str, str]:
         """(길드 현황 표의 행, 공지 대상 option, 읽기 실패 사유)를 돌려준다.
 
         운영자는 어느 길드가 공지를 허용했고 공지 채널이 어디인지 확인할 수단이
         없으면 공지를 보내기 전에 대상을 검증할 수 없다.
 
-        ponytail: 길드당 조회 2회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
+        ponytail: 길드당 조회 4회다. 1운영자 1인스턴스 규모에서는 무시할 수 있다.
         길드가 수백 개로 늘면 전 길드 설정을 한 번에 읽는 repository 메서드를
         추가한다.
         """
-        rows: list[str] = []
-        options = ['<option value="">전체 (공지 허용 길드 모두)</option>']
+        row_fragments: list[str] = []
+        option_fragments = [
+            '<option value="">전체 (공지 허용 길드 모두)</option>'
+        ]
         for guild in self.bot.guilds:
             try:
-                party = await run_db(self.settings.get_party_channel, guild.id)
-                announcement = await run_db(
-                    self.settings.get_announcement_channel, guild.id
+                party_channel_id = await run_db(
+                    self.settings_repository.get_party_channel, guild.id
                 )
-                allowed = await run_db(self.settings.get_allow_host_announce, guild.id)
+                announcement_channel_id = await run_db(
+                    self.settings_repository.get_announcement_channel, guild.id
+                )
+                event_channel_id = await run_db(
+                    self.settings_repository.get_event_channel, guild.id
+                )
+                announcements_allowed = await run_db(
+                    self.settings_repository.get_allow_host_announce, guild.id
+                )
             except Exception:
                 logger.exception("Guild overview lookup failed for guild_id=%s", guild.id)
-                return "", "".join(options), "길드 설정을 읽지 못했습니다."
-            name = html.escape(str(guild.name), quote=True)
-            rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                    name,
-                    html.escape(self._channel_label(guild, party), quote=True),
+                return (
+                    "",
+                    "".join(option_fragments),
+                    "길드 설정을 읽지 못했습니다.",
+                )
+            escaped_guild_name = html.escape(str(guild.name), quote=True)
+            event_channel_form = (
+                '<form class="channel-form" method="post" '
+                'action="/guilds/event-channel">'
+                f'<input type="hidden" name="csrf" value="{html.escape(csrf, quote=True)}">'
+                f'<input type="hidden" name="guild_id" value="{int(guild.id)}">'
+                f'<select name="channel_id" aria-label="{escaped_guild_name} 이벤트 채널">'
+                f'{self._event_channel_options(guild, event_channel_id)}'
+                '</select><button class="button button-secondary" type="submit">저장</button>'
+                '</form>'
+            )
+            row_fragments.append(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    escaped_guild_name,
+                    html.escape(
+                        self._channel_label(guild, party_channel_id), quote=True
+                    ),
                     html.escape(
                         self._channel_label(
-                            guild, announcement, announcement=True
+                            guild,
+                            announcement_channel_id,
+                            announcement=True,
                         ),
                         quote=True,
                     ),
-                    "허용" if allowed else "차단",
+                    event_channel_form,
+                    "허용" if announcements_allowed else "차단",
                 )
             )
-            if allowed:
-                options.append(f'<option value="{int(guild.id)}">{name}</option>')
-        if not rows:
-            rows.append('<tr><td colspan="4">참여 중인 길드가 없습니다.</td></tr>')
-        return "".join(rows), "".join(options), ""
+            if announcements_allowed:
+                option_fragments.append(
+                    f'<option value="{int(guild.id)}">{escaped_guild_name}</option>'
+                )
+        if not row_fragments:
+            row_fragments.append(
+                '<tr><td colspan="5">참여 중인 길드가 없습니다.</td></tr>'
+            )
+        return "".join(row_fragments), "".join(option_fragments), ""
 
     async def _index_response(self, csrf: str, notice: str = "") -> web.Response:
-        texts: dict[str, str] = {}
-        problems: list[str] = []
+        settings_text_by_name: dict[str, str] = {}
+        settings_problems: list[str] = []
         for name in config.SETTINGS_FILES:
             if name == "persona.json":
                 continue
             text, problem = self._settings_text(name)
-            texts[name] = text
+            settings_text_by_name[name] = text
             if problem:
-                problems.append(problem)
+                settings_problems.append(problem)
         persona_prompt, persona_greeting, persona_problem = self._persona_fields()
         if persona_problem:
-            problems.append(persona_problem)
-        guild_rows, guild_options, guild_problem = await self._guild_overview()
+            settings_problems.append(persona_problem)
+        guild_rows, guild_options, guild_problem = await self._guild_overview(csrf)
         if guild_problem:
-            problems.append(guild_problem)
-        if problems:
-            warning = "설정을 읽지 못했습니다 — " + " / ".join(problems)
+            settings_problems.append(guild_problem)
+        if settings_problems:
+            warning = "설정을 읽지 못했습니다 — " + " / ".join(
+                settings_problems
+            )
             notice = f"{notice} {warning}" if notice else warning
         return web.Response(
-            text=self._template(
+            text=self._render_template(
                 "admin_index.html",
                 csrf=csrf,
                 notice=notice,
                 persona_prompt=persona_prompt,
                 persona_greeting=persona_greeting,
-                forbidden_words=texts["forbidden_words.json"],
-                games=texts["games.json"],
+                forbidden_words=settings_text_by_name["forbidden_words.json"],
+                games=settings_text_by_name["games.json"],
                 guild_rows=guild_rows,
                 guild_options=guild_options,
             ),
@@ -436,7 +514,7 @@ class WebAdminCog(commands.Cog):
         )
 
     async def login_get(self, request: web.Request) -> web.StreamResponse:
-        if self._session(request):
+        if self._get_active_session(request):
             raise web.HTTPFound("/")
         return self._login_response()
 
@@ -451,8 +529,8 @@ class WebAdminCog(commands.Cog):
 
         session_id = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
-        self.sessions.clear()
-        self.sessions[session_id] = AdminSession(
+        self.admin_sessions.clear()
+        self.admin_sessions[session_id] = AdminSession(
             csrf=csrf, expires_at=time.monotonic() + SESSION_TTL_SECONDS
         )
         response = web.HTTPSeeOther("/")
@@ -470,13 +548,13 @@ class WebAdminCog(commands.Cog):
         self._require_session(request)
         form = await self._read_form(request)
         session_id, _ = self._require_csrf(request, form)
-        self.sessions.pop(session_id, None)
+        self.admin_sessions.pop(session_id, None)
         response = web.HTTPSeeOther("/login")
         response.del_cookie(SESSION_COOKIE, path="/")
         raise response
 
     async def index_get(self, request: web.Request) -> web.StreamResponse:
-        session = self._session(request)
+        session = self._get_active_session(request)
         if session is None:
             raise web.HTTPFound("/login")
         return await self._index_response(session[1].csrf)
@@ -486,11 +564,11 @@ class WebAdminCog(commands.Cog):
         form = await self._read_form(request)
         _, session = self._require_csrf(request, form)
         csrf = session.csrf
-        name = request.match_info["name"]
-        if name not in config.SETTINGS_FILES:
+        settings_filename = request.match_info["name"]
+        if settings_filename not in config.SETTINGS_FILES:
             raise web.HTTPNotFound(text="허용되지 않은 설정 파일입니다.")
         try:
-            if name == "persona.json":
+            if settings_filename == "persona.json":
                 # 화면이 값 두 개만 받으므로 JSON은 여기서 조립한다. 형식 검증은
                 # atomic_write_settings의 canonicalizer가 그대로 수행한다.
                 document = {
@@ -500,11 +578,15 @@ class WebAdminCog(commands.Cog):
             else:
                 document = json.loads(form.get("document", ""))
             async with self._mutation_lock:
-                await asyncio.to_thread(config.atomic_write_settings, name, document)
-                if name == "forbidden_words.json":
-                    cog = self.bot.get_cog("ForbiddenFilterCog")
-                    if cog is not None:
-                        await cog.reload_prohibited_words()
+                await asyncio.to_thread(
+                    config.atomic_write_settings, settings_filename, document
+                )
+                if settings_filename == "forbidden_words.json":
+                    forbidden_filter_cog = self.bot.get_cog(
+                        "ForbiddenFilterCog"
+                    )
+                    if forbidden_filter_cog is not None:
+                        await forbidden_filter_cog.reload_forbidden_words()
         except (OSError, ValueError, RecursionError) as exc:
             return await self._index_response(csrf, f"저장 실패: {exc}")
 
@@ -513,7 +595,46 @@ class WebAdminCog(commands.Cog):
             "forbidden_words.json": "저장하고 금지어 필터를 다시 불러왔습니다.",
             "games.json": "저장했습니다. 적용하려면 봇을 재시작하세요.",
         }
-        return await self._index_response(csrf, notices[name])
+        return await self._index_response(csrf, notices[settings_filename])
+
+    async def event_channel_post(self, request: web.Request) -> web.StreamResponse:
+        self._require_session(request)
+        form = await self._read_form(request)
+        _, session = self._require_csrf(request, form)
+        csrf = session.csrf
+        guild_id_text = form.get("guild_id", "").strip()
+        channel_id_text = form.get("channel_id", "").strip()
+        if not guild_id_text.isdigit() or (
+            channel_id_text and not channel_id_text.isdigit()
+        ):
+            return await self._index_response(csrf, "이벤트 채널 설정이 올바르지 않습니다.")
+
+        guild_id = int(guild_id_text)
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return await self._index_response(csrf, "참여 중인 길드를 찾지 못했습니다.")
+
+        channel_id = int(channel_id_text) if channel_id_text else None
+        if channel_id is not None:
+            channel = guild.get_channel(channel_id)
+            if channel is None or not is_sendable_panel_channel(guild, channel):
+                return await self._index_response(
+                    csrf,
+                    "이벤트 채널에는 봇의 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드 권한이 필요합니다.",
+                )
+
+        async with self._mutation_lock:
+            await run_db(
+                self.settings_repository.set_event_channel,
+                guild_id,
+                channel_id,
+            )
+        notice = (
+            f"{guild.name}의 `/이벤트` 채널을 <#{channel_id}>로 지정했습니다."
+            if channel_id is not None
+            else f"{guild.name}의 `/이벤트` 채널 제한을 해제했습니다."
+        )
+        return await self._index_response(csrf, notice)
 
     async def announce_post(self, request: web.Request) -> web.StreamResponse:
         self._require_session(request)
@@ -522,7 +643,7 @@ class WebAdminCog(commands.Cog):
         csrf = session.csrf
         title = form.get("title", "").strip()
         body = form.get("body", "").strip()
-        target = form.get("guild_id", "").strip()
+        target_guild_id_text = form.get("guild_id", "").strip()
         colour_text = form.get("color", "").strip()
         try:
             image_name = self._announcement_image_name(upload) if upload else None
@@ -532,7 +653,7 @@ class WebAdminCog(commands.Cog):
             return await self._index_response(csrf, "공지 제목은 1~256자여야 합니다.")
         if not body or len(body) > ANNOUNCEMENT_BODY_LIMIT:
             return await self._index_response(csrf, "공지 본문은 1~4,096자여야 합니다.")
-        if target and not target.isdigit():
+        if target_guild_id_text and not target_guild_id_text.isdigit():
             return await self._index_response(csrf, "공지 대상 길드가 올바르지 않습니다.")
         colour = discord.Colour.default()
         if colour_text:
@@ -542,20 +663,22 @@ class WebAdminCog(commands.Cog):
                 )
             colour = discord.Colour(int(colour_text[1:], 16))
 
-        success = skipped = failed = 0
-        async with self._announce_lock:
+        success_count = skipped_count = failed_count = 0
+        async with self._announcement_lock:
             try:
-                guild_ids = await run_db(self.settings.list_announcement_guild_ids)
+                guild_ids = await run_db(
+                    self.settings_repository.list_announcement_guild_ids
+                )
             except Exception:
                 return await self._index_response(csrf, "공지 대상 목록을 읽지 못했습니다.")
-            if target:
+            if target_guild_id_text:
                 # 옵트인 목록이 곧 신뢰 경계다. 드롭다운 표시 여부와 무관하게
                 # 전송 직전에 다시 확인해야 form을 조작한 요청이 통과하지 않는다.
-                if int(target) not in guild_ids:
+                if int(target_guild_id_text) not in guild_ids:
                     return await self._index_response(
                         csrf, "공지를 허용하지 않은 길드입니다."
                     )
-                guild_ids = [int(target)]
+                guild_ids = [int(target_guild_id_text)]
             embed = discord.Embed(title=title, description=body, colour=colour)
             if image_name:
                 embed.set_image(url=f"attachment://{image_name}")
@@ -563,45 +686,50 @@ class WebAdminCog(commands.Cog):
                 try:
                     guild = self.bot.get_guild(guild_id)
                     if guild is None:
-                        skipped += 1
+                        skipped_count += 1
                         continue
                     channel_id = await run_db(
-                        self.settings.get_announcement_channel, guild_id
+                        self.settings_repository.get_announcement_channel,
+                        guild_id,
                     )
                     channel = guild.get_channel(channel_id) if channel_id else None
                     if not is_sendable_announcement_channel(guild, channel):
-                        skipped += 1
+                        skipped_count += 1
                         continue
-                    file = (
+                    announcement_file = (
                         discord.File(io.BytesIO(upload.payload), filename=image_name)
                         if upload and image_name
                         else None
                     )
                     try:
-                        send = (
-                            channel.send(embed=embed, file=file)
-                            if file is not None
+                        send_request = (
+                            channel.send(embed=embed, file=announcement_file)
+                            if announcement_file is not None
                             else channel.send(embed=embed)
                         )
-                        await asyncio.wait_for(send, timeout=ANNOUNCE_SEND_TIMEOUT)
+                        await asyncio.wait_for(
+                            send_request,
+                            timeout=ANNOUNCEMENT_SEND_TIMEOUT_SECONDS,
+                        )
                     finally:
-                        if file is not None:
-                            file.close()
-                    success += 1
+                        if announcement_file is not None:
+                            announcement_file.close()
+                    success_count += 1
                 except Exception:
-                    failed += 1
+                    failed_count += 1
                     logger.exception("Host announcement failed for guild_id=%s", guild_id)
 
         return await self._index_response(
-            csrf, f"공지 완료: 성공 {success}, 건너뜀 {skipped}, 실패 {failed}"
+            csrf,
+            f"공지 완료: 성공 {success_count}, 건너뜀 {skipped_count}, 실패 {failed_count}",
         )
 
 
 async def setup(bot: commands.Bot) -> None:
-    cog = WebAdminCog(bot)
-    await cog.start()
+    web_admin_cog = WebAdminCog(bot)
+    await web_admin_cog.start()
     try:
-        await bot.add_cog(cog)
+        await bot.add_cog(web_admin_cog)
     except BaseException:
-        await cog.close()
+        await web_admin_cog.close()
         raise

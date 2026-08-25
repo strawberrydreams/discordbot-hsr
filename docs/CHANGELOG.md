@@ -10,6 +10,27 @@ The repository did not use release tags during the period covered below. The
 version numbers are therefore retrospective milestone labels, and each date is
 the last change included in that milestone.
 
+## [Unreleased]
+
+### Added
+
+- The web admin can select a dedicated `/이벤트` channel per guild and now
+  includes a Discord syntax guide in the announcement form.
+
+### Improved
+
+- Restricted `/설정` subcommands to members with the `Administrator`
+  permission.
+- Game cards now show the Discord nickname and game name in the title, followed
+  by the game account and first showcase character on two body lines.
+- Removed the separate image API explanation from exhausted OpenAI credit
+  messages.
+
+### Fixed
+
+- Fixed web admin requests failing when current aiohttp versions invoked the
+  security-header middleware.
+
 ## [0.7.0] - 2026-08-21 — Game cards and selective party recruitment
 
 ### Added

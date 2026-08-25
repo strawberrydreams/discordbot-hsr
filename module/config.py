@@ -27,13 +27,13 @@ def _path_from_env(name: str, default: str) -> Path:
 
 
 def _int_from_env(name: str, default: int | None = None) -> int:
-    raw = os.getenv(name)
-    if raw is None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
         if default is None:
             raise RuntimeError(f"{name} 환경변수가 필요합니다.")
         return default
     try:
-        return int(raw)
+        return int(raw_value)
     except ValueError as exc:
         raise RuntimeError(f"{name} 환경변수는 정수여야 합니다.") from exc
 
@@ -69,36 +69,36 @@ def load_settings_json(*names: str, default):
     return default
 
 
-def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
-    if not isinstance(raw, dict):
+def _canonicalize_games(document: object, *, strict: bool = False) -> dict:
+    if not isinstance(document, dict):
         if strict:
             raise ValueError("games.json 최상단은 객체여야 합니다.")
         return {}
-    if len(raw) > 25:
+    if len(document) > 25:
         message = "games.json의 게임은 최대 25개여야 합니다."
         if strict:
             raise ValueError(message)
         print(f"⚠️ {message} 앞 항목만 사용합니다.")
     games = {}
-    for name, info in raw.items():
+    for game_name, game_settings in document.items():
         if len(games) == 25:
             break
-        if not isinstance(name, str) or not 1 <= len(name) <= 89:
-            message = f"games.json의 게임 이름이 1~89자가 아닙니다: {name}"
+        if not isinstance(game_name, str) or not 1 <= len(game_name) <= 89:
+            message = f"games.json의 게임 이름이 1~89자가 아닙니다: {game_name}"
             if strict:
                 raise ValueError(message)
             print(f"⚠️ {message}")
             continue
-        if not isinstance(info, dict):
-            message = f"games.json 항목이 객체가 아닙니다: {name}"
+        if not isinstance(game_settings, dict):
+            message = f"games.json 항목이 객체가 아닙니다: {game_name}"
             if strict:
                 raise ValueError(message)
             print(f"⚠️ {message}")
             continue
-        max_players = info.get("max_players")
-        roles = info.get("roles", [])
+        max_players = game_settings.get("max_players")
+        roles = game_settings.get("roles", [])
         if type(max_players) is not int or not 1 <= max_players <= 25:
-            message = f"games.json의 max_players가 1~25의 정수가 아닙니다: {name}"
+            message = f"games.json의 max_players가 1~25의 정수가 아닙니다: {game_name}"
             if strict:
                 raise ValueError(message)
             print(f"⚠️ {message}")
@@ -111,13 +111,13 @@ def _canonicalize_games(raw: object, *, strict: bool = False) -> dict:
         ):
             message = (
                 "games.json의 roles가 최대 24개·각 1~100자·합계 1,024자 이내가 "
-                f"아닙니다: {name}"
+                f"아닙니다: {game_name}"
             )
             if strict:
                 raise ValueError(message)
             print(f"⚠️ {message}")
             continue
-        games[name] = {"max_players": max_players, "roles": roles}
+        games[game_name] = {"max_players": max_players, "roles": roles}
     return games
 
 
@@ -145,8 +145,11 @@ def _open_settings_directory(*, create: bool) -> int:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     directory_fd = os.open(SETTINGS_DIR, flags)
     try:
-        info = os.fstat(directory_fd)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        directory_stat = os.fstat(directory_fd)
+        if (
+            directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) & 0o022
+        ):
             raise PermissionError(
                 "SETTINGS_DIR은 현재 프로세스 소유이며 group/world 쓰기 불가여야 합니다."
             )
@@ -198,8 +201,12 @@ def read_settings_bytes(name: str) -> bytes | None:
             with os.fdopen(file_fd, "rb") as fp:
                 if not stat.S_ISREG(os.fstat(fp.fileno()).st_mode):
                     return None
-                data = fp.read(MAX_SETTINGS_BYTES + 1)
-            return data if len(data) <= MAX_SETTINGS_BYTES else None
+                settings_bytes = fp.read(MAX_SETTINGS_BYTES + 1)
+            return (
+                settings_bytes
+                if len(settings_bytes) <= MAX_SETTINGS_BYTES
+                else None
+            )
         return None
     finally:
         os.close(directory_fd)
@@ -299,12 +306,12 @@ def validate_config() -> None:
         raise RuntimeError("BACKUP_RETENTION_DAYS는 양의 정수여야 합니다.")
     if AI_COOLDOWN_SECONDS <= 0:
         raise RuntimeError("AI_COOLDOWN_SECONDS는 양의 정수여야 합니다.")
-    for name, value in (
+    for name, configured_limit in (
         ("LIMIT_LIGHT", LIMIT_LIGHT),
         ("LIMIT_DEEP", LIMIT_DEEP),
         ("LIMIT_IMAGE", LIMIT_IMAGE),
     ):
-        if value <= 0:
+        if configured_limit <= 0:
             raise RuntimeError(f"{name}는 양의 정수여야 합니다.")
     if DB_BACKEND != "sqlite":
         raise RuntimeError("현재 지원하는 DB_BACKEND는 sqlite뿐입니다.")
@@ -316,8 +323,8 @@ def load_games() -> dict:
     형태가 어긋난 항목은 버린다. playwith_cog가 max_players/roles를 무조건
     참조하므로, 잘못된 항목 하나가 파티 기능 전체를 깨뜨리면 안 된다.
     """
-    raw = load_settings_json("games.json", "games.example.json", default={})
-    return _canonicalize_games(raw)
+    document = load_settings_json("games.json", "games.example.json", default={})
+    return _canonicalize_games(document)
 
 
 GAMES = load_games()

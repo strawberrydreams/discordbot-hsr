@@ -23,3 +23,16 @@
 
 저장소는 **GPL-3.0**입니다. 프로필 카드가 쓰는 `enka`가 GPL-3.0이므로 배포물 전체가 그 조건을
 따릅니다. MIT였던 시절의 서술을 되살리지 마세요.
+
+## 작명 기준
+
+- 함수와 변수는 역할·도메인을 드러내는 완전한 영어 단어를 쓴다. (`interaction`,
+  `settings_repository`, `response_message`)
+- 함수 이름은 부작용을 포함한 실제 동작을 표현한다. 조회와 생성을 함께 하면
+  `get_or_create_*`, 상태를 바꾸면 `set_*`·`refresh_*`처럼 쓴다.
+- 도메인에서 관용적인 `id`, `db`, `api`, `url`, `uid`, `csrf`, `cog`와 자원·예외를
+  짧게 가리키는 `conn`, `cursor`, `row`, `fd`, `fp`, `exc`만 약어로 허용한다. 외부
+  계약인 환경 변수·JSON 키·DB 컬럼·Discord 명령 옵션은 호환성을 위해 내부 작명
+  기준과 달라도 유지한다.
+- 동일 개념은 모든 모듈에서 같은 용어를 쓴다. 특히 저장소는 `*_repository`,
+  Discord 상호작용은 `interaction`, AI 한도 구분값은 `usage_category`로 부른다.

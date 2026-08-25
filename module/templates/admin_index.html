@@ -3,30 +3,969 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>봇 관리</title>
-  <style>body{font:15px system-ui;max-width:64rem;margin:2rem auto;padding:0 1rem}textarea,input,select,button{box-sizing:border-box;width:100%;padding:.6rem}textarea{min-height:14rem;font-family:ui-monospace,monospace}form{margin:1rem 0 2rem}.notice{font-weight:600}button{margin-top:.5rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:.4rem .6rem;text-align:left}</style>
+  <title>Hyacine Bot Control Center</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --blurple: #5865f2;
+      --blurple-hover: #4752c4;
+      --spring-green: #57f287;
+      --cerulean: #00b0f4;
+      --danger: #ed4245;
+      --cosmic: #0e0f2d;
+      --cosmic-deep: #090a20;
+      --chrome: #23272a;
+      --surface: #2c2f33;
+      --surface-raised: #34373c;
+      --snow: #ffffff;
+      --fog: #babcd9;
+      --greyple: #99aab5;
+      --dim-grey: #50555f;
+      --border: #40444b;
+      --radius-button: 12px;
+      --radius-card: 16px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-7: 28px;
+      --space-9: 36px;
+      --page-width: 1240px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "Noto Sans KR", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      min-width: 320px;
+      min-height: 100vh;
+      margin: 0;
+      background:
+        radial-gradient(circle at 72% -15%, rgba(88, 101, 242, .2), transparent 31rem),
+        var(--cosmic-deep);
+      color: var(--snow);
+      font-size: 15px;
+      line-height: 1.5;
+    }
+
+    button,
+    input,
+    select,
+    textarea { font: inherit; }
+
+    button:focus-visible,
+    a:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible {
+      outline: 3px solid rgba(88, 101, 242, .52);
+      outline-offset: 2px;
+    }
+
+    .skip-link {
+      position: fixed;
+      z-index: 10;
+      top: var(--space-3);
+      left: var(--space-3);
+      transform: translateY(-150%);
+      border-radius: var(--radius-button);
+      background: var(--snow);
+      color: var(--chrome);
+      padding: var(--space-3) var(--space-4);
+      font-weight: 800;
+    }
+
+    .skip-link:focus { transform: translateY(0); }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 252px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      display: flex;
+      height: 100vh;
+      flex-direction: column;
+      border-right: 1px solid rgba(255, 255, 255, .08);
+      background: rgba(14, 15, 45, .88);
+      padding: var(--space-6) var(--space-4);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      padding: 0 var(--space-2) var(--space-7);
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 40px;
+      height: 40px;
+      place-items: center;
+      border-radius: 14px;
+      background: var(--blurple);
+      color: var(--snow);
+      font-size: 20px;
+      font-weight: 900;
+      letter-spacing: -.04em;
+    }
+
+    .brand-name {
+      display: block;
+      font-size: 18px;
+      font-weight: 850;
+      letter-spacing: -.01em;
+    }
+
+    .brand-meta {
+      display: block;
+      color: var(--greyple);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .nav-label {
+      margin: 0 var(--space-3) var(--space-2);
+      color: var(--greyple);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .nav-list {
+      display: grid;
+      gap: var(--space-1);
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .nav-link {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      border-radius: 10px;
+      color: var(--fog);
+      padding: 10px var(--space-3);
+      text-decoration: none;
+      transition: background-color 160ms ease, color 160ms ease;
+    }
+
+    .nav-link:hover,
+    .nav-link[aria-current="page"] {
+      background: rgba(88, 101, 242, .18);
+      color: var(--snow);
+    }
+
+    .nav-icon {
+      width: 20px;
+      color: var(--greyple);
+      text-align: center;
+      font-weight: 800;
+    }
+
+    .local-boundary {
+      margin-top: auto;
+      border: 1px solid rgba(88, 101, 242, .35);
+      border-radius: var(--radius-card);
+      background: rgba(88, 101, 242, .1);
+      padding: var(--space-4);
+    }
+
+    .boundary-title {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      margin: 0 0 var(--space-2);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .boundary-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--spring-green);
+    }
+
+    .boundary-copy {
+      margin: 0;
+      color: var(--fog);
+      font-size: 12px;
+    }
+
+    .main { min-width: 0; }
+
+    .topbar {
+      display: flex;
+      min-height: 72px;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+      padding: 0 clamp(20px, 4vw, 52px);
+    }
+
+    .breadcrumb {
+      color: var(--greyple);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .breadcrumb strong { color: var(--snow); }
+
+    .logout-form { margin: 0; }
+
+    .button {
+      display: inline-flex;
+      min-height: 44px;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-2);
+      border: 0;
+      border-radius: var(--radius-button);
+      padding: 0 var(--space-4);
+      cursor: pointer;
+      font-weight: 800;
+      transition: background-color 160ms ease, border-color 160ms ease,
+        transform 160ms ease;
+    }
+
+    .button:hover { transform: translateY(-1px); }
+
+    .button-primary {
+      background: var(--blurple);
+      color: var(--snow);
+    }
+
+    .button-primary:hover { background: var(--blurple-hover); }
+
+    .button-secondary {
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--fog);
+    }
+
+    .button-secondary:hover {
+      border-color: var(--greyple);
+      background: rgba(255, 255, 255, .05);
+      color: var(--snow);
+    }
+
+    .content {
+      width: min(100%, var(--page-width));
+      margin: 0 auto;
+      padding: clamp(28px, 4vw, 52px);
+    }
+
+    .page-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: var(--space-6);
+      margin-bottom: var(--space-7);
+    }
+
+    .eyebrow {
+      margin: 0 0 var(--space-2);
+      color: var(--greyple);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p { margin-top: 0; }
+
+    h1 {
+      max-width: 720px;
+      margin-bottom: var(--space-3);
+      font-size: clamp(32px, 4vw, 46px);
+      font-weight: 900;
+      letter-spacing: -.02em;
+      line-height: 1;
+      text-transform: uppercase;
+    }
+
+    .page-copy {
+      max-width: 650px;
+      margin-bottom: 0;
+      color: var(--fog);
+      font-size: 16px;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-2);
+      border: 1px solid rgba(87, 242, 135, .3);
+      border-radius: 999px;
+      background: rgba(87, 242, 135, .08);
+      color: var(--spring-green);
+      padding: var(--space-2) var(--space-3);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .overview-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-card);
+      background: var(--chrome);
+      margin-bottom: var(--space-6);
+    }
+
+    .metric { padding: var(--space-5) var(--space-6); }
+
+    .metric + .metric { border-left: 1px solid var(--border); }
+
+    .metric-label {
+      display: block;
+      margin-bottom: var(--space-1);
+      color: var(--greyple);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .metric-value {
+      display: block;
+      font-size: 22px;
+      font-weight: 850;
+      letter-spacing: -.02em;
+    }
+
+    .notice {
+      border-left: 3px solid var(--cerulean);
+      border-radius: 0 var(--radius-button) var(--radius-button) 0;
+      background: rgba(0, 176, 244, .08);
+      color: var(--fog);
+      margin-bottom: var(--space-9);
+      padding: var(--space-4) var(--space-5);
+      font-weight: 700;
+    }
+
+    .notice:empty { display: none; }
+
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: var(--space-4);
+      margin-bottom: var(--space-4);
+    }
+
+    .section-title {
+      margin-bottom: var(--space-1);
+      font-size: 22px;
+      font-weight: 850;
+      letter-spacing: -.01em;
+    }
+
+    .section-copy {
+      margin-bottom: 0;
+      color: var(--greyple);
+      font-size: 13px;
+    }
+
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-4);
+      margin-bottom: var(--space-9);
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-card);
+      background: var(--chrome);
+      padding: clamp(20px, 3vw, 28px);
+    }
+
+    .panel-wide { grid-column: 1 / -1; }
+
+    .panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: var(--space-4);
+      margin-bottom: var(--space-5);
+    }
+
+    .panel-kicker {
+      margin-bottom: var(--space-1);
+      color: var(--blurple);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .panel-title {
+      margin-bottom: 0;
+      font-size: 18px;
+      font-weight: 800;
+    }
+
+    .apply-state {
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--greyple);
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+      gap: var(--space-4);
+    }
+
+    .field + .field { margin-top: var(--space-4); }
+
+    label {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: var(--fog);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .required {
+      color: var(--greyple);
+      margin-left: var(--space-1);
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    input:not([type="hidden"]),
+    select,
+    textarea {
+      display: block;
+      width: 100%;
+      border: 1px solid var(--dim-grey);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--snow);
+      padding: var(--space-3);
+      transition: border-color 160ms ease, background-color 160ms ease;
+    }
+
+    input:not([type="hidden"]):hover,
+    select:hover,
+    textarea:hover { border-color: var(--greyple); }
+
+    input:not([type="hidden"]):focus,
+    select:focus,
+    textarea:focus {
+      border-color: var(--blurple);
+      background: var(--surface-raised);
+    }
+
+    textarea {
+      min-height: 220px;
+      resize: vertical;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      tab-size: 2;
+    }
+
+    .persona-textarea {
+      min-height: 148px;
+      font-family: inherit;
+    }
+
+    .helper {
+      display: block;
+      margin-top: var(--space-2);
+      color: var(--greyple);
+      font-size: 12px;
+    }
+
+    .syntax-guide {
+      margin-top: var(--space-3);
+      padding: var(--space-3) var(--space-4);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--fog);
+      background: rgba(255, 255, 255, .02);
+    }
+
+    .syntax-guide summary { cursor: pointer; font-weight: 700; }
+
+    .syntax-guide ul {
+      margin: var(--space-3) 0 0;
+      padding-left: var(--space-5);
+      line-height: 1.8;
+    }
+
+    .syntax-guide code { color: var(--snow); }
+
+    .panel-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .table-panel {
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-card);
+      background: var(--chrome);
+      margin-bottom: var(--space-9);
+    }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      white-space: nowrap;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--border);
+      padding: var(--space-4) var(--space-5);
+      text-align: left;
+    }
+
+    th {
+      background: rgba(255, 255, 255, .025);
+      color: var(--greyple);
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    tbody tr:last-child td { border-bottom: 0; }
+
+    tbody tr:hover { background: rgba(255, 255, 255, .025); }
+
+    td:first-child { color: var(--snow); font-weight: 750; }
+
+    td { color: var(--fog); }
+
+    .channel-form {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }
+
+    .channel-form select { min-width: 180px; }
+
+    .channel-form .button { padding: 9px 12px; }
+
+    .announcement-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr);
+      gap: var(--space-5);
+    }
+
+    .compact-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 132px;
+      gap: var(--space-3);
+    }
+
+    input[type="color"] {
+      height: 44px;
+      padding: 5px;
+      cursor: pointer;
+    }
+
+    input[type="file"] { color: var(--greyple); }
+
+    input[type="file"]::file-selector-button {
+      border: 0;
+      border-radius: 8px;
+      background: var(--surface-raised);
+      color: var(--fog);
+      margin-right: var(--space-3);
+      padding: var(--space-2) var(--space-3);
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .dispatch-note {
+      align-self: stretch;
+      border: 1px solid rgba(88, 101, 242, .32);
+      border-radius: var(--radius-card);
+      background: rgba(88, 101, 242, .1);
+      padding: var(--space-5);
+    }
+
+    .dispatch-note h3 {
+      margin-bottom: var(--space-3);
+      font-size: 16px;
+    }
+
+    .dispatch-list {
+      display: grid;
+      gap: var(--space-3);
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      color: var(--fog);
+      font-size: 13px;
+    }
+
+    .dispatch-list li {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr);
+      gap: var(--space-2);
+    }
+
+    .dispatch-number {
+      display: grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      border-radius: 7px;
+      background: var(--blurple);
+      color: var(--snow);
+      font-size: 11px;
+      font-weight: 850;
+    }
+
+    .page-footer {
+      border-top: 1px solid rgba(255, 255, 255, .08);
+      color: var(--greyple);
+      padding: var(--space-5) 0 0;
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: 1fr; }
+
+      .sidebar {
+        position: static;
+        display: block;
+        width: 100%;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid rgba(255, 255, 255, .08);
+        padding: var(--space-4) var(--space-5);
+      }
+
+      .brand { padding: 0 0 var(--space-4); }
+
+      .nav-label,
+      .local-boundary { display: none; }
+
+      .nav-list {
+        display: flex;
+        overflow-x: auto;
+        padding-bottom: var(--space-1);
+      }
+
+      .nav-link { white-space: nowrap; }
+
+      .topbar {
+        min-height: 64px;
+        justify-content: flex-end;
+      }
+
+      .breadcrumb { display: none; }
+    }
+
+    @media (max-width: 720px) {
+      .content { padding: var(--space-6) var(--space-4); }
+
+      .page-head {
+        display: block;
+        margin-bottom: var(--space-6);
+      }
+
+      .status-chip { margin-top: var(--space-4); }
+
+      .overview-strip,
+      .settings-grid,
+      .field-grid,
+      .announcement-layout,
+      .compact-grid { grid-template-columns: 1fr; }
+
+      .metric + .metric {
+        border-top: 1px solid var(--border);
+        border-left: 0;
+      }
+
+      .panel-wide { grid-column: auto; }
+
+      .panel-head,
+      .section-head { display: block; }
+
+      .apply-state {
+        display: inline-block;
+        margin-top: var(--space-3);
+      }
+
+      .panel-actions {
+        align-items: stretch;
+        flex-direction: column-reverse;
+      }
+
+      .button { width: 100%; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        transition-duration: .01ms !important;
+      }
+    }
+  </style>
 </head>
 <body>
-  <h1>봇 관리</h1>
-  <p class="notice">{{notice}}</p>
-  <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{csrf}}"><button type="submit">로그아웃</button></form>
+  <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="관리 메뉴">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">H</span>
+        <span>
+          <span class="brand-name">Hyacine</span>
+          <span class="brand-meta">Bot admin</span>
+        </span>
+      </div>
 
-  <h2>Persona</h2>
-  <form method="post" action="/settings/persona.json"><input type="hidden" name="csrf" value="{{csrf}}"><label>System prompt<textarea name="system_prompt" maxlength="16000" required>{{persona_prompt}}</textarea></label><label>인삿말<input name="greeting" maxlength="1974" required value="{{persona_greeting}}"></label><button type="submit">저장 — 새 AI 세션부터 적용</button></form>
+      <p class="nav-label">Control center</p>
+      <nav aria-label="관리 화면 바로가기">
+        <ul class="nav-list">
+          <li><a class="nav-link" aria-current="page" href="#overview"><span class="nav-icon" aria-hidden="true">⌁</span>개요</a></li>
+          <li><a class="nav-link" href="#persona"><span class="nav-icon" aria-hidden="true">✦</span>페르소나</a></li>
+          <li><a class="nav-link" href="#content-settings"><span class="nav-icon" aria-hidden="true">#</span>콘텐츠 설정</a></li>
+          <li><a class="nav-link" href="#guilds"><span class="nav-icon" aria-hidden="true">◎</span>길드 현황</a></li>
+          <li><a class="nav-link" href="#announcement"><span class="nav-icon" aria-hidden="true">↗</span>공지 보내기</a></li>
+        </ul>
+      </nav>
 
-  <h2>Forbidden words</h2>
-  <form method="post" action="/settings/forbidden_words.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{forbidden_words}}</textarea><button type="submit">저장 — 즉시 다시 불러오기</button></form>
+      <div class="local-boundary">
+        <p class="boundary-title"><span class="boundary-dot" aria-hidden="true"></span>Localhost protected</p>
+        <p class="boundary-copy">이 관리 화면은 127.0.0.1:8080에서만 접근할 수 있습니다.</p>
+      </div>
+    </aside>
 
-  <h2>Games</h2>
-  <form method="post" action="/settings/games.json"><input type="hidden" name="csrf" value="{{csrf}}"><textarea name="document" required>{{games}}</textarea><button type="submit">저장 — 봇 재시작 필요</button></form>
+    <main class="main" id="main-content">
+      <header class="topbar">
+        <div class="breadcrumb">Hyacine / <strong>관리자 콘솔</strong></div>
+        <form class="logout-form" method="post" action="/logout">
+          <input type="hidden" name="csrf" value="{{csrf}}">
+          <button class="button button-secondary" type="submit">로그아웃</button>
+        </form>
+      </header>
 
-  <h2>길드별 설정</h2>
-  <table>
-    <thead><tr><th>길드</th><th>파티 채널</th><th>공지 채널</th><th>공지 허용</th></tr></thead>
-    <tbody>{{guild_rows}}</tbody>
-  </table>
+      <div class="content">
+        <section class="page-head" id="overview" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow">Local administration</p>
+            <h1 id="page-title">Bot Control Center</h1>
+            <p class="page-copy">페르소나와 콘텐츠 설정을 관리하고, 참여 중인 Discord 길드의 운영 상태를 확인하세요.</p>
+          </div>
+          <span class="status-chip"><span class="boundary-dot" aria-hidden="true"></span>ADMIN ONLINE</span>
+        </section>
 
-  <h2>옵트인 공지</h2>
-  <form method="post" action="/announce" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{csrf}}"><label>대상<select name="guild_id">{{guild_options}}</select></label><label>제목<input name="title" required maxlength="256"></label><label>본문<textarea name="body" required maxlength="4096"></textarea></label><label>이미지 (선택, 1개·최대 8 MiB)<input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp"></label><label>색상<input type="color" name="color" value="#5865f2"></label><button type="submit">공지 보내기</button></form>
+        <section class="overview-strip" aria-label="관리 서버 운영 요약">
+          <div class="metric">
+            <span class="metric-label">접속 상태</span>
+            <strong class="metric-value">정상</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">관리 범위</span>
+            <strong class="metric-value">Local</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">설정 파일</span>
+            <strong class="metric-value">3</strong>
+          </div>
+        </section>
+
+        <div class="notice" role="status" aria-live="polite">{{notice}}</div>
+
+        <section aria-labelledby="settings-title">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title" id="settings-title">봇 설정</h2>
+              <p class="section-copy">운영 중 자주 확인하는 설정을 한곳에서 관리합니다.</p>
+            </div>
+          </div>
+
+          <div class="settings-grid">
+            <form class="panel panel-wide" id="persona" method="post" action="/settings/persona.json">
+              <input type="hidden" name="csrf" value="{{csrf}}">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">AI identity</p>
+                  <h3 class="panel-title">페르소나</h3>
+                </div>
+                <span class="apply-state">새 AI 세션부터 적용</span>
+              </div>
+              <div class="field-grid">
+                <div class="field">
+                  <label for="system-prompt">System prompt <span class="required">필수</span></label>
+                  <textarea class="persona-textarea" id="system-prompt" name="system_prompt" maxlength="16000" required>{{persona_prompt}}</textarea>
+                  <span class="helper">최대 16,000자</span>
+                </div>
+                <div class="field">
+                  <label for="greeting">인삿말 <span class="required">필수</span></label>
+                  <input id="greeting" name="greeting" maxlength="1974" required value="{{persona_greeting}}">
+                  <span class="helper">새 대화가 시작될 때 사용됩니다.</span>
+                </div>
+              </div>
+              <div class="panel-actions">
+                <button class="button button-primary" type="submit">페르소나 저장</button>
+              </div>
+            </form>
+
+            <form class="panel" id="content-settings" method="post" action="/settings/forbidden_words.json">
+              <input type="hidden" name="csrf" value="{{csrf}}">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Moderation</p>
+                  <h3 class="panel-title">금지어</h3>
+                </div>
+                <span class="apply-state">즉시 적용</span>
+              </div>
+              <div class="field">
+                <label for="forbidden-words">forbidden_words.json <span class="required">필수</span></label>
+                <textarea id="forbidden-words" name="document" required spellcheck="false">{{forbidden_words}}</textarea>
+              </div>
+              <div class="panel-actions">
+                <button class="button button-primary" type="submit">저장 및 다시 불러오기</button>
+              </div>
+            </form>
+
+            <form class="panel" method="post" action="/settings/games.json">
+              <input type="hidden" name="csrf" value="{{csrf}}">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Party finder</p>
+                  <h3 class="panel-title">게임 목록</h3>
+                </div>
+                <span class="apply-state">재시작 후 적용</span>
+              </div>
+              <div class="field">
+                <label for="games">games.json <span class="required">필수</span></label>
+                <textarea id="games" name="document" required spellcheck="false">{{games}}</textarea>
+              </div>
+              <div class="panel-actions">
+                <button class="button button-primary" type="submit">게임 목록 저장</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section id="guilds" aria-labelledby="guild-title">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title" id="guild-title">길드별 설정</h2>
+              <p class="section-copy">Discord에서 설정된 채널과 호스트 공지 허용 상태를 확인하고 `/이벤트` 전용 채널을 지정합니다.</p>
+            </div>
+          </div>
+          <div class="table-panel">
+            <div class="table-wrap">
+              <table aria-label="길드별 파티·이벤트·공지 설정">
+                <thead>
+                  <tr>
+                    <th scope="col">길드</th>
+                    <th scope="col">파티 채널</th>
+                    <th scope="col">공지 채널</th>
+                    <th scope="col">이벤트 채널</th>
+                    <th scope="col">공지 허용</th>
+                  </tr>
+                </thead>
+                <tbody>{{guild_rows}}</tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section id="announcement" aria-labelledby="announce-title">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title" id="announce-title">옵트인 공지</h2>
+              <p class="section-copy">공지를 허용한 길드의 지정 채널로 Embed 메시지를 보냅니다.</p>
+            </div>
+          </div>
+
+          <form class="panel" method="post" action="/announce" enctype="multipart/form-data">
+            <input type="hidden" name="csrf" value="{{csrf}}">
+            <div class="announcement-layout">
+              <div>
+                <div class="compact-grid">
+                  <div class="field">
+                    <label for="guild-select">대상 길드</label>
+                    <select id="guild-select" name="guild_id">{{guild_options}}</select>
+                  </div>
+                  <div class="field">
+                    <label for="announce-color">Embed 색상</label>
+                    <input id="announce-color" name="color" type="color" value="#5865f2">
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="announce-title-input">제목 <span class="required">필수</span></label>
+                  <input id="announce-title-input" name="title" required maxlength="256">
+                </div>
+                <div class="field">
+                  <label for="announce-body">본문 <span class="required">필수</span></label>
+                  <textarea class="persona-textarea" id="announce-body" name="body" required maxlength="4096"></textarea>
+                  <details class="syntax-guide">
+                    <summary>Discord 문법 가이드</summary>
+                    <ul>
+                      <li><code>**굵게**</code> · <code>*기울임*</code> · <code>__밑줄__</code> · <code>~~취소선~~</code></li>
+                      <li><code>`인라인 코드`</code> · <code>&gt; 인용</code> · <code>- 목록</code></li>
+                      <li><code>[링크 텍스트](URL)</code> · <code>&lt;@사용자_ID&gt;</code> 멘션</li>
+                    </ul>
+                    <span class="helper">입력한 줄바꿈과 Discord Markdown이 Embed 본문에 그대로 적용됩니다.</span>
+                  </details>
+                </div>
+                <div class="field">
+                  <label for="announce-image">이미지</label>
+                  <input id="announce-image" name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+                  <span class="helper">선택 사항 · PNG, JPEG, GIF, WebP · 최대 8 MiB</span>
+                </div>
+                <div class="panel-actions">
+                  <button class="button button-primary" type="submit">공지 보내기</button>
+                </div>
+              </div>
+
+              <aside class="dispatch-note" aria-label="공지 전송 안내">
+                <h3>전송 전 확인</h3>
+                <ol class="dispatch-list">
+                  <li><span class="dispatch-number">1</span><span>길드가 호스트 공지를 허용했는지 다시 확인합니다.</span></li>
+                  <li><span class="dispatch-number">2</span><span>설정된 공지 채널과 봇 권한을 검사합니다.</span></li>
+                  <li><span class="dispatch-number">3</span><span>성공·건너뜀·실패 결과를 이 화면에 표시합니다.</span></li>
+                </ol>
+              </aside>
+            </div>
+          </form>
+        </section>
+
+        <footer class="page-footer">Hyacine local administration · 127.0.0.1:8080</footer>
+      </div>
+    </main>
+  </div>
 </body>
 </html>

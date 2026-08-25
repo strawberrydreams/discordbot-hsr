@@ -25,7 +25,7 @@ from discord.ext import commands
 import module.config as config
 import module.guildsettings_cog as guildsettings_cog
 import module.main as bot_main
-from module.usage_cog import UsageCog, KST
+from module.usage_cog import KST_TIMEZONE, UsageCog
 from module.database import (
     SQLiteUsageRepository,
     SQLiteGuildSettingsRepository,
@@ -88,19 +88,31 @@ class MinimalConfigTest(unittest.TestCase):
 
 class ConditionalExtensionTest(unittest.TestCase):
     def test_all_extensions_load_when_every_key_present(self):
-        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": "a", "GOOGLE_API_KEY": "b"}):
+        with patch.object(
+            bot_main,
+            "OPTIONAL_DEPENDENCY_VALUES",
+            {"OPENAI_API_KEY": "a", "GOOGLE_API_KEY": "b"},
+        ):
             names = bot_main.available_extensions()
         self.assertIn("module.hyacine_chat_cog", names)
         self.assertIn("module.hyacine_image_cog", names)
 
     def test_ai_extensions_skipped_without_keys(self):
-        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}):
+        with patch.object(
+            bot_main,
+            "OPTIONAL_DEPENDENCY_VALUES",
+            {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None},
+        ):
             names = bot_main.available_extensions()
         self.assertNotIn("module.hyacine_chat_cog", names)
         self.assertNotIn("module.hyacine_image_cog", names)
 
     def test_core_extensions_survive_with_no_optional_keys(self):
-        with patch.object(bot_main, "ENV_VALUES", {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}):
+        with patch.object(
+            bot_main,
+            "OPTIONAL_DEPENDENCY_VALUES",
+            {"OPENAI_API_KEY": None, "GOOGLE_API_KEY": None},
+        ):
             names = bot_main.available_extensions()
         for required in (
             "module.guildsettings_cog",
@@ -183,6 +195,14 @@ class FakeGuild:
         return FakeUser()
 
 
+class _EventSettingsRepository:
+    def __init__(self, event_channel_id=None):
+        self.event_channel_id = event_channel_id
+
+    def get_event_channel(self, guild_id):
+        return self.event_channel_id
+
+
 _UNSET = object()  # guild_id=None(=DM)과 "기본값 사용"을 구분한다
 
 
@@ -206,16 +226,16 @@ class RecordingUsage:
         self.reserve_result = reserve_result
         self.usage = usage or {}
 
-    async def reserve_ai_usage(self, user_id, command, limit):
-        self.reservations.append((user_id, command, limit))
+    async def reserve_ai_usage(self, user_id, usage_category, daily_limit):
+        self.reservations.append((user_id, usage_category, daily_limit))
         return self.reserve_result
 
-    async def release_ai_usage(self, user_id, usage_date, command):
-        self.releases.append((user_id, usage_date, command))
+    async def release_ai_usage(self, user_id, usage_date, usage_category):
+        self.releases.append((user_id, usage_date, usage_category))
         return True
 
-    async def get_ai_usage(self, user_id, command):
-        return self.usage.get(command, 0)
+    async def get_ai_usage(self, user_id, usage_category):
+        return self.usage.get(usage_category, 0)
 
 
 class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -225,9 +245,9 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.google_key.stop)
 
     async def test_daily_limit_stops_before_the_provider_call(self):
-        attendance = RecordingUsage(reserve_result=None)
+        usage_cog = RecordingUsage(reserve_result=None)
         interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
         provider_calls = []
         cog.client = SimpleNamespace(
             models=SimpleNamespace(
@@ -235,19 +255,19 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        await HyacineImageCog._image.callback(cog, interaction, "test")
+        await HyacineImageCog._generate_image.callback(cog, interaction, "test")
 
         self.assertEqual(
-            attendance.reservations,
+            usage_cog.reservations,
             [(123, "image", config.LIMIT_IMAGE)],
         )
         self.assertEqual(provider_calls, [])
         self.assertIn("오늘 사용 횟수", interaction.response.messages[-1][0][0])
 
     async def test_defer_failure_releases_the_reserved_slot(self):
-        attendance = RecordingUsage()
+        usage_cog = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
 
         async def fail_defer():
             raise RuntimeError("defer transport failed")
@@ -256,19 +276,19 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch("module.hyacine_image_cog.print"), patch(
             "module.hyacine_image_cog.traceback.print_exc"
         ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
+            await HyacineImageCog._generate_image.callback(cog, interaction, "test")
 
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "image")])
+        self.assertEqual(usage_cog.releases, [(123, "2026-08-04", "image")])
 
     async def test_long_prompt_is_truncated_in_embed(self):
-        attendance = RecordingUsage()
+        usage_cog = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        cog.temporary_image_directory = temporary_directory.name
         cog.bot = SimpleNamespace(
-            get_cog=lambda _: attendance,
+            get_cog=lambda _: usage_cog,
             loop=SimpleNamespace(create_task=lambda coro: coro.close()),
         )
         part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
@@ -281,7 +301,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
         prompt = "가" * 5_000
 
-        await HyacineImageCog._image.callback(cog, interaction, prompt)
+        await HyacineImageCog._generate_image.callback(cog, interaction, prompt)
 
         description = interaction.followup.messages[0][1]["embed"].description
         self.assertLessEqual(len(description), 1_100)
@@ -290,13 +310,13 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["contents"], [prompt])
 
     async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
-        attendance = RecordingUsage()
+        usage_cog = RecordingUsage()
         interaction = FakeInteraction(channel_id=1)
         interaction.followup = RecordingFollowup(fail_on_call=1)
-        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: attendance))
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        cog.temp_dir = temp_dir.name
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        cog.temporary_image_directory = temporary_directory.name
         part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
         cog.client = SimpleNamespace(
             models=SimpleNamespace(
@@ -307,19 +327,21 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch("module.hyacine_image_cog.print"), patch(
             "module.hyacine_image_cog.traceback.print_exc"
         ):
-            await HyacineImageCog._image.callback(cog, interaction, "test")
+            await HyacineImageCog._generate_image.callback(cog, interaction, "test")
 
-        self.assertEqual(list(pathlib.Path(temp_dir.name).iterdir()), [])
+        self.assertEqual(
+            list(pathlib.Path(temporary_directory.name).iterdir()), []
+        )
 
 
 class DisappearingUsageBot:
-    def __init__(self, attendance):
-        self.attendance = attendance
+    def __init__(self, usage_cog):
+        self.usage_cog = usage_cog
         self.calls = 0
 
     def get_cog(self, name):
         self.calls += 1
-        return self.attendance if self.calls == 1 else None
+        return self.usage_cog if self.calls == 1 else None
 
 
 class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -327,9 +349,9 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.openai_key = patch("module.hyacine_chat_cog.OPENAI_API_KEY", "sk-test-dummy")
         self.openai_key.start()
         self.addCleanup(self.openai_key.stop)
-        self.attendance = RecordingUsage()
+        self.usage_cog = RecordingUsage()
         self.cog = HyacineChatCog(
-            bot=SimpleNamespace(get_cog=lambda _: self.attendance)
+            bot=SimpleNamespace(get_cog=lambda _: self.usage_cog)
         )
 
     def test_chat_command_set_replaces_switching_commands(self):
@@ -341,15 +363,15 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_basic_and_advanced_commands_route_exact_model_settings(self):
         calls = []
 
-        async def record_run_talk(*args):
+        async def record_run_chat(*args):
             calls.append(args)
 
-        self.cog._run_talk = record_run_talk
+        self.cog._run_chat = record_run_chat
         basic = FakeInteraction(channel_id=1)
         advanced = FakeInteraction(channel_id=1)
 
-        await HyacineChatCog._light_talk.callback(self.cog, basic, "기본 대화")
-        await HyacineChatCog._deep_talk.callback(self.cog, advanced, "고급 대화")
+        await HyacineChatCog._light_chat.callback(self.cog, basic, "기본 대화")
+        await HyacineChatCog._deep_chat.callback(self.cog, advanced, "고급 대화")
 
         self.assertEqual(
             calls,
@@ -369,15 +391,15 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
                     "image": 1,
                 }
 
-            def get_ai_usage(self, user_id, usage_date, command):
-                self.calls.append((user_id, usage_date, command))
-                return self.counts[command]
+            def get_ai_usage(self, user_id, usage_date, usage_category):
+                self.calls.append((user_id, usage_date, usage_category))
+                return self.counts[usage_category]
 
         repository = RecordingUsageRepository()
-        attendance = UsageCog(bot=None, repository=repository)
-        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
+        usage_cog = UsageCog(bot=None, usage_repository=repository)
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: usage_cog)
         interaction = FakeInteraction(channel_id=1)
-        self.cog.get_session(1).last_usage = {
+        self.cog.get_or_create_session(1).last_usage = {
             "model": "gpt-5.6-sol",
             "input_tokens": 12,
             "output_tokens": 34,
@@ -385,7 +407,9 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch("module.usage_cog.datetime") as mocked_datetime:
-            mocked_datetime.now.return_value = datetime(2026, 8, 5, 0, 1, tzinfo=KST)
+            mocked_datetime.now.return_value = datetime(
+                2026, 8, 5, 0, 1, tzinfo=KST_TIMEZONE
+            )
             await HyacineChatCog._status.callback(self.cog, interaction)
 
         message = interaction.response.messages[-1][0][0]
@@ -411,12 +435,14 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
                 (123, "2026-08-05", "image"),
             ],
         )
-        self.assertEqual(mocked_datetime.now.call_args_list, [call(KST)] * 3)
+        self.assertEqual(
+            mocked_datetime.now.call_args_list, [call(KST_TIMEZONE)] * 3
+        )
 
-    async def test_status_preserves_models_when_attendance_is_unavailable(self):
+    async def test_status_preserves_models_when_usage_cog_is_unavailable(self):
         self.cog.bot = None
         interaction = FakeInteraction(channel_id=1)
-        self.cog.get_session(1).last_usage = {
+        self.cog.get_or_create_session(1).last_usage = {
             "model": "gpt-5.6-sol",
             "total_tokens": 46,
         }
@@ -430,8 +456,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("확인할 수 없어요", message)
 
     async def test_daily_limit_stops_before_the_provider_call(self):
-        attendance = RecordingUsage(reserve_result=None)
-        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
+        usage_cog = RecordingUsage(reserve_result=None)
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: usage_cog)
         interaction = FakeInteraction(channel_id=1)
         provider_calls = []
 
@@ -442,7 +468,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
             responses=SimpleNamespace(create=provider)
         )
 
-        await self.cog._run_talk(
+        await self.cog._run_chat(
             interaction, "test", None, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
@@ -452,8 +478,8 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pre_api_failure_releases_the_reserved_slot(self):
         """API 호출 전에 실패하면 일일 한도를 돌려준다."""
-        attendance = RecordingUsage()
-        self.cog.bot = SimpleNamespace(get_cog=lambda _: attendance)
+        usage_cog = RecordingUsage()
+        self.cog.bot = SimpleNamespace(get_cog=lambda _: usage_cog)
         interaction = FakeInteraction(channel_id=1)
 
         async def fail_defer():
@@ -463,12 +489,12 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch("module.hyacine_chat_cog.print"), patch(
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
-            await self.cog._run_talk(
+            await self.cog._run_chat(
                 interaction, "test", None, "gpt-5.6-terra", "none",
                 "light", config.LIMIT_LIGHT,
             )
 
-        self.assertEqual(attendance.releases, [(123, "2026-08-04", "light")])
+        self.assertEqual(usage_cog.releases, [(123, "2026-08-04", "light")])
 
     async def test_exhausted_openai_credit_has_actionable_message_without_traceback(self):
         interaction = FakeInteraction(channel_id=1)
@@ -495,14 +521,15 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch("module.hyacine_chat_cog.traceback.print_exc") as print_exc, patch(
             "module.hyacine_chat_cog.logger.warning"
         ) as warning:
-            await self.cog._run_talk(
+            await self.cog._run_chat(
                 interaction, "test", None, "gpt-5.6-terra", "none",
                 "light", config.LIMIT_LIGHT,
             )
 
         message = interaction.followup.messages[-1][0][0]
         self.assertIn("OpenAI API 크레딧", message)
-        self.assertIn("/이미지", message)
+        self.assertNotIn("/이미지", message)
+        self.assertNotIn("Gemini API", message)
         print_exc.assert_not_called()
         warning.assert_called_once()
 
@@ -526,14 +553,14 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.cog.client = SimpleNamespace(
             responses=SimpleNamespace(create=response)
         )
-        await self.cog._run_talk(
+        await self.cog._run_chat(
             interaction, "", attachment, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
 
         self.assertIn(attachment.url, repr(captured["input"]))
         self.assertNotIn(
-            attachment.url, repr(list(self.cog.get_session(1).history))
+            attachment.url, repr(list(self.cog.get_or_create_session(1).history))
         )
 
     def test_splitter_never_exceeds_discord_limit_around_code_fences(self):
@@ -563,7 +590,7 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         self.cog.client = SimpleNamespace(
             responses=SimpleNamespace(create=response)
         )
-        await self.cog._run_talk(
+        await self.cog._run_chat(
             interaction, "가" * 2_500, None, "gpt-5.6-terra", "none",
             "light", config.LIMIT_LIGHT,
         )
@@ -591,12 +618,12 @@ class ChatCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch("module.hyacine_chat_cog.print"), patch(
             "module.hyacine_chat_cog.traceback.print_exc"
         ):
-            await self.cog._run_talk(
+            await self.cog._run_chat(
                 interaction, "user text", None, "gpt-5.6-terra", "none",
                 "light", config.LIMIT_LIGHT,
             )
 
-        session = self.cog.get_session(1)
+        session = self.cog.get_or_create_session(1)
         self.assertEqual(
             [item["role"] for item in session.history], ["system"]
         )
@@ -608,8 +635,8 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.openai_key.stop)
 
     async def test_same_channel_calls_do_not_interleave_history(self):
-        attendance = RecordingUsage()
-        cog = HyacineChatCog(bot=SimpleNamespace(get_cog=lambda _: attendance))
+        usage_cog = RecordingUsage()
+        cog = HyacineChatCog(bot=SimpleNamespace(get_cog=lambda _: usage_cog))
         # 첫 호출의 응답이 두 번째보다 늦게 끝나도록 지연시킨다.
         delays = {"first": 0.05, "second": 0.0}
 
@@ -625,21 +652,21 @@ class ChatConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(responses=SimpleNamespace(create=delayed))
 
         await asyncio.gather(
-            cog._run_talk(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
-            cog._run_talk(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+            cog._run_chat(FakeInteraction(channel_id=1), "first", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
+            cog._run_chat(FakeInteraction(channel_id=1), "second", None, "gpt-5.6-terra", "none", "light", config.LIMIT_LIGHT),
         )
 
-        roles = [m["role"] for m in cog.get_session(1).history if m["role"] != "system"]
+        roles = [m["role"] for m in cog.get_or_create_session(1).history if m["role"] != "system"]
         self.assertEqual(roles, ["user", "assistant", "user", "assistant"])
 
     async def test_active_session_survives_eviction(self):
         cog = HyacineChatCog(bot=None)
         cog.MAX_CHANNEL_SESSIONS = 2
-        active = cog.get_session(1)
+        active = cog.get_or_create_session(1)
         async with active.lock:
             for channel_id in range(2, 12):
-                cog.get_session(channel_id)
-            self.assertIs(cog.get_session(1), active)
+                cog.get_or_create_session(channel_id)
+            self.assertIs(cog.get_or_create_session(1), active)
 
 
 class AICooldownTests(unittest.IsolatedAsyncioTestCase):
@@ -655,9 +682,9 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         chat = HyacineChatCog(bot=None)
         image = HyacineImageCog(bot=None)
         commands = {
-            "기본대화": HyacineChatCog._light_talk,
-            "고급대화": HyacineChatCog._deep_talk,
-            "이미지": HyacineImageCog._image,
+            "기본대화": HyacineChatCog._light_chat,
+            "고급대화": HyacineChatCog._deep_chat,
+            "이미지": HyacineImageCog._generate_image,
         }
         for name, command in commands.items():
             with self.subTest(command=name):
@@ -679,17 +706,17 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
         descriptions = " ".join(
             command.description
             for command in (
-                HyacineChatCog._light_talk,
-                HyacineChatCog._deep_talk,
-                HyacineImageCog._image,
+                HyacineChatCog._light_chat,
+                HyacineChatCog._deep_chat,
+                HyacineImageCog._generate_image,
             )
         )
         for model_label in ("GPT-5.6", "Terra", "Sol", "Nano Banana"):
             self.assertNotIn(model_label, descriptions)
 
     async def test_cooldown_notice_is_ephemeral_and_charges_nothing(self):
-        attendance = RecordingUsage()
-        cog = HyacineChatCog(bot=DisappearingUsageBot(attendance))
+        usage_cog = RecordingUsage()
+        cog = HyacineChatCog(bot=DisappearingUsageBot(usage_cog))
         interaction = FakeInteraction(channel_id=1)
         error = discord.app_commands.CommandOnCooldown(
             discord.app_commands.Cooldown(1, 15), 7.4
@@ -703,16 +730,18 @@ class AICooldownTests(unittest.IsolatedAsyncioTestCase):
 
 class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        root = pathlib.Path(self.temp_dir.name)
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = pathlib.Path(self.temporary_directory.name)
         self.usage = UsageCog(
             bot=None,
-            repository=SQLiteUsageRepository(root / "usage.db"),
+            usage_repository=SQLiteUsageRepository(root / "usage.db"),
         )
         self.party_repository = SQLitePartyRepository(root / "party.db")
         with patch("discord.ext.tasks.Loop.start"):
-            self.play = PlayWithCog(bot=None, repository=self.party_repository)
+            self.play = PlayWithCog(
+                bot=None, party_repository=self.party_repository
+            )
 
     async def test_profile_success_is_ephemeral(self):
         interaction = FakeInteraction(channel_id=1)
@@ -723,13 +752,29 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         for command in ("모집", "파티", "나가기", "변경"):
             self.assertNotIn(command, PlayWithCog.__dict__)
 
-    async def test_event_commands_reach_their_backend_from_any_channel(self):
-        self.assertNotIn("settings", EventNoticeCog.__init__.__code__.co_varnames)
-
+    async def test_event_commands_reach_their_backend_from_any_unrestricted_channel(self):
         guild = FakeGuild()
         interaction = FakeInteraction(channel_id=-1, guild=guild)
-        await EventNoticeCog.show_specific_event.callback(EventNoticeCog(bot=None), interaction, 1)
+        cog = EventNoticeCog(bot=None, settings_repository=_EventSettingsRepository())
+        await EventNoticeCog._show_events.callback(cog, interaction, 1)
 
+        self.assertEqual(guild.fetch_scheduled_events_calls, 1)
+
+    async def test_event_commands_only_run_in_the_configured_channel(self):
+        guild = FakeGuild()
+        cog = EventNoticeCog(
+            bot=None,
+            settings_repository=_EventSettingsRepository(event_channel_id=77),
+        )
+        blocked = FakeInteraction(channel_id=66, guild=guild)
+        await EventNoticeCog._show_events.callback(cog, blocked, None)
+
+        self.assertEqual(guild.fetch_scheduled_events_calls, 0)
+        self.assertIn("<#77>", blocked.response.messages[0][0][0])
+        self.assertTrue(blocked.response.messages[0][1]["ephemeral"])
+
+        allowed = FakeInteraction(channel_id=77, guild=guild)
+        await EventNoticeCog._show_events.callback(cog, allowed, None)
         self.assertEqual(guild.fetch_scheduled_events_calls, 1)
 
     async def test_event_list_and_detail_use_start_time_then_id_order(self):
@@ -742,12 +787,15 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
                 fake_event(1, "같은 시각 앞", earlier),
             ]
         )
-        cog = EventNoticeCog(bot=None)
+        cog = EventNoticeCog(
+            bot=None,
+            settings_repository=_EventSettingsRepository(),
+        )
 
         listing = FakeInteraction(channel_id=1, guild=guild)
         detail = FakeInteraction(channel_id=1, guild=guild)
-        await EventNoticeCog.show_specific_event.callback(cog, listing, None)
-        await EventNoticeCog.show_specific_event.callback(cog, detail, 1)
+        await EventNoticeCog._show_events.callback(cog, listing, None)
+        await EventNoticeCog._show_events.callback(cog, detail, 1)
 
         list_text = listing.followup.messages[0][1]["embed"].description
         self.assertLess(list_text.index("같은 시각 앞"), list_text.index("같은 시각 뒤"))
@@ -852,10 +900,10 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             guild = _PartyGuild()
             cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild)
 
-        self.assertEqual(set(cog.views), set(playwith_cog.GAMES))
+        self.assertEqual(set(cog.party_views), set(playwith_cog.GAMES))
         self.assertEqual(len(bot.registered), len(playwith_cog.GAMES) + 1)
         self.assertEqual(len(cog.selector_view.children), len(playwith_cog.GAMES))
-        for game, view in cog.views.items():
+        for game, view in cog.party_views.items():
             self.assertTrue(view.is_persistent())
             self.assertLessEqual(len(view.children), 25)
             expected = hashlib.sha256(game.encode("utf-8")).hexdigest()[:16]
@@ -914,7 +962,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await selector.callback(FakeInteraction(50, guild, message_id=selector_id))
             panel_id = settings.get_party_panels(guild.id)["PUBG"]
             leave = next(
-                child for child in cog.views["PUBG"].children if child.action == "leave"
+                child for child in cog.party_views["PUBG"].children if child.action == "leave"
             )
 
             interaction = FakeInteraction(50, guild, message_id=panel_id)
@@ -959,7 +1007,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await cog.ensure_panels(guild)
             panel_count = len(settings.get_party_panels(guild.id))
 
-        self.assertEqual(len(cog.views), 25)
+        self.assertEqual(len(cog.party_views), 25)
         self.assertEqual(len(cog.selector_view.children), 25)
         self.assertEqual(len(bot.registered), 26)
         self.assertEqual(panel_count, 1)
@@ -973,8 +1021,8 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             guild = _PartyGuild()
             cog, _, _, bot = self._make_cog(pathlib.Path(directory), guild, games)
         self.assertEqual(len(bot.registered), 2)
-        self.assertEqual(cog.views["Too Many"].children, [])
-        self.assertTrue(cog.views["Okay"].children)
+        self.assertEqual(cog.party_views["Too Many"].children, [])
+        self.assertTrue(cog.party_views["Okay"].children)
 
     async def test_role_and_no_role_panels_cover_join_change_and_leave(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -986,9 +1034,9 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             game = "League of Legends"
             _, panel_id = await self._select(cog, settings, guild, game)
             self.assertEqual(party.get_participants(guild.id, game), {FakeUser.id: None})
-            top = next(child for child in cog.views[game].children if child.role == "탑")
-            jungle = next(child for child in cog.views[game].children if child.role == "정글")
-            leave = next(child for child in cog.views[game].children if child.action == "leave")
+            top = next(child for child in cog.party_views[game].children if child.role == "탑")
+            jungle = next(child for child in cog.party_views[game].children if child.role == "정글")
+            leave = next(child for child in cog.party_views[game].children if child.action == "leave")
             await top.callback(FakeInteraction(50, guild, message_id=panel_id))
             await jungle.callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=second_user)
@@ -1002,7 +1050,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
 
             game = "PUBG"
             _, panel_id = await self._select(cog, settings, guild, game)
-            join, leave = cog.views[game].children
+            join, leave = cog.party_views[game].children
             await join.callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=second_user)
             )
@@ -1027,7 +1075,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
                 party.add_participant(guild.id, game, uid, role, 5)
 
             full = FakeInteraction(50, guild, message_id=panel_id, user=users[6])
-            await cog.views[game].children[0].callback(full)
+            await cog.party_views[game].children[0].callback(full)
             self.assertIn("가득", full.followup.messages[0][0][0])
             self.assertIsNone(party.get_user_party(guild.id, 6))
 
@@ -1036,8 +1084,8 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             first = FakeInteraction(50, guild, message_id=panel_id, user=racer)
             second = FakeInteraction(50, guild, message_id=panel_id, user=racer)
             await asyncio.gather(
-                cog.views[game].children[3].callback(first),
-                cog.views[game].children[4].callback(second),
+                cog.party_views[game].children[3].callback(first),
+                cog.party_views[game].children[4].callback(second),
             )
             self.assertEqual(party.get_participants(guild.id, game)[7], "서포터")
             self.assertTrue(first.followup.messages and second.followup.messages)
@@ -1051,7 +1099,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await cog.ensure_panels(guild)
             game = "League of Legends"
             _, panel_id = await self._select(cog, settings, guild, game, user=host)
-            buttons = cog.views[game].children
+            buttons = cog.party_views[game].children
 
             await buttons[0].callback(
                 FakeInteraction(50, guild, message_id=panel_id, user=host)
@@ -1131,7 +1179,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             interaction.response.defer = recording_defer
             lock = panel_lock(guild.id, f"party:{game}")
             await lock.acquire()
-            task = asyncio.create_task(cog.views[game].children[-1].callback(interaction))
+            task = asyncio.create_task(cog.party_views[game].children[-1].callback(interaction))
             await deferred.wait()
             settings.set_party_panel(guild.id, game, panel_id + 1)
             lock.release()
@@ -1148,7 +1196,7 @@ class PartyPanelTests(unittest.IsolatedAsyncioTestCase):
             await cog.ensure_panels(guild)
             game = "PUBG"
             _, panel_id = await self._select(cog, settings, guild, game)
-            button = cog.views[game].children[-1]
+            button = cog.party_views[game].children[-1]
 
             dm = FakeInteraction(50, guild=None, guild_id=None, message_id=panel_id)
             await button.callback(dm)
@@ -1349,7 +1397,12 @@ class RecordingFilterSettings:
         return self.enabled
 
 
-def make_forbidden_cog(counter, words=("나쁜말",), document=None, settings=None):
+def make_forbidden_cog(
+    counter,
+    words=("나쁜말",),
+    document=None,
+    settings_repository=None,
+):
     with tempfile.TemporaryDirectory() as directory:
         pathlib.Path(directory, "forbidden_words.json").write_text(
             json.dumps(list(words) if document is None else document),
@@ -1360,7 +1413,7 @@ def make_forbidden_cog(counter, words=("나쁜말",), document=None, settings=No
         ):
             cog = forbiddenfilter_cog.ForbiddenFilterCog(
                 SimpleNamespace(get_cog=lambda name: counter),
-                settings or RecordingFilterSettings(),
+                settings_repository or RecordingFilterSettings(),
             )
     return cog
 
@@ -1375,9 +1428,10 @@ class ForbiddenFilterDegradesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
                 cog = forbiddenfilter_cog.ForbiddenFilterCog(
-                    bot=None, settings=RecordingFilterSettings()
+                    bot=None,
+                    settings_repository=RecordingFilterSettings(),
                 )
-        self.assertIsNone(cog._find_match("아무 말이나"))
+        self.assertIsNone(cog._find_forbidden_word("아무 말이나"))
 
 
 class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
@@ -1426,7 +1480,7 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "_verify_databases"), patch.object(
             main, "DATA_DIR", pathlib.Path(tempfile.mkdtemp())
         ):
-            await main.MyBot.setup_hook(FakeBot())
+            await main.HyacineBot.setup_hook(FakeBot())
 
         # 공개 배포 봇은 어떤 서버에 초대될지 미리 알 수 없다.
         self.assertEqual(events, ["global"])
@@ -1607,13 +1661,13 @@ class ForbiddenFilterSettingCommandTests(unittest.IsolatedAsyncioTestCase):
             interaction = SimpleNamespace(
                 guild_id=TEST_GUILD_ID, response=RecordingResponse()
             )
-            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+            await GuildSettingsCog._set_forbidden_filter.callback(cog, interaction, False)
 
             self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
             self.assertEqual(invalidated, [TEST_GUILD_ID])
             self.assertIn("껐", interaction.response.messages[0][0][0])
 
-            await GuildSettingsCog._forbidden_filter.callback(
+            await GuildSettingsCog._set_forbidden_filter.callback(
                 cog, SimpleNamespace(guild_id=TEST_GUILD_ID, response=RecordingResponse()), True
             )
             self.assertTrue(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
@@ -1625,15 +1679,20 @@ class ForbiddenFilterSettingCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             cog = GuildSettingsCog(_SetupBot(), settings)
             settings.set_forbidden_filter_enabled(TEST_GUILD_ID, False)
+            settings.set_event_channel(TEST_GUILD_ID, 77)
 
             interaction = SimpleNamespace(
                 guild_id=TEST_GUILD_ID, response=RecordingResponse()
             )
-            await GuildSettingsCog._show.callback(cog, interaction)
+            await GuildSettingsCog._show_settings.callback(cog, interaction)
 
         embed = interaction.response.messages[0][1]["embed"]
         field = next(f for f in embed.fields if f.name == "금지어 필터")
         self.assertEqual(field.value, "꺼짐")
+        event_field = next(
+            f for f in embed.fields if f.name == "이벤트 전용 채널"
+        )
+        self.assertEqual(event_field.value, "<#77>")
 
     async def test_toggle_survives_a_missing_filter_cog(self):
         """금지어 확장이 로드되지 않은 인스턴스에서도 설정은 저장돼야 한다."""
@@ -1645,14 +1704,14 @@ class ForbiddenFilterSettingCommandTests(unittest.IsolatedAsyncioTestCase):
             interaction = SimpleNamespace(
                 guild_id=TEST_GUILD_ID, response=RecordingResponse()
             )
-            await GuildSettingsCog._forbidden_filter.callback(cog, interaction, False)
+            await GuildSettingsCog._set_forbidden_filter.callback(cog, interaction, False)
             self.assertFalse(settings.get_forbidden_filter_enabled(TEST_GUILD_ID))
 
 
 class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
     def test_greeting_loads_without_any_ai_key(self):
         env = {"ADMIN_TOKEN": "t", "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
-        with patch.object(bot_main, "ENV_VALUES", env):
+        with patch.object(bot_main, "OPTIONAL_DEPENDENCY_VALUES", env):
             names = bot_main.available_extensions()
         self.assertIn("module.greeting_cog", names)
         self.assertNotIn("module.hyacine_chat_cog", names)
@@ -1677,6 +1736,33 @@ class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_settings_commands_are_administrator_only(self):
+        permissions = GuildSettingsCog.설정.default_permissions
+        self.assertTrue(permissions.administrator)
+        self.assertFalse(permissions.manage_guild)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cog = GuildSettingsCog(
+                _SetupBot(),
+                SQLiteGuildSettingsRepository(
+                    pathlib.Path(directory) / "settings.db"
+                ),
+            )
+            administrator = SimpleNamespace(
+                user=SimpleNamespace(
+                    guild_permissions=SimpleNamespace(administrator=True)
+                )
+            )
+            manager = SimpleNamespace(
+                user=SimpleNamespace(
+                    guild_permissions=SimpleNamespace(administrator=False)
+                )
+            )
+
+            self.assertTrue(await cog.interaction_check(administrator))
+            with self.assertRaises(discord.app_commands.MissingPermissions):
+                await cog.interaction_check(manager)
+
     async def test_announcement_channel_is_stored_separately_from_party_channel(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             guildsettings_cog.discord, "TextChannel", _SetupChannel
@@ -1694,7 +1780,7 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
                 response=RecordingResponse(),
             )
 
-            await GuildSettingsCog._announcement_channel.callback(
+            await GuildSettingsCog._set_announcement_channel.callback(
                 cog, interaction, announcement
             )
 
@@ -1778,7 +1864,7 @@ class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
                 response=RecordingResponse(),
             )
 
-            await GuildSettingsCog._show.callback(cog, interaction)
+            await GuildSettingsCog._show_settings.callback(cog, interaction)
 
             embed = interaction.response.messages[0][1]["embed"]
             field = next(f for f in embed.fields if f.name == "파티 패널 채널")
@@ -2007,7 +2093,7 @@ class ForbiddenResponseTests(unittest.IsolatedAsyncioTestCase):
 
         await cog.on_guild_remove(SimpleNamespace(id=TEST_GUILD_ID))
 
-        self.assertNotIn(TEST_GUILD_ID, cog._enabled_cache)
+        self.assertNotIn(TEST_GUILD_ID, cog._enabled_by_guild)
 
     async def test_bot_messages_are_never_screened(self):
         """봇 응답이 다시 걸리면 봇끼리 핑퐁이 돈다. 회귀 방지."""
@@ -2188,8 +2274,10 @@ class ForbiddenPolicyDocumentTests(unittest.IsolatedAsyncioTestCase):
 class ForbiddenGuildToggleTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_guild_is_not_screened(self):
         counter = RecordingForbiddenCounts()
-        settings = RecordingFilterSettings(enabled=False)
-        cog = make_forbidden_cog(counter, settings=settings)
+        settings_repository = RecordingFilterSettings(enabled=False)
+        cog = make_forbidden_cog(
+            counter, settings_repository=settings_repository
+        )
         message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
 
         await cog.on_message(message)
@@ -2198,25 +2286,31 @@ class ForbiddenGuildToggleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter.counts, [])
 
     async def test_setting_is_read_once_per_guild_then_cached(self):
-        settings = RecordingFilterSettings()
-        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+        settings_repository = RecordingFilterSettings()
+        cog = make_forbidden_cog(
+            RecordingForbiddenCounts(),
+            settings_repository=settings_repository,
+        )
 
         for _ in range(3):
             await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
 
-        self.assertEqual(settings.reads, 1)
+        self.assertEqual(settings_repository.reads, 1)
 
     async def test_invalidate_guild_forces_a_reread(self):
-        settings = RecordingFilterSettings()
-        cog = make_forbidden_cog(RecordingForbiddenCounts(), settings=settings)
+        settings_repository = RecordingFilterSettings()
+        cog = make_forbidden_cog(
+            RecordingForbiddenCounts(),
+            settings_repository=settings_repository,
+        )
         await cog.on_message(FakeMessage("깨끗한 말", guild_id=TEST_GUILD_ID))
 
         cog.invalidate_guild(TEST_GUILD_ID)
-        settings.enabled = False
+        settings_repository.enabled = False
         message = FakeMessage("나쁜말", guild_id=TEST_GUILD_ID)
         await cog.on_message(message)
 
-        self.assertEqual(settings.reads, 2)
+        self.assertEqual(settings_repository.reads, 2)
         self.assertEqual(message.sent, [])
 
 
@@ -2246,11 +2340,11 @@ class ForbiddenEditTests(unittest.IsolatedAsyncioTestCase):
             "to_thread",
             AsyncMock(return_value=(policy, pattern, None)),
         ) as to_thread, patch("module.forbiddenfilter_cog.print"):
-            loaded = await self.cog.reload_prohibited_words()
-        to_thread.assert_awaited_once_with(forbiddenfilter_cog._load_prohibited_pattern)
+            loaded = await self.cog.reload_forbidden_words()
+        to_thread.assert_awaited_once_with(forbiddenfilter_cog._load_filter_state)
         self.assertEqual(loaded, ["새금지어"])
-        self.assertEqual(self.cog._banned, ["새금지어"])
-        self.assertIs(self.cog._banned_pattern, pattern)
+        self.assertEqual(self.cog._forbidden_words, ["새금지어"])
+        self.assertIs(self.cog._forbidden_pattern, pattern)
 
     async def test_edit_of_an_already_caught_message_is_not_double_counted(self):
         before = FakeMessage("나쁜말 하나", guild_id=TEST_GUILD_ID)
@@ -2285,7 +2379,7 @@ class PartyCreationTests(unittest.IsolatedAsyncioTestCase):
             game = "PUBG"  # 역할 없는 게임
             repository.create_party(TEST_GUILD_ID, game, 1_000)
             with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
+                cog = PlayWithCog(bot=None, party_repository=repository)
 
             for user_id in range(playwith_cog.GAMES[game]["max_players"]):
                 self.assertTrue(await cog.add_participant(TEST_GUILD_ID, game, user_id))
@@ -2303,7 +2397,7 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
             repository.add_participant(TEST_GUILD_ID, game, 42, "탑")
             repository.add_participant(TEST_GUILD_ID, game, 43, "미드")
             with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
+                cog = PlayWithCog(bot=None, party_repository=repository)
 
             member = SimpleNamespace(
                 id=42, guild=SimpleNamespace(id=TEST_GUILD_ID)
@@ -2321,7 +2415,7 @@ class PartyMembershipTests(unittest.IsolatedAsyncioTestCase):
             repository.create_party(TEST_GUILD_ID, game, 1_000)
             repository.add_participant(TEST_GUILD_ID, game, 42, "탑")
             with patch("discord.ext.tasks.Loop.start"):
-                cog = PlayWithCog(bot=None, repository=repository)
+                cog = PlayWithCog(bot=None, party_repository=repository)
 
             await cog.on_member_remove(
                 SimpleNamespace(id=42, guild=SimpleNamespace(id=TEST_GUILD_ID))
@@ -2651,16 +2745,16 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)):
-                attendance = RecordingUsage()
+                usage_cog = RecordingUsage()
                 cog = HyacineChatCog(
-                    bot=SimpleNamespace(get_cog=lambda _: attendance)
+                    bot=SimpleNamespace(get_cog=lambda _: usage_cog)
                 )
-                old_session = cog.get_session(1)
+                old_session = cog.get_or_create_session(1)
                 persona_path.write_text(
                     json.dumps({"system_prompt": "new prompt", "greeting": "new greeting"}),
                     encoding="utf-8",
                 )
-                new_session = cog.get_session(2)
+                new_session = cog.get_or_create_session(2)
 
                 captured_instructions = []
 
@@ -2677,11 +2771,11 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
                 cog.client = SimpleNamespace(
                     responses=SimpleNamespace(create=response)
                 )
-                await cog._run_talk(
+                await cog._run_chat(
                     FakeInteraction(channel_id=1), "old", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
-                await cog._run_talk(
+                await cog._run_chat(
                     FakeInteraction(channel_id=2), "new", None, "test-model", "none",
                     "light", config.LIMIT_LIGHT,
                 )
@@ -2690,7 +2784,7 @@ class PersonaSessionRefreshTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_instructions, ["old prompt", "new prompt"])
 
 
-class _StubShowcase:
+class _StubProfileService:
     """ProfileService 대역. 네트워크 없이 명령 경로만 확인한다."""
 
     def __init__(self, results=None):
@@ -2698,10 +2792,10 @@ class _StubShowcase:
         self.results = results or {}
         self.calls = []
 
-    def adapter(self, game):
+    def get_adapter(self, game):
         return game_profile.ADAPTERS[game]
 
-    async def fetch(self, game, uid, *, use_cache=True):
+    async def fetch_showcase(self, game, uid, *, use_cache=True):
         self.calls.append((game, uid))
         result = self.results.get((game, uid))
         if isinstance(result, Exception):
@@ -2743,13 +2837,15 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.repository = SQLiteProfileRepository(
             pathlib.Path(self.directory.name) / "profile.db"
         )
-        self.service = _StubShowcase()
+        self.profile_service = _StubProfileService()
         self.cog = profile_cog.ProfileCog(
-            bot=None, repository=self.repository, service=self.service
+            bot=None,
+            profile_repository=self.repository,
+            profile_service=self.profile_service,
         )
 
     async def test_registration_defers_then_stores_a_validated_uid(self):
-        self.service.results[("hsr", "800333171")] = _showcase(
+        self.profile_service.results[("hsr", "800333171")] = _showcase(
             characters=[_character()]
         )
         interaction = _ProfileInteraction()
@@ -2772,7 +2868,7 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.cog, interaction, _choice("hsr"), "12ab"
         )
 
-        self.assertEqual(self.service.calls, [])
+        self.assertEqual(self.profile_service.calls, [])
         self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
         self.assertIn("9자리", interaction.followup.messages[0][0][0])
 
@@ -2787,7 +2883,9 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("❌", interaction.followup.messages[0][0][0])
 
     async def test_empty_showcase_registers_but_explains_the_game_menu(self):
-        self.service.results[("zzz", "1000032854")] = _showcase(characters=[])
+        self.profile_service.results[("zzz", "1000032854")] = _showcase(
+            characters=[]
+        )
         interaction = _ProfileInteraction()
 
         await profile_cog.ProfileCog._register.callback(
@@ -2801,8 +2899,8 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(game_profile.ADAPTERS["zzz"].showcase_help, text)
 
     async def test_uids_are_partitioned_per_guild(self):
-        self.service.results[("hsr", "800333171")] = _showcase()
-        self.service.results[("hsr", "800000001")] = _showcase()
+        self.profile_service.results[("hsr", "800333171")] = _showcase()
+        self.profile_service.results[("hsr", "800000001")] = _showcase()
 
         await profile_cog.ProfileCog._register.callback(
             self.cog, _ProfileInteraction(guild_id=1), _choice("hsr"), "800333171"
@@ -2843,9 +2941,11 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
         self.repository = SQLiteProfileRepository(
             pathlib.Path(self.directory.name) / "profile.db"
         )
-        self.service = _StubShowcase()
+        self.profile_service = _StubProfileService()
         self.cog = profile_cog.ProfileCog(
-            bot=None, repository=self.repository, service=self.service
+            bot=None,
+            profile_repository=self.repository,
+            profile_service=self.profile_service,
         )
 
     async def _run_card(self, game="hsr", interaction=None):
@@ -2857,7 +2957,7 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
 
     def _seed(self):
         self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
-        self.service.results[("hsr", "800333171")] = _showcase(
+        self.profile_service.results[("hsr", "800333171")] = _showcase(
             nickname="Visions",
             level=70,
             characters=[_character("에버나이트", 80), _character("은랑", 79)],
@@ -2874,15 +2974,17 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
         interaction = await self._run_card()
 
         embed = interaction.followup.messages[0][1]["embed"]
-        self.assertEqual(embed.title, "Visions · 붕괴: 스타레일")
-        self.assertIn("**에버나이트** Lv.80", embed.description)
+        self.assertEqual(embed.title, "테스트 유저 · 붕괴: 스타레일")
+        self.assertEqual(embed.description, "Visions Lv.70\n에버나이트 Lv.80")
         self.assertNotIn("은랑", embed.description)
         self.assertEqual(embed.image.url, "https://example.invalid/a.png")
 
     async def test_empty_showcase_explains_the_in_game_menu(self):
         """UID가 멀쩡해도 진열장이 비어 있을 수 있다. 그때가 최우선 UX다."""
         self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "gi", "618285856")
-        self.service.results[("gi", "618285856")] = _showcase(characters=[])
+        self.profile_service.results[("gi", "618285856")] = _showcase(
+            characters=[]
+        )
 
         interaction = await self._run_card("gi")
 
@@ -2897,13 +2999,13 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
     async def test_card_without_registration_points_at_the_register_command(self):
         interaction = await self._run_card()
 
-        self.assertEqual(self.service.calls, [])
+        self.assertEqual(self.profile_service.calls, [])
         self.assertIn("/등록", interaction.followup.messages[0][0][0])
         self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
     async def test_lookup_failure_is_reported_without_leaking_internals(self):
         self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
-        self.service.results[("hsr", "800333171")] = game_profile.ProfileLookupError(
+        self.profile_service.results[("hsr", "800333171")] = game_profile.ProfileLookupError(
             "Enka Network에 연결하지 못했습니다."
         )
 
@@ -2915,7 +3017,7 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_card_defers_before_any_network_work(self):
         self.repository.set_uid(TEST_GUILD_ID, FakeUser.id, "hsr", "800333171")
-        self.service.results[("hsr", "800333171")] = _showcase()
+        self.profile_service.results[("hsr", "800333171")] = _showcase()
 
         interaction = await self._run_card()
 
@@ -2925,7 +3027,7 @@ class ProfileCardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_registration_is_read_from_this_guild_only(self):
         self.repository.set_uid(1, FakeUser.id, "hsr", "800333171")
-        self.service.results[("hsr", "800333171")] = _showcase()
+        self.profile_service.results[("hsr", "800333171")] = _showcase()
 
         elsewhere = await self._run_card(interaction=_ProfileInteraction(guild_id=2))
 
@@ -2959,7 +3061,7 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         adapter = dataclasses.replace(
             game_profile.ADAPTERS["hsr"],
             _client_factory=lambda: client,
-            _convert=convert or (lambda response: response),
+            _showcase_converter=convert or (lambda response: response),
         )
         return game_profile.ProfileService({"hsr": adapter}), client
 
@@ -2967,15 +3069,15 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         showcase = _showcase()
         service, client = self._service([showcase])
 
-        first = await service.fetch("hsr", "800333171")
-        second = await service.fetch("hsr", "800333171")
+        first = await service.fetch_showcase("hsr", "800333171")
+        second = await service.fetch_showcase("hsr", "800333171")
 
         self.assertIs(first, second)
         self.assertEqual(client.calls, 1)
 
     async def test_expired_cache_refetches(self):
         service, client = self._service([_showcase("A"), _showcase("B")])
-        await service.fetch("hsr", "800333171")
+        await service.fetch_showcase("hsr", "800333171")
         # 창이 지난 상황을 시계 대신 만료 시각으로 만든다.
         expires_at, showcase = service._cache[("hsr", "800333171")]
         service._cache[("hsr", "800333171")] = (
@@ -2983,7 +3085,7 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
             showcase,
         )
 
-        again = await service.fetch("hsr", "800333171")
+        again = await service.fetch_showcase("hsr", "800333171")
 
         self.assertEqual(again.nickname, "B")
         self.assertEqual(client.calls, 2)
@@ -2994,8 +3096,8 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         service, _ = self._service([enka.errors.PlayerDoesNotExistError()] * 4)
         for _ in range(4):
             with self.assertRaises(game_profile.ProfileLookupError):
-                await service.fetch("hsr", "800333171")
-        self.assertEqual(service._failures, {})
+                await service.fetch_showcase("hsr", "800333171")
+        self.assertEqual(service._backoff_by_game, {})
 
     async def test_repeated_transport_failures_back_off(self):
         import enka
@@ -3005,11 +3107,11 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         for _ in range(game_profile.BACKOFF_FAILURE_THRESHOLD):
             with self.assertRaises(game_profile.ProfileLookupError):
-                await service.fetch("hsr", "800333171")
+                await service.fetch_showcase("hsr", "800333171")
 
         calls_before = client.calls
         with self.assertRaises(game_profile.ProfileLookupError) as caught:
-            await service.fetch("hsr", "800333171")
+            await service.fetch_showcase("hsr", "800333171")
 
         self.assertIn("잠시 쉬는 중", str(caught.exception))
         self.assertEqual(client.calls, calls_before)
@@ -3018,19 +3120,19 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         responses = [_showcase(str(n)) for n in range(game_profile.CACHE_MAX_ENTRIES + 5)]
         service, _ = self._service(responses)
         for index in range(game_profile.CACHE_MAX_ENTRIES + 5):
-            await service.fetch("hsr", f"80000{index:04d}")
+            await service.fetch_showcase("hsr", f"80000{index:04d}")
         self.assertLessEqual(len(service._cache), game_profile.CACHE_MAX_ENTRIES)
 
     async def test_close_releases_the_client(self):
         service, client = self._service([_showcase()])
-        await service.fetch("hsr", "800333171")
+        await service.fetch_showcase("hsr", "800333171")
         await service.close()
         self.assertTrue(client.closed)
 
     async def test_unknown_game_is_refused(self):
         service, _ = self._service([])
         with self.assertRaises(game_profile.ProfileLookupError):
-            service.adapter("wuwa")
+            service.get_adapter("wuwa")
 
     def test_construction_touches_no_network(self):
         """회선 없이도 봇은 기동해야 한다. 클라이언트는 첫 조회에서 열린다."""
@@ -3038,7 +3140,7 @@ class ProfileServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_profile_extension_needs_no_api_key(self):
         env = {"ADMIN_TOKEN": None, "OPENAI_API_KEY": None, "GOOGLE_API_KEY": None}
-        with patch.object(bot_main, "ENV_VALUES", env):
+        with patch.object(bot_main, "OPTIONAL_DEPENDENCY_VALUES", env):
             self.assertIn("module.profile_cog", bot_main.available_extensions())
 
 
@@ -3047,6 +3149,7 @@ class _WebSettingsRepository:
         self.guild_ids = list(guild_ids)
         self.channels = dict(channels or {})
         self.party_channels = {}
+        self.event_channels = {}
 
     def list_announcement_guild_ids(self):
         return list(self.guild_ids)
@@ -3062,6 +3165,15 @@ class _WebSettingsRepository:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def get_event_channel(self, guild_id):
+        value = self.event_channels.get(guild_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def set_event_channel(self, guild_id, channel_id):
+        self.event_channels[guild_id] = channel_id
 
     def get_allow_host_announce(self, guild_id):
         return guild_id in self.guild_ids
@@ -3086,7 +3198,7 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
             "OPENAI_API_KEY": "openai",
             "GOOGLE_API_KEY": "google",
         }
-        with patch.object(bot_main, "ENV_VALUES", env):
+        with patch.object(bot_main, "OPTIONAL_DEPENDENCY_VALUES", env):
             names = bot_main.available_extensions()
         self.assertNotIn("module.webadmin_cog", names)
         self.assertIn("module.guildsettings_cog", names)
@@ -3098,7 +3210,7 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
             "OPENAI_API_KEY": None,
             "GOOGLE_API_KEY": None,
         }
-        with patch.object(bot_main, "ENV_VALUES", env):
+        with patch.object(bot_main, "OPTIONAL_DEPENDENCY_VALUES", env):
             names = bot_main.available_extensions()
         self.assertIn("module.webadmin_cog", names)
         self.assertNotIn("module.hyacine_chat_cog", names)
@@ -3142,10 +3254,10 @@ class WebAdminExtensionTests(unittest.IsolatedAsyncioTestCase):
             cleanup=AsyncMock(side_effect=lambda: events.append("runner"))
         )
         cog = webadmin_cog.WebAdminCog(_WebBot(), _WebSettingsRepository())
-        cog.runner = runner
-        bot = object.__new__(bot_main.MyBot)
+        cog.web_runner = runner
+        bot = object.__new__(bot_main.HyacineBot)
         superclass_close = AsyncMock(side_effect=lambda: events.append("super"))
-        with patch.object(bot_main.MyBot, "get_cog", return_value=cog), patch.object(
+        with patch.object(bot_main.HyacineBot, "get_cog", return_value=cog), patch.object(
             commands.Bot, "close", superclass_close
         ):
             await bot.close()
@@ -3476,6 +3588,171 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         self.assertFalse(pathlib.Path(temporary_file.name).exists())
 
 
+class WebAdminTemplateDesignTests(unittest.TestCase):
+    def test_login_template_uses_local_discord_design(self):
+        login_page = webadmin_cog.WebAdminCog._render_template(
+            "admin_login.html", error=""
+        )
+        self.assertIn("--blurple: #5865f2", login_page)
+        self.assertIn('for="admin-token"', login_page)
+        self.assertIn('id="admin-token"', login_page)
+        self.assertNotIn("<script", login_page)
+        self.assertNotIn("https://", login_page)
+
+    def test_index_template_uses_responsive_design_and_keeps_form_contracts(self):
+        page = webadmin_cog.WebAdminCog._render_template(
+            "admin_index.html",
+            csrf="csrf",
+            notice="",
+            persona_prompt="prompt",
+            persona_greeting="hello",
+            forbidden_words='["bad"]',
+            games='{"Game":{"max_players":2,"roles":[]}}',
+            guild_rows=(
+                '<tr><td><form action="/guilds/event-channel">'
+                '<select name="channel_id"></select></form></td></tr>'
+            ),
+            guild_options='<option value="">전체</option>',
+        )
+        self.assertIn("--blurple: #5865f2", page)
+        self.assertIn('class="shell"', page)
+        self.assertIn("@media (max-width: 960px)", page)
+        self.assertIn('href="#main-content"', page)
+        for action in (
+            "/logout",
+            "/settings/persona.json",
+            "/settings/forbidden_words.json",
+            "/settings/games.json",
+            "/guilds/event-channel",
+            "/announce",
+        ):
+            self.assertIn(f'action="{action}"', page)
+        for name in (
+            "csrf",
+            "system_prompt",
+            "greeting",
+            "document",
+            "guild_id",
+            "title",
+            "body",
+            "image",
+            "color",
+        ):
+            self.assertIn(f'name="{name}"', page)
+        for control_id in (
+            "system-prompt",
+            "greeting",
+            "forbidden-words",
+            "games",
+            "guild-select",
+            "announce-color",
+            "announce-title-input",
+            "announce-body",
+            "announce-image",
+        ):
+            self.assertIn(f'for="{control_id}"', page)
+            self.assertIn(f'id="{control_id}"', page)
+        self.assertIn('scope="col"', page)
+        self.assertIn('aria-live="polite"', page)
+        self.assertIn("Discord 문법 가이드", page)
+        self.assertIn("**굵게**", page)
+        self.assertNotIn("<script", page)
+        self.assertNotIn("https://", page)
+
+
+class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_security_headers_middleware_accepts_aiohttp_handler_keyword(self):
+        handler = AsyncMock(return_value=webadmin_cog.web.Response(text="ok"))
+        request = SimpleNamespace(method="GET", path="/")
+
+        response = await webadmin_cog._security_headers(
+            request,
+            handler=handler,
+        )
+
+        handler.assert_awaited_once_with(request)
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+    async def test_event_channel_handler_persists_a_guild_owned_channel(self):
+        permissions = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            embed_links=True,
+        )
+        channel = SimpleNamespace(
+            id=77,
+            name="events",
+            type=discord.ChannelType.text,
+            permissions_for=lambda member: permissions,
+        )
+        guild = SimpleNamespace(
+            id=1,
+            name="테스트 길드",
+            me=object(),
+            get_channel=lambda channel_id: channel if channel_id == 77 else None,
+        )
+        bot = _WebBot()
+        bot.guilds = [guild]
+        repository = _WebSettingsRepository()
+        cog = webadmin_cog.WebAdminCog(bot, repository)
+        session = webadmin_cog.AdminSession(csrf="csrf", expires_at=1)
+        response = webadmin_cog.web.Response(text="ok")
+
+        with patch.object(
+            cog,
+            "_read_form",
+            AsyncMock(
+                return_value={"csrf": "csrf", "guild_id": "1", "channel_id": "77"}
+            ),
+        ), patch.object(cog, "_require_session"), patch.object(
+            cog,
+            "_require_csrf",
+            return_value=("session", session),
+        ), patch.object(
+            cog,
+            "_index_response",
+            AsyncMock(return_value=response),
+        ):
+            result = await cog.event_channel_post(object())
+
+        self.assertIs(result, response)
+        self.assertEqual(repository.event_channels[1], 77)
+
+    async def test_guild_overview_marks_the_selected_event_channel(self):
+        permissions = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            embed_links=True,
+        )
+        channel = SimpleNamespace(
+            id=77,
+            name="events",
+            type=discord.ChannelType.text,
+            permissions_for=lambda member: permissions,
+        )
+        guild = SimpleNamespace(
+            id=1,
+            name="<테스트>",
+            me=object(),
+            text_channels=[channel],
+            get_channel=lambda channel_id: channel if channel_id == 77 else None,
+        )
+        bot = _WebBot()
+        bot.guilds = [guild]
+        repository = _WebSettingsRepository()
+        repository.event_channels[1] = 77
+        cog = webadmin_cog.WebAdminCog(bot, repository)
+
+        rows, _, problem = await cog._guild_overview("csrf")
+
+        self.assertEqual(problem, "")
+        self.assertIn('action="/guilds/event-channel"', rows)
+        self.assertIn('<option value="77" selected>#events</option>', rows)
+        self.assertNotIn("<테스트>", rows)
+
+
 class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -3512,7 +3789,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 303)
         session_id = response.cookies[webadmin_cog.SESSION_COOKIE].value
-        return session_id, self.cog.sessions[session_id].csrf
+        return session_id, self.cog.admin_sessions[session_id].csrf
 
     async def test_auth_redirect_headers_cookie_and_non_reflection(self):
         response = await self.client.get("/", allow_redirects=False)
@@ -3569,7 +3846,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(morsel["path"], "/")
         self.assertEqual(morsel["max-age"], str(webadmin_cog.SESSION_TTL_SECONDS))
         session_id = morsel.value
-        csrf = self.cog.sessions[session_id].csrf
+        csrf = self.cog.admin_sessions[session_id].csrf
 
         rejected = await self.client.post(
             "/settings/forbidden_words.json", data={"document": "[]"}
@@ -3579,18 +3856,40 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
             "/logout", data={"csrf": "wrong"}, allow_redirects=False
         )
         self.assertEqual(rejected.status, 403)
-        self.assertIn(session_id, self.cog.sessions)
+        self.assertIn(session_id, self.cog.admin_sessions)
 
         logout = await self.client.post(
             "/logout", data={"csrf": csrf}, allow_redirects=False
         )
         self.assertEqual(logout.status, 303)
-        self.assertNotIn(session_id, self.cog.sessions)
+        self.assertNotIn(session_id, self.cog.admin_sessions)
         self.assertEqual(
             logout.cookies[webadmin_cog.SESSION_COOKIE]["max-age"], "0"
         )
         restarted = webadmin_cog.WebAdminCog(self.bot, self.repository)
-        self.assertEqual(restarted.sessions, {})
+        self.assertEqual(restarted.admin_sessions, {})
+
+    async def test_event_channel_can_be_set_and_cleared_from_the_admin_page(self):
+        _, csrf = await self._login()
+        channel = _AnnouncementChannel(name="events")
+        guild = _AnnouncementGuild({77: channel}, guild_id=1, name="테스트 길드")
+        self.bot.guilds = [guild]
+
+        selected = await self.client.post(
+            "/guilds/event-channel",
+            data={"csrf": csrf, "guild_id": "1", "channel_id": "77"},
+        )
+        self.assertEqual(selected.status, 200)
+        self.assertEqual(self.repository.event_channels[1], 77)
+        self.assertIn("지정했습니다", await selected.text())
+
+        cleared = await self.client.post(
+            "/guilds/event-channel",
+            data={"csrf": csrf, "guild_id": "1", "channel_id": ""},
+        )
+        self.assertEqual(cleared.status, 200)
+        self.assertIsNone(self.repository.event_channels[1])
+        self.assertIn("제한을 해제했습니다", await cleared.text())
 
     async def test_session_expiry_relogin_revocation_and_stale_cookie(self):
         with patch.object(webadmin_cog.time, "monotonic", return_value=100.0):
@@ -3598,8 +3897,8 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(webadmin_cog.time, "monotonic", return_value=101.0):
             second_id, _ = await self._login()
         self.assertNotEqual(first_id, second_id)
-        self.assertNotIn(first_id, self.cog.sessions)
-        self.assertEqual(list(self.cog.sessions), [second_id])
+        self.assertNotIn(first_id, self.cog.admin_sessions)
+        self.assertEqual(list(self.cog.admin_sessions), [second_id])
 
         self.client.session.cookie_jar.update_cookies(
             {webadmin_cog.SESSION_COOKIE: first_id}, self.client.make_url("/")
@@ -3617,7 +3916,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         ):
             expired = await self.client.get("/", allow_redirects=False)
         self.assertEqual((expired.status, expired.headers["Location"]), (302, "/login"))
-        self.assertEqual(self.cog.sessions, {})
+        self.assertEqual(self.cog.admin_sessions, {})
 
     async def test_settings_validation_reload_notices_and_html_escape(self):
         session_id, csrf = await self._login()
@@ -3634,14 +3933,14 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(denied.status, 404)
 
-        reload_cog = SimpleNamespace(reload_prohibited_words=AsyncMock())
+        reload_cog = SimpleNamespace(reload_forbidden_words=AsyncMock())
         self.bot.cogs["ForbiddenFilterCog"] = reload_cog
         saved = await self.client.post(
             "/settings/forbidden_words.json",
             data={"csrf": csrf, "document": '["new"]'},
         )
         self.assertIn("다시 불러왔습니다", await saved.text())
-        reload_cog.reload_prohibited_words.assert_awaited_once_with()
+        reload_cog.reload_forbidden_words.assert_awaited_once_with()
 
         persona = await self.client.post(
             "/settings/persona.json",
@@ -3667,10 +3966,10 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         page = await index.text()
         self.assertNotIn("</textarea><script>", page)
         self.assertIn("&lt;/textarea&gt;&lt;script&gt;", page)
-        self.assertIn(session_id, self.cog.sessions)
+        self.assertIn(session_id, self.cog.admin_sessions)
 
     def test_template_replaces_original_placeholders_once(self):
-        page = self.cog._template(
+        page = self.cog._render_template(
             "admin_index.html",
             csrf="csrf",
             notice="",
@@ -3836,6 +4135,9 @@ class _AnnouncementGuild:
         self.id = guild_id
         self.name = name
         self.me = object()
+        for channel_id, channel in channels.items():
+            channel.id = channel_id
+        self.text_channels = list(channels.values())
 
     def get_channel(self, channel_id):
         return self.channels.get(channel_id)
@@ -3938,7 +4240,7 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((sent.embeds[0].title, sent.embeds[0].description), ("Title", "Body"))
         logged.assert_called_once()
         self.assertEqual(logged.call_args.args[-1], 4)
-        self.assertIn(session_id, self.cog.sessions)
+        self.assertIn(session_id, self.cog.admin_sessions)
 
     async def test_hanging_guild_times_out_without_blocking_settings_saves(self):
         """공지가 한 길드에 매달려도 관리 화면 전체가 멈추면 안 된다."""
@@ -3957,7 +4259,9 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             _AnnouncementGuild({11: _HangingChannel()}, 1),
             _AnnouncementGuild({22: delivered}, 2),
         ]
-        with patch.object(webadmin_cog, "ANNOUNCE_SEND_TIMEOUT", 0.2), patch.object(
+        with patch.object(
+            webadmin_cog, "ANNOUNCEMENT_SEND_TIMEOUT_SECONDS", 0.2
+        ), patch.object(
             webadmin_cog.logger, "exception"
         ):
             announcing = asyncio.create_task(
@@ -4069,7 +4373,8 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         # 길드 2는 party_channel_id 22가 있지만 채널이 사라졌다.
         self.assertIn("삭제됨 (22)", page)
         self.assertIn('<option value="1">공지 켠 길드</option>', page)
-        self.assertNotIn('value="2"', page)
+        # 이벤트 채널 폼은 모든 길드에 있으므로 공지 대상 option만 확인한다.
+        self.assertNotIn('<option value="2">', page)
         # 길드 이름은 운영자가 통제하지 않는 외부 문자열이다.
         self.assertNotIn("<공지 끈 길드>", page)
         self.assertIn("&lt;공지 끈 길드&gt;", page)

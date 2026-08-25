@@ -51,38 +51,53 @@ class SetupView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        party = await self.cog._ensure_bot_channels(guild)
+        party_channel = await self.cog._ensure_bot_channels(guild)
         await interaction.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}", ephemeral=True
+            f"✅ 봇 채널을 준비했습니다: {party_channel.mention}",
+            ephemeral=True,
         )
 
 
 class GuildSettingsCog(commands.Cog):
     def __init__(
-        self, bot: commands.Bot, settings: Optional[GuildSettingsRepository] = None
+        self,
+        bot: commands.Bot,
+        settings_repository: Optional[GuildSettingsRepository] = None,
     ):
         self.bot = bot
-        self.settings = settings or create_guild_settings_repository()
+        self.settings_repository = (
+            settings_repository or create_guild_settings_repository()
+        )
         self.setup_view = SetupView(self)
         if bot is not None:
             bot.add_view(self.setup_view)
 
     설정 = app_commands.Group(
         name="설정",
-        description="이 서버에서 봇이 사용할 채널을 지정합니다. (서버 관리 권한 필요)",
+        description="이 서버에서 봇이 사용할 채널을 지정합니다. (Administrator 필요)",
         guild_only=True,
-        default_permissions=discord.Permissions(manage_guild=True),
+        default_permissions=discord.Permissions(administrator=True),
     )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions is not None and permissions.administrator:
+            return True
+        raise app_commands.MissingPermissions(["administrator"])
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
         """봇이 서버에서 제거되면 그 서버의 설정을 남기지 않는다."""
-        await run_db(self.settings.delete_guild, guild.id)
+        await run_db(self.settings_repository.delete_guild, guild.id)
         drop_panel_locks(guild.id)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
-        await run_db(self.settings.clear_channel, channel.guild.id, channel.id)
+        await run_db(
+            self.settings_repository.clear_channel,
+            channel.guild.id,
+            channel.id,
+        )
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
@@ -104,18 +119,22 @@ class GuildSettingsCog(commands.Cog):
                 )
 
     async def _rename_legacy_party_channel(self, guild: discord.Guild):
-        party_id = await run_db(self.settings.get_party_channel, guild.id)
-        party = guild.get_channel(party_id) if party_id else None
-        if party is None or party.name != "🎮-파티":
-            return party
+        party_channel_id = await run_db(
+            self.settings_repository.get_party_channel, guild.id
+        )
+        party_channel = (
+            guild.get_channel(party_channel_id) if party_channel_id else None
+        )
+        if party_channel is None or party_channel.name != "🎮-파티":
+            return party_channel
         try:
-            await party.edit(name="🎮-디스코-파티")
+            await party_channel.edit(name="🎮-디스코-파티")
         except (discord.Forbidden, discord.HTTPException):
             logger.warning(
                 "기존 파티 채널 이름을 바꾸지 못했습니다: guild=%s",
                 guild.id,
             )
-        return party
+        return party_channel
 
     async def _ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
         async with panel_lock(guild.id, "setup"):
@@ -125,14 +144,14 @@ class GuildSettingsCog(commands.Cog):
 
     async def _ensure_panels(self, guild: discord.Guild) -> None:
         get_cog = getattr(self.bot, "get_cog", None)
-        play_cog = get_cog("PlayWithCog") if get_cog else None
-        if play_cog is not None:
-            await play_cog.ensure_panels(guild)
+        party_cog = get_cog("PlayWithCog") if get_cog else None
+        if party_cog is not None:
+            await party_cog.ensure_panels(guild)
 
     async def ensure_bot_channels(self, guild: discord.Guild) -> discord.TextChannel:
-        party = await self._rename_legacy_party_channel(guild)
-        if party:
-            return party
+        party_channel = await self._rename_legacy_party_channel(guild)
+        if party_channel:
+            return party_channel
 
         category = discord.utils.get(guild.categories, name="🤖 봇")
         if category is None:
@@ -148,108 +167,154 @@ class GuildSettingsCog(commands.Cog):
             }
             category = await guild.create_category("🤖 봇", overwrites=overwrites)
 
-        party = await guild.create_text_channel("🎮-디스코-파티", category=category)
-        await run_db(self.settings.set_party_channel, guild.id, party.id)
-        return party
+        party_channel = await guild.create_text_channel(
+            "🎮-디스코-파티", category=category
+        )
+        await run_db(
+            self.settings_repository.set_party_channel,
+            guild.id,
+            party_channel.id,
+        )
+        return party_channel
 
     @설정.command(name="시작", description="봇 전용 파티 채널을 만듭니다.")
-    async def _start(self, inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True)
-        party = await self._ensure_bot_channels(inter.guild)
-        await inter.followup.send(
-            f"✅ 봇 채널을 준비했습니다: {party.mention}", ephemeral=True
+    async def _start(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        party_channel = await self._ensure_bot_channels(interaction.guild)
+        await interaction.followup.send(
+            f"✅ 봇 채널을 준비했습니다: {party_channel.mention}",
+            ephemeral=True,
         )
 
     @설정.command(name="파티채널", description="파티 패널을 표시할 채널을 지정합니다.")
     @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
     async def _party_channel(
-        self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
+        self,
+        interaction: discord.Interaction,
+        채널: Optional[discord.TextChannel] = None,
     ):
-        target = 채널 or inter.channel
-        if not isinstance(target, discord.TextChannel):
-            await inter.response.send_message(
+        target_channel = 채널 or interaction.channel
+        if not isinstance(target_channel, discord.TextChannel):
+            await interaction.response.send_message(
                 "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
                 ephemeral=True,
             )
             return
-        if not is_sendable_panel_channel(inter.guild, target):
-            await inter.response.send_message(
+        if not is_sendable_panel_channel(interaction.guild, target_channel):
+            await interaction.response.send_message(
                 "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드 권한이 필요합니다.",
                 ephemeral=True,
             )
             return
-        await inter.response.defer(ephemeral=True)
-        await run_db(self.settings.set_party_channel, inter.guild_id, target.id)
-        await self._ensure_panels(inter.guild)
-        await inter.followup.send(
-            f"✅ 파티 패널 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+        await interaction.response.defer(ephemeral=True)
+        await run_db(
+            self.settings_repository.set_party_channel,
+            interaction.guild_id,
+            target_channel.id,
+        )
+        await self._ensure_panels(interaction.guild)
+        await interaction.followup.send(
+            f"✅ 파티 패널 채널을 {target_channel.mention} 으로 지정했습니다.",
+            ephemeral=True,
         )
 
     @설정.command(name="공지허용", description="웹 관리 공지를 허용하거나 차단합니다.")
     @app_commands.describe(허용="허용하면 설정한 공지 채널로 웹 관리 공지를 받습니다.")
-    async def _allow_host_announce(self, inter: discord.Interaction, 허용: bool):
-        await run_db(self.settings.set_allow_host_announce, inter.guild_id, 허용)
-        await inter.response.send_message(
+    async def _set_host_announcements(
+        self, interaction: discord.Interaction, 허용: bool
+    ):
+        await run_db(
+            self.settings_repository.set_allow_host_announce,
+            interaction.guild_id,
+            허용,
+        )
+        await interaction.response.send_message(
             f"✅ 웹 관리 공지를 {'허용' if 허용 else '차단'}했습니다.", ephemeral=True
         )
 
     @설정.command(name="공지채널", description="웹 관리 공지를 받을 채널을 지정합니다.")
     @app_commands.describe(채널="비워두면 현재 채널로 지정됩니다.")
-    async def _announcement_channel(
-        self, inter: discord.Interaction, 채널: Optional[discord.TextChannel] = None
+    async def _set_announcement_channel(
+        self,
+        interaction: discord.Interaction,
+        채널: Optional[discord.TextChannel] = None,
     ):
-        target = 채널 or inter.channel
-        if not isinstance(target, discord.TextChannel):
-            await inter.response.send_message(
+        target_channel = 채널 or interaction.channel
+        if not isinstance(target_channel, discord.TextChannel):
+            await interaction.response.send_message(
                 "❌ 텍스트 채널에서 실행하거나 텍스트 채널을 지정해 주세요.",
                 ephemeral=True,
             )
             return
-        if not is_sendable_announcement_channel(inter.guild, target):
-            await inter.response.send_message(
+        if not is_sendable_announcement_channel(
+            interaction.guild, target_channel
+        ):
+            await interaction.response.send_message(
                 "❌ 봇에 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드, 파일 첨부 권한이 필요합니다.",
                 ephemeral=True,
             )
             return
         await run_db(
-            self.settings.set_announcement_channel, inter.guild_id, target.id
+            self.settings_repository.set_announcement_channel,
+            interaction.guild_id,
+            target_channel.id,
         )
-        await inter.response.send_message(
-            f"✅ 웹 공지 채널을 {target.mention} 으로 지정했습니다.", ephemeral=True
+        await interaction.response.send_message(
+            f"✅ 웹 공지 채널을 {target_channel.mention} 으로 지정했습니다.",
+            ephemeral=True,
         )
 
     @설정.command(name="금지어", description="이 서버에서 금지어 필터를 켜거나 끕니다.")
     @app_commands.describe(사용="끄면 이 서버에서만 금지어에 반응하지 않습니다.")
-    async def _forbidden_filter(self, inter: discord.Interaction, 사용: bool):
+    async def _set_forbidden_filter(
+        self, interaction: discord.Interaction, 사용: bool
+    ):
         await run_db(
-            self.settings.set_forbidden_filter_enabled, inter.guild_id, 사용
+            self.settings_repository.set_forbidden_filter_enabled,
+            interaction.guild_id,
+            사용,
         )
         # 필터는 메시지마다 DB를 때리지 않으려고 값을 캐시한다. 여기서 무효화하지
         # 않으면 다음 재시작까지 옛 설정으로 동작한다.
-        filter_cog = self.bot.get_cog("ForbiddenFilterCog") if self.bot else None
-        if filter_cog is not None:
-            filter_cog.invalidate_guild(inter.guild_id)
-        await inter.response.send_message(
+        forbidden_filter_cog = (
+            self.bot.get_cog("ForbiddenFilterCog") if self.bot else None
+        )
+        if forbidden_filter_cog is not None:
+            forbidden_filter_cog.invalidate_guild(interaction.guild_id)
+        await interaction.response.send_message(
             f"✅ 금지어 필터를 {'켰' if 사용 else '껐'}습니다.", ephemeral=True
         )
 
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
-    async def _show(self, inter: discord.Interaction):
-        party = await run_db(self.settings.get_party_channel, inter.guild_id)
-        announcement = await run_db(
-            self.settings.get_announcement_channel, inter.guild_id
+    async def _show_settings(self, interaction: discord.Interaction):
+        party_channel_id = await run_db(
+            self.settings_repository.get_party_channel, interaction.guild_id
+        )
+        announcement_channel_id = await run_db(
+            self.settings_repository.get_announcement_channel,
+            interaction.guild_id,
+        )
+        event_channel_id = await run_db(
+            self.settings_repository.get_event_channel,
+            interaction.guild_id,
         )
         allow_host_announce = await run_db(
-            self.settings.get_allow_host_announce, inter.guild_id
+            self.settings_repository.get_allow_host_announce,
+            interaction.guild_id,
         )
-        forbidden_filter = await run_db(
-            self.settings.get_forbidden_filter_enabled, inter.guild_id
+        forbidden_filter_enabled = await run_db(
+            self.settings_repository.get_forbidden_filter_enabled,
+            interaction.guild_id,
         )
         party_value = "미지정 — `/설정 파티채널`"
-        if party:
-            party_value = f"<#{party}>"
-            guild = getattr(inter, "guild", None)
-            channel = guild.get_channel(party) if guild is not None else None
+        if party_channel_id:
+            party_value = f"<#{party_channel_id}>"
+            guild = getattr(interaction, "guild", None)
+            channel = (
+                guild.get_channel(party_channel_id)
+                if guild is not None
+                else None
+            )
             if guild is not None and not is_sendable_panel_channel(guild, channel):
                 party_value += " — 삭제됨 또는 권한 부족"
 
@@ -261,7 +326,20 @@ class GuildSettingsCog(commands.Cog):
         )
         embed.add_field(
             name="웹 공지 채널",
-            value=f"<#{announcement}>" if announcement else "미지정 — `/설정 공지채널`",
+            value=(
+                f"<#{announcement_channel_id}>"
+                if announcement_channel_id
+                else "미지정 — `/설정 공지채널`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="이벤트 전용 채널",
+            value=(
+                f"<#{event_channel_id}>"
+                if event_channel_id
+                else "미지정 — 모든 채널에서 사용 가능"
+            ),
             inline=False,
         )
         embed.add_field(
@@ -271,10 +349,10 @@ class GuildSettingsCog(commands.Cog):
         )
         embed.add_field(
             name="금지어 필터",
-            value="켜짐" if forbidden_filter else "꺼짐",
+            value="켜짐" if forbidden_filter_enabled else "꺼짐",
             inline=False,
         )
-        await inter.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

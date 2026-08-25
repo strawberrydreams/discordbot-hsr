@@ -23,64 +23,76 @@ class ProfileCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
-        repository: Optional[ProfileRepository] = None,
-        service: Optional[ProfileService] = None,
+        profile_repository: Optional[ProfileRepository] = None,
+        profile_service: Optional[ProfileService] = None,
     ):
         self.bot = bot
-        self.db = repository or create_profile_repository()
+        self.profile_repository = profile_repository or create_profile_repository()
         # 네트워크는 명령이 처음 불릴 때 열린다. 키·회선 없이도 봇은 기동해야 한다.
-        self.service = service or ProfileService()
+        self.profile_service = profile_service or ProfileService()
 
     async def cog_unload(self) -> None:
-        await self.service.close()
+        await self.profile_service.close()
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
         """봇이 서버에서 제거되면 그 서버의 UID 등록을 남기지 않는다."""
-        await run_db(self.db.delete_guild, guild.id)
+        await run_db(self.profile_repository.delete_guild, guild.id)
 
     @app_commands.command(name="등록", description="게임 계정 UID를 이 서버에 등록합니다.")
     @app_commands.describe(게임="UID를 등록할 게임", uid="게임 안에서 확인할 수 있는 숫자 UID")
     @app_commands.choices(게임=GAME_CHOICES)
     @app_commands.guild_only()
     async def _register(
-        self, inter: discord.Interaction, 게임: app_commands.Choice[str], uid: str
+        self,
+        interaction: discord.Interaction,
+        게임: app_commands.Choice[str],
+        uid: str,
     ):
         # Enka 조회가 3초를 넘길 수 있다. 먼저 ACK한다.
-        await inter.response.defer(ephemeral=True)
-        adapter = self.service.adapter(게임.value)
+        await interaction.response.defer(ephemeral=True)
+        adapter = self.profile_service.get_adapter(게임.value)
         try:
-            cleaned = adapter.validate_uid(uid)
-            showcase = await self.service.fetch(adapter.key, cleaned)
+            normalized_uid = adapter.validate_uid(uid)
+            showcase = await self.profile_service.fetch_showcase(
+                adapter.key, normalized_uid
+            )
         except ProfileLookupError as exc:
-            await inter.followup.send(f"❌ {exc}", ephemeral=True)
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
         await run_db(
-            self.db.set_uid, inter.guild_id, inter.user.id, adapter.key, cleaned
+            self.profile_repository.set_uid,
+            interaction.guild_id,
+            interaction.user.id,
+            adapter.key,
+            normalized_uid,
         )
         message = (
-            f"✅ {adapter.label} UID `{cleaned}` 을(를) 이 서버에 등록했습니다. "
+            f"✅ {adapter.label} UID `{normalized_uid}` 을(를) 이 서버에 등록했습니다. "
             f"({showcase.nickname})"
         )
         if not showcase.characters:
             message += f"\n\nℹ️ 진열장이 비어 있습니다. {adapter.showcase_help}"
-        await inter.followup.send(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=True)
 
     @app_commands.command(name="게임카드", description="등록한 게임 계정의 첫 진열 캐릭터를 봅니다.")
     @app_commands.describe(게임="카드를 볼 게임")
     @app_commands.choices(게임=GAME_CHOICES)
     @app_commands.guild_only()
     async def _card(
-        self, inter: discord.Interaction, 게임: app_commands.Choice[str]
+        self, interaction: discord.Interaction, 게임: app_commands.Choice[str]
     ):
-        await inter.response.defer()
-        adapter = self.service.adapter(게임.value)
+        await interaction.response.defer()
+        adapter = self.profile_service.get_adapter(게임.value)
         uid = await run_db(
-            self.db.get_uid, inter.guild_id, inter.user.id, adapter.key
+            self.profile_repository.get_uid,
+            interaction.guild_id,
+            interaction.user.id,
+            adapter.key,
         )
         if uid is None:
-            await inter.followup.send(
+            await interaction.followup.send(
                 f"ℹ️ 이 서버에 등록된 {adapter.label} UID가 없습니다. "
                 f"`/등록 게임:{adapter.label}` 으로 먼저 등록해 주세요.",
                 ephemeral=True,
@@ -88,29 +100,41 @@ class ProfileCog(commands.Cog):
             return
 
         try:
-            showcase = await self.service.fetch(adapter.key, uid)
+            showcase = await self.profile_service.fetch_showcase(adapter.key, uid)
         except ProfileLookupError as exc:
-            await inter.followup.send(f"❌ {exc}", ephemeral=True)
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
-        await inter.followup.send(embed=self._build_embed(adapter, showcase))
+        await interaction.followup.send(
+            embed=self._build_embed(
+                adapter,
+                showcase,
+                interaction.user.display_name,
+            )
+        )
 
     @staticmethod
-    def _build_embed(adapter: GameAdapter, showcase: Showcase) -> discord.Embed:
+    def _build_embed(
+        adapter: GameAdapter,
+        showcase: Showcase,
+        discord_nickname: str,
+    ) -> discord.Embed:
         embed = discord.Embed(
-            title=f"{showcase.nickname} · {adapter.label}",
+            title=f"{discord_nickname} · {adapter.label}",
+            description=f"{showcase.nickname} Lv.{showcase.level}",
             color=discord.Color.blurple(),
         )
-        embed.add_field(name="계정 레벨", value=str(showcase.level), inline=True)
 
         if not showcase.characters:
             # UID가 멀쩡해도 진열장이 비어 있을 수 있다. Enka는 인게임에서 올린
             # 캐릭터만 돌려주므로 "데이터 없음"이 아니라 올리는 방법을 알려야 한다.
-            embed.description = f"진열장이 비어 있습니다.\n\n{adapter.showcase_help}"
+            embed.description += (
+                f"\n\n진열장이 비어 있습니다.\n\n{adapter.showcase_help}"
+            )
             return embed
 
         character = showcase.characters[0]
-        embed.description = f"**{character.name}** Lv.{character.level}"
+        embed.description += f"\n{character.name} Lv.{character.level}"
         embed.set_image(url=character.art_url)
         return embed
 
@@ -119,18 +143,21 @@ class ProfileCog(commands.Cog):
     @app_commands.choices(게임=GAME_CHOICES)
     @app_commands.guild_only()
     async def _unregister(
-        self, inter: discord.Interaction, 게임: app_commands.Choice[str]
+        self, interaction: discord.Interaction, 게임: app_commands.Choice[str]
     ):
-        adapter = self.service.adapter(게임.value)
-        removed = await run_db(
-            self.db.delete_uid, inter.guild_id, inter.user.id, adapter.key
+        adapter = self.profile_service.get_adapter(게임.value)
+        registration_removed = await run_db(
+            self.profile_repository.delete_uid,
+            interaction.guild_id,
+            interaction.user.id,
+            adapter.key,
         )
-        text = (
+        response_message = (
             f"✅ {adapter.label} 등록을 지웠습니다."
-            if removed
+            if registration_removed
             else f"ℹ️ 이 서버에 등록된 {adapter.label} UID가 없습니다."
         )
-        await inter.response.send_message(text, ephemeral=True)
+        await interaction.response.send_message(response_message, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

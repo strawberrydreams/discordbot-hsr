@@ -75,13 +75,13 @@ def _require_columns(conn: sqlite3.Connection, table: str, expected: set[str]) -
         raise RuntimeError(f"지원하지 않는 {table} 스키마입니다. 누락 컬럼: {missing}")
 
 
-async def run_db(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+async def run_db(operation: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     """동기 리포지토리 호출을 스레드로 넘겨 이벤트 루프가 막히지 않게 한다.
 
     SQLite 쓰기 락은 최대 SQLITE_TIMEOUT_SECONDS(30초)까지 대기할 수 있다.
     이벤트 루프에서 직접 호출하면 그동안 하트비트가 끊겨 봇 전체가 멈춘다.
     """
-    return await asyncio.to_thread(func, *args, **kwargs)
+    return await asyncio.to_thread(operation, *args, **kwargs)
 
 
 # ─────────── 인터페이스 ─────────── #
@@ -99,16 +99,24 @@ class UsageRepository(ABC):
 
     @abstractmethod
     def consume_ai_usage(
-        self, user_id: int, usage_date: str, command: str, limit: int
+        self,
+        user_id: int,
+        usage_date: str,
+        usage_category: str,
+        daily_limit: int,
     ) -> Optional[int]:
         """인스턴스 전역 일일 사용량을 원자적으로 예약하고 새 count를 반환한다."""
 
     @abstractmethod
-    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+    def release_ai_usage(
+        self, user_id: int, usage_date: str, usage_category: str
+    ) -> bool:
         """예약한 일일 사용량을 0 아래로 내리지 않고 반환한다."""
 
     @abstractmethod
-    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+    def get_ai_usage(
+        self, user_id: int, usage_date: str, usage_category: str
+    ) -> int:
         """인스턴스 전역 일일 사용량을 반환한다."""
 
     @abstractmethod
@@ -204,6 +212,14 @@ class GuildSettingsRepository(ABC):
         """웹 공지 채널을 지정한다. None이면 해제."""
 
     @abstractmethod
+    def get_event_channel(self, guild_id: int) -> Optional[int]:
+        """`/이벤트` 전용 채널 ID. 미설정이면 None."""
+
+    @abstractmethod
+    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """`/이벤트` 전용 채널을 지정한다. None이면 채널 제한 해제."""
+
+    @abstractmethod
     def get_allow_host_announce(self, guild_id: int) -> bool:
         """파티 호스트 공지를 허용하는지 반환한다."""
 
@@ -285,9 +301,9 @@ class SQLiteUsageRepository(UsageRepository):
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
             version = _prepare_schema(conn, self._SCHEMA_VERSION, "usage")
-            c = conn.cursor()
+            cursor = conn.cursor()
             # (guild_id, user_id)가 기본키다. 금지어 카운트는 서버마다 독립이다.
-            c.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
@@ -295,7 +311,7 @@ class SQLiteUsageRepository(UsageRepository):
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
-            c.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS ai_usage (
                     user_id INTEGER NOT NULL,
                     usage_date TEXT NOT NULL,
@@ -315,7 +331,11 @@ class SQLiteUsageRepository(UsageRepository):
             conn.commit()
 
     def consume_ai_usage(
-        self, user_id: int, usage_date: str, command: str, limit: int
+        self,
+        user_id: int,
+        usage_date: str,
+        usage_category: str,
+        daily_limit: int,
     ) -> Optional[int]:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.execute(
@@ -326,29 +346,33 @@ class SQLiteUsageRepository(UsageRepository):
                 WHERE count < ?
                 RETURNING count
                 """,
-                (user_id, usage_date, command, limit),
+                (user_id, usage_date, usage_category, daily_limit),
             )
             row = cursor.fetchone()
             conn.commit()
             return row[0] if row else None
 
-    def release_ai_usage(self, user_id: int, usage_date: str, command: str) -> bool:
+    def release_ai_usage(
+        self, user_id: int, usage_date: str, usage_category: str
+    ) -> bool:
         with closing(_connect(self.db_path)) as conn:
             cursor = conn.execute(
                 "UPDATE ai_usage SET count = count - 1 "
                 "WHERE user_id = ? AND usage_date = ? AND command = ? AND count > 0",
-                (user_id, usage_date, command),
+                (user_id, usage_date, usage_category),
             )
             released = cursor.rowcount > 0
             conn.commit()
             return released
 
-    def get_ai_usage(self, user_id: int, usage_date: str, command: str) -> int:
+    def get_ai_usage(
+        self, user_id: int, usage_date: str, usage_category: str
+    ) -> int:
         with closing(_connect(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT count FROM ai_usage "
                 "WHERE user_id = ? AND usage_date = ? AND command = ?",
-                (user_id, usage_date, command),
+                (user_id, usage_date, usage_category),
             ).fetchone()
             conn.commit()
             return row[0] if row else 0
@@ -382,13 +406,13 @@ class SQLiteUsageRepository(UsageRepository):
 
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
+            cursor = conn.cursor()
+            cursor.execute(
                 "INSERT OR IGNORE INTO users (guild_id, user_id, forbidden_count) "
                 "VALUES (?, ?, 0)",
                 (guild_id, user_id),
             )
-            c.execute(
+            cursor.execute(
                 "UPDATE users SET forbidden_count = forbidden_count + 1 "
                 "WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
@@ -397,18 +421,18 @@ class SQLiteUsageRepository(UsageRepository):
 
     def get_forbidden_count(self, guild_id: int, user_id: int) -> int:
         with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute(
+            cursor = conn.cursor()
+            cursor.execute(
                 "SELECT forbidden_count FROM users WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
             )
-            result = c.fetchone()
-            return result[0] if result else 0
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
             conn.commit()
 
 
@@ -709,15 +733,17 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
     # 컬럼명은 아래 상수에서만 나온다. 외부 입력이 SQL 문자열에 섞이지 않는다.
     _PARTY_CHANNEL = "party_channel_id"
     _ANNOUNCEMENT_CHANNEL = "announcement_channel_id"
+    _EVENT_CHANNEL = "event_channel_id"
     _ALLOW_HOST_ANNOUNCE = "allow_host_announce"
     _FORBIDDEN_FILTER = "forbidden_filter_enabled"
-    _SCHEMA_VERSION = 5
+    _SCHEMA_VERSION = 6
     _CURRENT_COLUMNS = {
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
         _FORBIDDEN_FILTER,
         _ANNOUNCEMENT_CHANNEL,
+        _EVENT_CHANNEL,
     }
     _LEGACY_COLUMNS = {"guild_id", "recruit_channel_id", "event_channel_id"}
     # v2는 음악 컬럼 둘을 더 갖고 있었다. v3는 v4에서 토글만 빠진 모양이다.
@@ -741,12 +767,14 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         _ALLOW_HOST_ANNOUNCE,
         _FORBIDDEN_FILTER,
     }
+    _V5_COLUMNS = _V4_COLUMNS | {_ANNOUNCEMENT_CHANNEL}
     _GUILD_SETTINGS_COLUMN_ORDER = (
         "guild_id",
         _PARTY_CHANNEL,
         _ALLOW_HOST_ANNOUNCE,
         _FORBIDDEN_FILTER,
         _ANNOUNCEMENT_CHANNEL,
+        _EVENT_CHANNEL,
     )
     _PARTY_PANELS_COLUMN_ORDER = ("guild_id", "game", "message_id")
 
@@ -775,10 +803,22 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             columns = {
                 row[1] for row in conn.execute('PRAGMA table_info("guild_settings")')
             }
+            if version < self._SCHEMA_VERSION and columns == self._V5_COLUMNS:
+                with conn:
+                    conn.execute(
+                        "ALTER TABLE guild_settings ADD COLUMN event_channel_id INTEGER"
+                    )
+                    self._create_party_panels_table(conn)
+                    self._require_current_contract(conn)
+                    _set_schema_version(conn, self._SCHEMA_VERSION)
+                return
             if version < self._SCHEMA_VERSION and columns == self._V4_COLUMNS:
                 with conn:
                     conn.execute(
                         "ALTER TABLE guild_settings ADD COLUMN announcement_channel_id INTEGER"
+                    )
+                    conn.execute(
+                        "ALTER TABLE guild_settings ADD COLUMN event_channel_id INTEGER"
                     )
                     self._create_party_panels_table(conn)
                     self._require_current_contract(conn)
@@ -790,8 +830,10 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                     conn,
                     "guild_settings_v1",
                     """
-                    INSERT INTO guild_settings (guild_id, party_channel_id)
-                    SELECT guild_id, recruit_channel_id FROM guild_settings_v1
+                    INSERT INTO guild_settings
+                        (guild_id, party_channel_id, event_channel_id)
+                    SELECT guild_id, recruit_channel_id, event_channel_id
+                    FROM guild_settings_v1
                     """,
                 )
                 return
@@ -879,7 +921,8 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                     CHECK (allow_host_announce IN (0, 1)),
                 forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1
                     CHECK (forbidden_filter_enabled IN (0, 1)),
-                announcement_channel_id INTEGER
+                announcement_channel_id INTEGER,
+                event_channel_id INTEGER
             )
         """)
         SQLiteGuildSettingsRepository._create_party_panels_table(conn)
@@ -926,6 +969,12 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         self, guild_id: int, channel_id: Optional[int]
     ) -> None:
         self._set_column(guild_id, self._ANNOUNCEMENT_CHANNEL, channel_id)
+
+    def get_event_channel(self, guild_id: int) -> Optional[int]:
+        return self._get_column(guild_id, self._EVENT_CHANNEL)
+
+    def set_event_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        self._set_column(guild_id, self._EVENT_CHANNEL, channel_id)
 
     def get_allow_host_announce(self, guild_id: int) -> bool:
         return bool(self._get_column(guild_id, self._ALLOW_HOST_ANNOUNCE))
@@ -984,11 +1033,22 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
                         WHEN party_channel_id = ? THEN NULL ELSE party_channel_id END,
                     announcement_channel_id = CASE
                         WHEN announcement_channel_id = ? THEN NULL
-                        ELSE announcement_channel_id END
+                        ELSE announcement_channel_id END,
+                    event_channel_id = CASE
+                        WHEN event_channel_id = ? THEN NULL ELSE event_channel_id END
                 WHERE guild_id = ?
-                  AND (party_channel_id = ? OR announcement_channel_id = ?)
+                  AND (party_channel_id = ? OR announcement_channel_id = ?
+                       OR event_channel_id = ?)
                 """,
-                (channel_id, channel_id, guild_id, channel_id, channel_id),
+                (
+                    channel_id,
+                    channel_id,
+                    channel_id,
+                    guild_id,
+                    channel_id,
+                    channel_id,
+                    channel_id,
+                ),
             )
             conn.commit()
 

@@ -18,10 +18,10 @@ from module.config import (
 # 실행 커맨드: python -m module.main
 
 # Intents 설정
-intents = discord.Intents.default()
-intents.guild_scheduled_events = True
-intents.message_content = True
-intents.members = True
+BOT_INTENTS = discord.Intents.default()
+BOT_INTENTS.guild_scheduled_events = True
+BOT_INTENTS.message_content = True
+BOT_INTENTS.members = True
 
 # (확장 경로, 그 확장이 요구하는 환경변수 이름들)
 EXTENSIONS = (
@@ -37,7 +37,7 @@ EXTENSIONS = (
     ("module.profile_cog", ()),
 )
 
-ENV_VALUES = {
+OPTIONAL_DEPENDENCY_VALUES = {
     "ADMIN_TOKEN": ADMIN_TOKEN,
     "OPENAI_API_KEY": OPENAI_API_KEY,
     "GOOGLE_API_KEY": GOOGLE_API_KEY,
@@ -50,14 +50,18 @@ def available_extensions() -> list[str]:
     키가 없는 확장은 어차피 동작할 수 없다. 로드해서 런타임에 터지게 두는 것보다
     건너뛰고 로그를 남기는 편이 낫다. 기능 선택 토글이 아니라 의존성 가드다.
     """
-    names = []
-    for extension, required in EXTENSIONS:
-        missing = [key for key in required if not ENV_VALUES.get(key)]
+    available = []
+    for extension, required_environment_variables in EXTENSIONS:
+        missing = [
+            key
+            for key in required_environment_variables
+            if not OPTIONAL_DEPENDENCY_VALUES.get(key)
+        ]
         if missing:
             print(f"⏭️ Skipped: {extension} ({', '.join(missing)} 없음)")
             continue
-        names.append(extension)
-    return names
+        available.append(extension)
+    return available
 
 
 def _verify_databases(
@@ -65,32 +69,32 @@ def _verify_databases(
     allow_legacy: bool = False,
 ) -> None:
     for filename, required_tables in DATABASES.items():
-        path = DATA_DIR / filename
-        if existing_only and not path.exists():
+        database_path = DATA_DIR / filename
+        if existing_only and not database_path.exists():
             continue
         verify_database(
-            path,
+            database_path,
             required_tables,
             source_name=filename,
             allow_legacy=allow_legacy,
         )
 
 
-def acquire_instance_lock(path: Path) -> BinaryIO:
-    lock = path.open("a+b")
+def acquire_instance_lock(lock_path: Path) -> BinaryIO:
+    lock_file = lock_path.open("a+b")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
-        lock.close()
-        raise RuntimeError(f"봇이 이미 실행 중입니다: {path}") from exc
-    return lock
+        lock_file.close()
+        raise RuntimeError(f"봇이 이미 실행 중입니다: {lock_path}") from exc
+    return lock_file
 
 
-class MyBot(commands.Bot):
+class HyacineBot(commands.Bot):
     def __init__(self):
         super().__init__(
             command_prefix="!", # Slash command 위주지만 prefix 설정은 필요함
-            intents=intents,
+            intents=BOT_INTENTS,
             help_command=None,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -109,21 +113,23 @@ class MyBot(commands.Bot):
         print("🔄 Command tree synced globally")
 
     async def close(self):
-        web_admin = self.get_cog("WebAdminCog")
+        web_admin_cog = self.get_cog("WebAdminCog")
         try:
-            if web_admin is not None:
-                await web_admin.close()
+            if web_admin_cog is not None:
+                await web_admin_cog.close()
         finally:
             await super().close()
 
     async def on_ready(self):
         print(f"✅ {self.user} 봇이 실행되었습니다!")
 
-        activity = discord.Game(name="📝 생각나는 아이디어를 끄적이는 중...")
+        presence_activity = discord.Game(name="📝 생각나는 아이디어를 끄적이는 중...")
         # activity = discord.Streaming(name="broadcast_title", url="broadcast_link")
         # activity = discord.Activity(type=discord.ActivityType.watching, name="video_title")
 
-        await self.change_presence(status=discord.Status.online, activity=activity)
+        await self.change_presence(
+            status=discord.Status.online, activity=presence_activity
+        )
         # await client.change_presence(status=discord.Status.idle, activity=activity)
         # await client.change_presence(status=discord.Status.dnd, activity=activity)
         # await client.change_presence(status=discord.Status.invisible, activity=activity)
@@ -134,7 +140,7 @@ def main() -> None:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with acquire_instance_lock(DATA_DIR / ".bot.lock"), \
          pid_file(DATA_DIR / ".bot.pid"):
-        MyBot().run(DISCORD_TOKEN)
+        HyacineBot().run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     main()

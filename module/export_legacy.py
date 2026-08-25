@@ -66,11 +66,14 @@ def _read_table(
 
 
 def _export_database(
-    db_path: Path, requests: tuple[tuple[str, str, tuple[str, ...]], ...]
+    db_path: Path,
+    sections_to_export: tuple[tuple[str, str, tuple[str, ...]], ...],
 ) -> tuple[int | None, dict[str, list[dict] | None]]:
     """스냅숏을 떠서 읽는다. 원본은 읽기 전용으로만 연다."""
     if not db_path.exists():
-        return None, {section: None for section, _, _ in requests}
+        return None, {
+            section: None for section, _, _ in sections_to_export
+        }
 
     with tempfile.TemporaryDirectory(prefix="legacy_export_") as directory:
         snapshot = Path(directory) / db_path.name
@@ -79,21 +82,23 @@ def _export_database(
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             sections = {
                 section: _read_table(conn, table, columns)
-                for section, table, columns in requests
+                for section, table, columns in sections_to_export
             }
     return version, sections
 
 
 def build_export(data_dir: Path | None = None) -> dict:
     """삭제 예정 데이터를 담은 문서를 만든다."""
-    root = Path(data_dir) if data_dir is not None else DATA_DIR
+    source_directory = Path(data_dir) if data_dir is not None else DATA_DIR
     document: dict = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "schema_versions": {},
         "sections": {},
     }
-    for filename, requests in EXPORTS.items():
-        version, sections = _export_database(root / filename, requests)
+    for filename, sections_to_export in EXPORTS.items():
+        version, sections = _export_database(
+            source_directory / filename, sections_to_export
+        )
         document["schema_versions"][filename] = version
         document["sections"].update(sections)
     return document

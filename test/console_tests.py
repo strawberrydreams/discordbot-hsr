@@ -345,7 +345,7 @@ def test_readme_public_distribution_contract():
         "launchd 선택 사항",
         "금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`",
         "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
-        "`Manage Guild` 권한",
+        "`Administrator` 권한",
     )
     check("README 공개 배포 계약", all(term in readme for term in required))
     check(
@@ -1010,7 +1010,7 @@ def test_startup_syncs_commands_globally():
 
     with patch.object(main, "DATA_DIR", data_dir), \
          patch.object(main, "_verify_databases", side_effect=verify):
-        asyncio.run(main.MyBot.setup_hook(FakeBot()))
+        asyncio.run(main.HyacineBot.setup_hook(FakeBot()))
 
     check("전역으로만 sync", [e for e in events if e.startswith("sync")] == ["sync:global"],
           f"({events})")
@@ -1034,8 +1034,8 @@ def test_startup_syncs_commands_globally():
     )
     check(
         "길드 고정 잔재 없음",
-        "copy_global_to" not in inspect.getsource(main.MyBot.setup_hook)
-        and "interaction_check" not in inspect.getsource(main.MyBot.setup_hook),
+        "copy_global_to" not in inspect.getsource(main.HyacineBot.setup_hook)
+        and "interaction_check" not in inspect.getsource(main.HyacineBot.setup_hook),
     )
 
 
@@ -1060,7 +1060,7 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
     with patch.object(pathlib.Path, "exists", return_value=True), \
          patch.object(main, "verify_database", side_effect=fail_verify):
         try:
-            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            asyncio.run(main.HyacineBot.setup_hook(FakeBot()))
             check("사전 DB 검증 실패 전파", False)
         except RuntimeError:
             check("사전 DB 검증 실패 전파", True)
@@ -1093,7 +1093,7 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
 
     with patch.object(main, "DATA_DIR", data_dir):
         try:
-            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            asyncio.run(main.HyacineBot.setup_hook(FakeBot()))
             started = True
         except RuntimeError:
             started = False
@@ -1151,7 +1151,7 @@ def test_startup_cog_failure_stops_postverification_and_sync():
          patch.object(pathlib.Path, "exists", return_value=True), \
          patch.object(main, "verify_database", side_effect=verify):
         try:
-            asyncio.run(main.MyBot.setup_hook(FakeBot()))
+            asyncio.run(main.HyacineBot.setup_hook(FakeBot()))
             check("Cog 로드 실패 전파", False)
         except RuntimeError:
             check("Cog 로드 실패 전파", True)
@@ -1246,7 +1246,7 @@ def test_main_holds_instance_lock_while_bot_runs():
          patch.object(main, "DATA_DIR", data_dir), \
          patch.object(main, "BACKUP_DIR", backup_dir), \
          patch.object(main, "acquire_instance_lock", side_effect=acquire), \
-         patch.object(main, "MyBot", FakeBot), \
+         patch.object(main, "HyacineBot", FakeBot), \
          patch.object(sys, "platform", "darwin"):
         main.main()
 
@@ -1282,7 +1282,7 @@ def test_bot_disables_all_mentions():
     from discord.ext import commands
 
     with patch.object(commands.Bot, "__init__", return_value=None) as init:
-        main.MyBot()
+        main.HyacineBot()
 
     allowed = init.call_args.kwargs["allowed_mentions"]
     check("봇 전역 멘션 차단", allowed.everyone is False and allowed.roles is False and allowed.users is False)
@@ -1419,7 +1419,9 @@ def test_guild_isolation():
     check(
         "DM은 금지어 집계에서 제외",
         "message.guild is None"
-        in inspect.getsource(forbiddenfilter_cog.ForbiddenFilterCog._inspect),
+        in inspect.getsource(
+            forbiddenfilter_cog.ForbiddenFilterCog._inspect_message
+        ),
     )
     check(
         "파티 패널은 길드 밖 상호작용을 거부",
@@ -1434,12 +1436,12 @@ def test_temp_image_lifecycle():
     import module.hyacine_image_cog as hyacine_image_cog
 
     cog = object.__new__(hyacine_image_cog.HyacineImageCog)
-    cog.temp_dir = config.DATA_DIR / "temp_images"
-    cog.temp_dir.mkdir(parents=True, exist_ok=True)
-    check("임시 경로는 DATA_DIR 아래", cog.temp_dir.is_relative_to(config.DATA_DIR))
+    cog.temporary_image_directory = config.DATA_DIR / "temp_images"
+    cog.temporary_image_directory.mkdir(parents=True, exist_ok=True)
+    check("임시 경로는 DATA_DIR 아래", cog.temporary_image_directory.is_relative_to(config.DATA_DIR))
 
-    stale = cog.temp_dir / "stale.png"
-    fresh = cog.temp_dir / "fresh.png"
+    stale = cog.temporary_image_directory / "stale.png"
+    fresh = cog.temporary_image_directory / "fresh.png"
     stale.write_bytes(b"png")
     fresh.write_bytes(b"png")
     old = time.time() - hyacine_image_cog.TEMP_IMAGE_TTL_SECONDS - 60
@@ -1497,7 +1499,7 @@ def test_schema_versions():
 
     check("usage 스키마 버전", _user_version(attendance_path) == 3)
     check("party 스키마 버전", _user_version(party_path) == 2)
-    check("settings 스키마 버전", _user_version(settings_path) == 5)
+    check("settings 스키마 버전", _user_version(settings_path) == 6)
 
     for label, repository in (
         ("attendance", SQLiteUsageRepository),
@@ -1601,7 +1603,7 @@ def test_schema_versions():
         )
 
     for legacy_version in (0, 1):
-        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v5.db"
+        legacy_path = _TMP_DIR / f"settings_v{legacy_version}_to_v6.db"
         with sqlite3.connect(legacy_path) as conn:
             conn.execute(
                 "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, recruit_channel_id INTEGER, event_channel_id INTEGER)"
@@ -1611,7 +1613,8 @@ def test_schema_versions():
         SQLiteGuildSettingsRepository(legacy_path)
         with sqlite3.connect(legacy_path) as conn:
             row = conn.execute(
-                "SELECT party_channel_id, allow_host_announce FROM guild_settings WHERE guild_id = 7"
+                "SELECT party_channel_id, allow_host_announce, event_channel_id "
+                "FROM guild_settings WHERE guild_id = 7"
             ).fetchone()
             forbidden_default = conn.execute(
                 "SELECT forbidden_filter_enabled FROM guild_settings WHERE guild_id = 7"
@@ -1631,7 +1634,10 @@ def test_schema_versions():
                 row[1] for row in sorted(panel_info, key=lambda row: row[5]) if row[5]
             )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        check(f"settings v{legacy_version} recruit 보존", row == (700, 0))
+        check(
+            f"settings v{legacy_version} 채널 보존",
+            row == (700, 0, 701),
+        )
         check(
             f"settings v{legacy_version} 금지어 필터 기본 켜짐",
             forbidden_default == (1,),
@@ -1645,13 +1651,14 @@ def test_schema_versions():
                 "allow_host_announce",
                 "forbidden_filter_enabled",
                 "announcement_channel_id",
+                "event_channel_id",
             )
             and panel_columns == ("guild_id", "game", "message_id")
             and panel_primary_key == ("guild_id", "game"),
         )
-        check(f"settings v{legacy_version} 버전", version == 5)
+        check(f"settings v{legacy_version} 버전", version == 6)
 
-    # v2(음악 컬럼 보유), v3(토글 없음), v4(공지 채널 없음)가 모두 v5로
+    # v2(음악 컬럼 보유), v3(토글 없음), v4(공지 채널 없음), v5(이벤트 채널 없음)가 v6로
     # 올라온다. 기존 토글 값은 그대로여야 한다.
     settings_upgrade_schemas = {
         2: """
@@ -1695,9 +1702,26 @@ def test_schema_versions():
             INSERT INTO guild_settings VALUES (7, 700, 1, 0);
             INSERT INTO party_panels VALUES (7, 'LOL', 900);
         """,
+        5: """
+            CREATE TABLE guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                party_channel_id INTEGER,
+                allow_host_announce INTEGER NOT NULL DEFAULT 0,
+                forbidden_filter_enabled INTEGER NOT NULL DEFAULT 1,
+                announcement_channel_id INTEGER
+            );
+            CREATE TABLE party_panels (
+                guild_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, game)
+            );
+            INSERT INTO guild_settings VALUES (7, 700, 1, 1, 800);
+            INSERT INTO party_panels VALUES (7, 'LOL', 900);
+        """,
     }
     for old_version, schema in settings_upgrade_schemas.items():
-        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v5.db"
+        upgrade_path = _TMP_DIR / f"settings_v{old_version}_to_v6.db"
         with sqlite3.connect(upgrade_path) as conn:
             conn.executescript(schema)
             conn.execute(f"PRAGMA user_version = {old_version}")
@@ -1707,14 +1731,15 @@ def test_schema_versions():
                 row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
             )
         check(
-            f"settings v{old_version}에서 v5로 마이그레이션",
-            _user_version(upgrade_path) == 5
+            f"settings v{old_version}에서 v6로 마이그레이션",
+            _user_version(upgrade_path) == 6
             and columns == (
                 "guild_id",
                 "party_channel_id",
                 "allow_host_announce",
                 "forbidden_filter_enabled",
                 "announcement_channel_id",
+                "event_channel_id",
             ),
             f"({_user_version(upgrade_path)}, {columns})",
         )
@@ -1786,11 +1811,14 @@ def test_schema_versions():
     settings.delete_party_panel(7, "LOL")
     settings.set_party_channel(7, 700)
     settings.set_announcement_channel(7, 701)
+    settings.set_event_channel(7, 702)
     settings.set_allow_host_announce(7, True)
     settings.set_allow_host_announce(8, True)
-    settings.clear_channel(7, 702)
+    settings.clear_channel(7, 703)
     check("party panel upsert/list/delete", panels_after_upsert == {"LOL": 71, "PUBG": 72} and settings.get_party_panels(7) == {"PUBG": 72})
-    check("무관한 채널 삭제는 채널 설정을 건드리지 않음", settings.get_party_channel(7) == 700 and settings.get_announcement_channel(7) == 701)
+    check("무관한 채널 삭제는 채널 설정을 건드리지 않음", settings.get_party_channel(7) == 700 and settings.get_announcement_channel(7) == 701 and settings.get_event_channel(7) == 702)
+    settings.clear_channel(7, 702)
+    check("삭제된 이벤트 채널은 해제", settings.get_event_channel(7) is None)
     settings.clear_channel(7, 701)
     check("삭제된 공지 채널은 해제", settings.get_announcement_channel(7) is None)
     settings.clear_channel(7, 700)
@@ -1918,7 +1946,7 @@ def test_party_cog_uses_epoch_seconds():
 
     repository = RecordingRepository()
     cog = object.__new__(PlayWithCog)
-    cog.db = repository
+    cog.party_repository = repository
     with patch("time.time", return_value=2_000_000_000.75):
         asyncio.run(cog.create_party(_TEST_GUILD, "LOL"))
         asyncio.run(PlayWithCog.cleanup_parties.coro(cog))
@@ -1940,7 +1968,7 @@ def test_persistent_party_panel_contract():
     )
     check(
         "파티 패널 custom_id는 SHA-256 digest 사용",
-        "hashlib.sha256" in source and "_game_key(game)" in source,
+        "hashlib.sha256" in source and "_game_component_key(game)" in source,
     )
     check(
         "파티 패널은 startup/setup/cleanup 복구 경로 제공",
@@ -1975,7 +2003,7 @@ def test_factory():
 def test_cog_facade():
     print("\n[6] UsageCog 파사드 (Repository 주입)")
     raw = SQLiteUsageRepository(_TMP_DIR / "facade_test.db")
-    cog = UsageCog(bot=None, repository=raw)
+    cog = UsageCog(bot=None, usage_repository=raw)
     G = _TEST_GUILD
 
     # 파사드는 모두 async다. 동기 리포지토리를 스레드로 넘겨 이벤트 루프를 지킨다.
@@ -2003,15 +2031,15 @@ def test_channel_sessions():
     print("\n[7] 채널별 대화 세션 분리")
     cog = HyacineChatCog(bot=None)
 
-    s1 = cog.get_session(111)
-    s2 = cog.get_session(222)
+    s1 = cog.get_or_create_session(111)
+    s2 = cog.get_or_create_session(222)
 
     check("두 채널은 서로 다른 세션 객체", s1 is not s2)
-    check("같은 채널은 같은 세션 재사용", cog.get_session(111) is s1)
+    check("같은 채널은 같은 세션 재사용", cog.get_or_create_session(111) is s1)
     # 히스토리 분리
     s1.history.append({"role": "user", "content": "채널 111의 비밀 이야기"})
     s1.history.append({"role": "assistant", "content": "네, 기억할게요"})
-    cog.trim(s1)
+    cog._trim_history(s1)
 
     s2_contents = [m["content"] for m in s2.history if m["role"] != "system"]
     check("채널 111의 대화가 채널 222에 노출되지 않음", len(s2_contents) == 0)
@@ -2023,9 +2051,9 @@ def test_channel_sessions():
 
     lru_cog = HyacineChatCog(bot=None)
     for channel_id in range(lru_cog.MAX_CHANNEL_SESSIONS):
-        lru_cog.get_session(channel_id)
-    lru_cog.get_session(0)
-    lru_cog.get_session(lru_cog.MAX_CHANNEL_SESSIONS)
+        lru_cog.get_or_create_session(channel_id)
+    lru_cog.get_or_create_session(0)
+    lru_cog.get_or_create_session(lru_cog.MAX_CHANNEL_SESSIONS)
     check("채널 세션 수 제한", len(lru_cog.sessions) == lru_cog.MAX_CHANNEL_SESSIONS)
     check("최근 사용 세션 유지", 0 in lru_cog.sessions)
     check("가장 오래된 세션 제거", 1 not in lru_cog.sessions)
@@ -2585,7 +2613,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical settings migrates to the panel contract",
-        settings_version == 5
+        settings_version == 6
         and "party_panels" in settings_tables
         and party_channel == (700,),
     )
@@ -3054,10 +3082,10 @@ def test_backup_same_timestamp_rejected():
     backup.DATA_DIR = _TMP_DIR / "collision_data"
     backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
-    attendance = SQLiteUsageRepository(
+    usage_repository = SQLiteUsageRepository(
         backup.DATA_DIR / "attendance_data.db"
     )
-    attendance.increment_forbidden_count(_TEST_GUILD, 1)
+    usage_repository.increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
@@ -3067,7 +3095,7 @@ def test_backup_same_timestamp_rejected():
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
 
-    attendance.increment_forbidden_count(_TEST_GUILD, 2)
+    usage_repository.increment_forbidden_count(_TEST_GUILD, 2)
     try:
         backup.create_backup_set(fixed)
         check("동일 시각 백업 충돌 거부", False)
@@ -3256,10 +3284,10 @@ def test_legacy_export():
 
     root = _TMP_DIR / "legacy_export_src"
     root.mkdir(parents=True, exist_ok=True)
-    attendance = root / "attendance_data.db"
+    legacy_attendance_database_path = root / "attendance_data.db"
     settings_db = root / "guild_settings.db"
-    _create_legacy_attendance_db(attendance, version=2)
-    with closing(sqlite3.connect(attendance)) as conn:
+    _create_legacy_attendance_db(legacy_attendance_database_path, version=2)
+    with closing(sqlite3.connect(legacy_attendance_database_path)) as conn:
         conn.execute("INSERT INTO users VALUES (7, 99, 1234, '2026-08-17', 3)")
         conn.commit()
     with closing(sqlite3.connect(settings_db)) as conn:
@@ -3275,7 +3303,10 @@ def test_legacy_export():
             PRAGMA user_version = 2;
         """)
 
-    before = (_sha256_file(attendance), _sha256_file(settings_db))
+    before = (
+        _sha256_file(legacy_attendance_database_path),
+        _sha256_file(settings_db),
+    )
     document = export_legacy.build_export(root)
     sections = document["sections"]
 
@@ -3298,7 +3329,11 @@ def test_legacy_export():
     )
     check(
         "export는 원본 DB를 수정하지 않음",
-        before == (_sha256_file(attendance), _sha256_file(settings_db)),
+        before
+        == (
+            _sha256_file(legacy_attendance_database_path),
+            _sha256_file(settings_db),
+        ),
     )
 
     # 이미 마이그레이션이 끝난 DB — 사라진 것은 null, 남은 것은 그대로.

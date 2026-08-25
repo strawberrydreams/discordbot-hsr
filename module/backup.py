@@ -54,37 +54,39 @@ _LEGACY_GUILD_SETTINGS_TABLES = {"guild_settings"}
 
 
 @contextmanager
-def pid_file(path: Path):
+def pid_file(pid_path: Path):
     if sys.platform != "darwin":
         yield
         return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f"{path.name}.lock")
-    temporary_path = path.with_name(f"{path.name}.tmp")
-    with lock_path.open("a+b") as lock:
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = pid_path.with_name(f"{pid_path.name}.lock")
+    temporary_path = pid_path.with_name(f"{pid_path.name}.tmp")
+    with lock_path.open("a+b") as lock_file:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError(f"PID 파일이 이미 사용 중입니다: {path}") from exc
+            raise RuntimeError(
+                f"PID 파일이 이미 사용 중입니다: {pid_path}"
+            ) from exc
 
         try:
             with temporary_path.open("w", encoding="ascii") as temporary:
                 temporary.write(f"{os.getpid()}\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
-            os.replace(temporary_path, path)
+            os.replace(temporary_path, pid_path)
             try:
                 yield
             finally:
-                path.unlink(missing_ok=True)
+                pid_path.unlink(missing_ok=True)
         finally:
             temporary_path.unlink(missing_ok=True)
 
 
-def _require_positive(name: str, value: int) -> None:
-    if value <= 0:
-        raise RuntimeError(f"{name}는 양의 정수여야 합니다.")
+def _require_positive(config_name: str, configured_value: int) -> None:
+    if configured_value <= 0:
+        raise RuntimeError(f"{config_name}는 양의 정수여야 합니다.")
 
 
 def _validate_backup_settings() -> None:
@@ -93,59 +95,68 @@ def _validate_backup_settings() -> None:
 
 
 def verify_database(
-    path: Path,
+    database_path: Path,
     required_tables: set[str],
     *,
     source_name: str,
     allow_legacy: bool = False,
 ) -> dict[str, int]:
-    if not path.is_file():
-        raise RuntimeError(f"DB 파일이 없습니다: {path}")
+    if not database_path.is_file():
+        raise RuntimeError(f"DB 파일이 없습니다: {database_path}")
     try:
-        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
-            result = conn.execute("PRAGMA integrity_check").fetchone()
-            if result != ("ok",):
-                raise RuntimeError(f"SQLite 무결성 검사 실패: {path}")
-            current_version = _CURRENT_SCHEMA_VERSIONS[source_name]
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > current_version:
+        with closing(
+            sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+                timeout=SQLITE_TIMEOUT_SECONDS,
+            )
+        ) as conn:
+            integrity_result = conn.execute("PRAGMA integrity_check").fetchone()
+            if integrity_result != ("ok",):
                 raise RuntimeError(
-                    f"{source_name} DB 버전 {version}은 지원 버전 "
-                    f"{current_version}보다 높습니다."
+                    f"SQLite 무결성 검사 실패: {database_path}"
                 )
-            if version < current_version and not allow_legacy:
+            supported_version = _CURRENT_SCHEMA_VERSIONS[source_name]
+            schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if schema_version > supported_version:
                 raise RuntimeError(
-                    f"{source_name} DB 버전 {version}은 현재 버전 "
-                    f"{current_version}이 아닙니다."
+                    f"{source_name} DB 버전 {schema_version}은 지원 버전 "
+                    f"{supported_version}보다 높습니다."
+                )
+            if schema_version < supported_version and not allow_legacy:
+                raise RuntimeError(
+                    f"{source_name} DB 버전 {schema_version}은 현재 버전 "
+                    f"{supported_version}이 아닙니다."
                 )
             if (
                 allow_legacy
                 and source_name == "attendance_data.db"
-                and version in (0, 1)
+                and schema_version in (0, 1)
             ):
                 required_tables = _LEGACY_ATTENDANCE_TABLES
             if (
                 allow_legacy
                 and source_name == "guild_settings.db"
-                and version in (0, 1)
+                and schema_version in (0, 1)
             ):
                 required_tables = _LEGACY_GUILD_SETTINGS_TABLES
             if (
                 allow_legacy
                 and source_name == "party_data.db"
-                and version in (0, 1)
+                and schema_version in (0, 1)
             ):
                 required_tables = _LEGACY_PARTY_TABLES
-            tables = {
+            table_names = {
                 row[0]
                 for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            missing = required_tables - tables
-            if missing:
+            missing_tables = required_tables - table_names
+            if missing_tables:
                 raise RuntimeError(
-                    f"필수 테이블이 없습니다: {', '.join(sorted(missing))}"
+                    "필수 테이블이 없습니다: "
+                    f"{', '.join(sorted(missing_tables))}"
                 )
             return {
                 table: conn.execute(
@@ -154,7 +165,9 @@ def verify_database(
                 for table in sorted(required_tables)
             }
     except sqlite3.DatabaseError as exc:
-        raise RuntimeError(f"SQLite 파일을 읽을 수 없습니다: {path}") from exc
+        raise RuntimeError(
+            f"SQLite 파일을 읽을 수 없습니다: {database_path}"
+        ) from exc
 
 
 def _sha256(path: Path) -> str:
@@ -227,14 +240,14 @@ def _copy_staged_setting(source: Path, name: str, directory_descriptor: int) -> 
         shutil.copyfileobj(input_file, output_file)
 
 
-def _utc(now: datetime | None) -> datetime:
-    value = now or datetime.now(timezone.utc)
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+def _as_utc(now: datetime | None) -> datetime:
+    timestamp = now or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
-def _temporary_path(prefix: str) -> Path:
+def _create_temporary_path(prefix: str) -> Path:
     descriptor, name = tempfile.mkstemp(
         dir=BACKUP_DIR,
         prefix=f".{prefix}-",
@@ -279,7 +292,7 @@ def create_backup_set(now: datetime | None = None) -> Path:
 
 
 def _create_backup_set(now: datetime | None) -> Path:
-    created_at = _utc(now)
+    created_at = _as_utc(now)
     timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
     destinations = [
         *(BACKUP_DIR / f"{timestamp}-{source}" for source in DATABASES),
@@ -297,7 +310,7 @@ def _create_backup_set(now: datetime | None) -> Path:
         for source_name, required_tables in DATABASES.items():
             source = DATA_DIR / source_name
             final = BACKUP_DIR / f"{timestamp}-{source_name}"
-            temporary = _temporary_path(f"{timestamp}-{source_name}")
+            temporary = _create_temporary_path(f"{timestamp}-{source_name}")
             temporary_paths.append(temporary)
             _backup_one(source, temporary)
             counts = verify_database(
@@ -310,7 +323,9 @@ def _create_backup_set(now: datetime | None) -> Path:
         for source_name in SETTINGS_FILES:
             source = SETTINGS_DIR / source_name
             final = BACKUP_DIR / f"{timestamp}-setting-{source_name}"
-            temporary = _temporary_path(f"{timestamp}-setting-{source_name}")
+            temporary = _create_temporary_path(
+                f"{timestamp}-setting-{source_name}"
+            )
             temporary_paths.append(temporary)
             if not _copy_setting(source, temporary):
                 continue
@@ -348,7 +363,9 @@ def _create_backup_set(now: datetime | None) -> Path:
                 for _, final, source_name in pending_settings
             ],
         }
-        manifest_temporary = _temporary_path(f"{timestamp}-manifest.json")
+        manifest_temporary = _create_temporary_path(
+            f"{timestamp}-manifest.json"
+        )
         temporary_paths.append(manifest_temporary)
         with manifest_temporary.open("w", encoding="utf-8") as fp:
             json.dump(manifest, fp, ensure_ascii=False, indent=2)
@@ -382,21 +399,23 @@ def _create_backup_set(now: datetime | None) -> Path:
 def _load_manifest(manifest_path: Path) -> dict:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        items = manifest["databases"]
-        settings = manifest.get("settings", [])
+        database_entries = manifest["databases"]
+        setting_entries = manifest.get("settings", [])
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RuntimeError(f"백업 manifest를 읽을 수 없습니다: {manifest_path}") from exc
 
-    if not isinstance(items, list) or not isinstance(settings, list):
+    if not isinstance(database_entries, list) or not isinstance(
+        setting_entries, list
+    ):
         raise RuntimeError(f"잘못된 백업 manifest입니다: {manifest_path}")
 
     sources: set[str] = set()
     backups: set[str] = set()
-    for item in items:
-        if not isinstance(item, dict):
+    for database_entry in database_entries:
+        if not isinstance(database_entry, dict):
             raise RuntimeError(f"잘못된 백업 manifest입니다: {manifest_path}")
-        source = item.get("source")
-        backup = item.get("backup")
+        source = database_entry.get("source")
+        backup = database_entry.get("backup")
         if (
             not isinstance(source, str)
             or source not in DATABASES
@@ -416,11 +435,11 @@ def _load_manifest(manifest_path: Path) -> dict:
         raise RuntimeError(f"완전하지 않은 백업 manifest입니다: {manifest_path}")
     timestamp = manifest_path.name.removesuffix("-manifest.json")
     setting_sources: set[str] = set()
-    for item in settings:
-        if not isinstance(item, dict):
+    for setting_entry in setting_entries:
+        if not isinstance(setting_entry, dict):
             raise RuntimeError(f"잘못된 백업 manifest입니다: {manifest_path}")
-        source = item.get("source")
-        backup = item.get("backup")
+        source = setting_entry.get("source")
+        backup = setting_entry.get("backup")
         if (
             not isinstance(source, str)
             or source not in SETTINGS_FILES
@@ -437,7 +456,7 @@ def _load_manifest(manifest_path: Path) -> dict:
             raise RuntimeError(f"잘못된 백업 파일 경로입니다: {backup}")
         setting_sources.add(source)
         backups.add(backup)
-    manifest["settings"] = settings
+    manifest["settings"] = setting_entries
     return manifest
 
 
@@ -446,17 +465,17 @@ def verify_backup_set(manifest_path: Path) -> dict[str, dict[str, int]]:
     manifest = _load_manifest(manifest_path)
     verified: dict[str, dict[str, int]] = {}
 
-    for item in manifest["databases"]:
-        source_name = item["source"]
-        backup = manifest_path.parent / item["backup"]
+    for database_entry in manifest["databases"]:
+        source_name = database_entry["source"]
+        backup = manifest_path.parent / database_entry["backup"]
         try:
             size = backup.stat().st_size
             checksum = _sha256(backup)
         except OSError as exc:
             raise RuntimeError(f"백업 파일을 읽을 수 없습니다: {backup}") from exc
-        if size != item.get("size"):
+        if size != database_entry.get("size"):
             raise RuntimeError(f"백업 파일 크기가 일치하지 않습니다: {backup}")
-        if checksum != item.get("sha256"):
+        if checksum != database_entry.get("sha256"):
             raise RuntimeError(f"백업 체크섬이 일치하지 않습니다: {backup}")
         counts = verify_database(
             backup,
@@ -464,20 +483,20 @@ def verify_backup_set(manifest_path: Path) -> dict[str, dict[str, int]]:
             source_name=source_name,
             allow_legacy=True,
         )
-        if counts != item.get("tables"):
+        if counts != database_entry.get("tables"):
             raise RuntimeError(f"백업 테이블 정보가 일치하지 않습니다: {backup}")
         verified[source_name] = counts
 
-    for item in manifest["settings"]:
-        backup = manifest_path.parent / item["backup"]
+    for setting_entry in manifest["settings"]:
+        backup = manifest_path.parent / setting_entry["backup"]
         try:
             size = backup.stat().st_size
             checksum = _sha256(backup)
         except OSError as exc:
             raise RuntimeError(f"백업 파일을 읽을 수 없습니다: {backup}") from exc
-        if size != item.get("size"):
+        if size != setting_entry.get("size"):
             raise RuntimeError(f"백업 파일 크기가 일치하지 않습니다: {backup}")
-        if checksum != item.get("sha256"):
+        if checksum != setting_entry.get("sha256"):
             raise RuntimeError(f"백업 체크섬이 일치하지 않습니다: {backup}")
 
     return verified
@@ -488,9 +507,13 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
     manifest = _load_manifest(manifest_path)
     verify_backup_set(manifest_path)
     stage = Path(stage)
-    destinations = [stage / item["source"] for item in manifest["databases"]]
+    destinations = [
+        stage / database_entry["source"]
+        for database_entry in manifest["databases"]
+    ]
     setting_destinations = [
-        stage / "settings" / item["source"] for item in manifest["settings"]
+        stage / "settings" / setting_entry["source"]
+        for setting_entry in manifest["settings"]
     ]
     settings_stage = stage / "settings"
     if setting_destinations and (
@@ -508,9 +531,11 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
         settings_stage.mkdir(parents=True, exist_ok=True)
         settings_descriptor = _open_settings_stage(settings_stage)
     try:
-        for item, restored in zip(manifest["databases"], destinations):
-            source_name = item["source"]
-            source = manifest_path.parent / item["backup"]
+        for database_entry, restored in zip(
+            manifest["databases"], destinations
+        ):
+            source_name = database_entry["source"]
+            source = manifest_path.parent / database_entry["backup"]
             shutil.copy2(source, restored)
             _SQLITE_REPOSITORIES[source_name](restored)
             verify_database(
@@ -519,10 +544,10 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
                 source_name=source_name,
             )
         if settings_descriptor is not None:
-            for item in manifest["settings"]:
+            for setting_entry in manifest["settings"]:
                 _copy_staged_setting(
-                    manifest_path.parent / item["backup"],
-                    item["source"],
+                    manifest_path.parent / setting_entry["backup"],
+                    setting_entry["source"],
                     settings_descriptor,
                 )
     finally:
@@ -531,8 +556,8 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
 
 
 def restore_test(manifest_path: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="hsr_restore_") as temp_dir:
-        stage_restore(manifest_path, Path(temp_dir))
+    with tempfile.TemporaryDirectory(prefix="hsr_restore_") as temporary_directory:
+        stage_restore(manifest_path, Path(temporary_directory))
 
 
 def _under_data_dir(path: Path) -> bool:
@@ -545,8 +570,8 @@ def _under_data_dir(path: Path) -> bool:
 
 def prune_backups(now: datetime | None = None) -> int:
     _require_positive("BACKUP_RETENTION_DAYS", BACKUP_RETENTION_DAYS)
-    cutoff = _utc(now) - timedelta(days=BACKUP_RETENTION_DAYS)
-    deleted = 0
+    retention_cutoff = _as_utc(now) - timedelta(days=BACKUP_RETENTION_DAYS)
+    deleted_set_count = 0
 
     for manifest_path in BACKUP_DIR.glob("*-manifest.json"):
         timestamp = manifest_path.name.removesuffix("-manifest.json")
@@ -557,27 +582,29 @@ def prune_backups(now: datetime | None = None) -> int:
             ).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        if created_at >= cutoff:
+        if created_at >= retention_cutoff:
             continue
 
         try:
             manifest = _load_manifest(manifest_path)
             if any(
-                item["backup"] != f"{timestamp}-{item['source']}"
-                for item in manifest["databases"]
+                database_entry["backup"]
+                != f"{timestamp}-{database_entry['source']}"
+                for database_entry in manifest["databases"]
             ) or any(
-                item["backup"] != f"{timestamp}-setting-{item['source']}"
-                for item in manifest["settings"]
+                setting_entry["backup"]
+                != f"{timestamp}-setting-{setting_entry['source']}"
+                for setting_entry in manifest["settings"]
             ):
                 continue
             verify_backup_set(manifest_path)
             files = [
-                manifest_path.parent / item["backup"]
-                for item in manifest["databases"]
+                manifest_path.parent / database_entry["backup"]
+                for database_entry in manifest["databases"]
             ]
             files.extend(
-                manifest_path.parent / item["backup"]
-                for item in manifest["settings"]
+                manifest_path.parent / setting_entry["backup"]
+                for setting_entry in manifest["settings"]
             )
         except RuntimeError:
             continue
@@ -587,9 +614,9 @@ def prune_backups(now: datetime | None = None) -> int:
         for path in files:
             path.unlink()
         manifest_path.unlink()
-        deleted += 1
+        deleted_set_count += 1
 
-    return deleted
+    return deleted_set_count
 
 
 def latest_manifest() -> Path:

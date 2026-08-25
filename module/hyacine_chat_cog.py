@@ -30,48 +30,59 @@ PERSONA_FIELD_LIMITS = {
     "system_prompt": SYSTEM_PROMPT_MAX_CHARS,
     "greeting": GREETING_MAX_CHARS,
 }
+MAX_LIGHT_RESPONSE_TOKENS = 2_000
+MAX_DEEP_RESPONSE_TOKENS = 16_000
 logger = logging.getLogger(__name__)
 
 
 def _is_insufficient_quota(exc: Exception) -> bool:
     if not isinstance(exc, openai.RateLimitError):
         return False
-    values = {getattr(exc, "code", None), getattr(exc, "type", None)}
+    error_codes = {getattr(exc, "code", None), getattr(exc, "type", None)}
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         error = body.get("error", body)
         if isinstance(error, dict):
-            values.update((error.get("code"), error.get("type")))
-    return bool({"credit_balance_exhausted", "insufficient_quota"} & values)
+            error_codes.update((error.get("code"), error.get("type")))
+    return bool(
+        {"credit_balance_exhausted", "insufficient_quota"} & error_codes
+    )
 
 
-def canonicalize_persona(data: object, *, strict: bool = False) -> dict:
-    if not isinstance(data, dict):
+def canonicalize_persona(document: object, *, strict: bool = False) -> dict:
+    if not isinstance(document, dict):
         if strict:
             raise ValueError("persona.json 최상단은 객체여야 합니다.")
-        data = {}
+        document = {}
     accepted = {}
-    for key, value in data.items():
-        limit = PERSONA_FIELD_LIMITS.get(key)
-        valid = isinstance(value, str) and bool(value) and (
-            limit is None or len(value) <= limit
+    for field_name, field_value in document.items():
+        field_limit = PERSONA_FIELD_LIMITS.get(field_name)
+        valid = isinstance(field_value, str) and bool(field_value) and (
+            field_limit is None or len(field_value) <= field_limit
         )
         if not valid:
             message = "persona.json 값은 비어 있지 않은 문자열이어야 합니다."
-            if limit is not None and isinstance(value, str) and len(value) > limit:
-                message = f"persona.json의 {key}는 {limit:,}자 이하여야 합니다."
+            if (
+                field_limit is not None
+                and isinstance(field_value, str)
+                and len(field_value) > field_limit
+            ):
+                message = (
+                    f"persona.json의 {field_name}는 "
+                    f"{field_limit:,}자 이하여야 합니다."
+                )
             if strict:
                 raise ValueError(message)
             print(f"⚠️ {message} 기본값을 씁니다.")
             continue
-        accepted[key] = value
+        accepted[field_name] = field_value
     return {**DEFAULT_PERSONA, **accepted}
 
 
 def load_persona() -> dict:
     """settings/persona.json → persona.example.json → 코드 기본값 순으로 읽는다."""
-    data = load_settings_json("persona.json", "persona.example.json", default={})
-    return canonicalize_persona(data)
+    document = load_settings_json("persona.json", "persona.example.json", default={})
+    return canonicalize_persona(document)
 
 
 class ChannelSession:
@@ -96,15 +107,12 @@ class HyacineChatCog(commands.Cog):
         self.bot = bot
         self.client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-        self.MAX_ASSISTANT_LIGHT = 2_000
-        self.MAX_ASSISTANT_DEEP = 16_000
-
         self.system_prompt = load_persona()["system_prompt"]
 
         # 채널 ID -> ChannelSession (채널별 대화 기억 슬롯)
         self.sessions: OrderedDict[int, ChannelSession] = OrderedDict()
 
-    def get_session(self, channel_id: int) -> ChannelSession:
+    def get_or_create_session(self, channel_id: int) -> ChannelSession:
         """채널의 세션을 가져오거나 새로 만든다."""
         session = self.sessions.pop(channel_id, None)
         if session is None:
@@ -121,21 +129,33 @@ class HyacineChatCog(commands.Cog):
                 break  # 전부 사용 중이면 이번 사이클은 축출하지 않음
         return session
 
-    def trim(self, session: ChannelSession):
+    def _trim_history(self, session: ChannelSession):
         # system 제외하고 최근 10개(5턴)까지 유지
-        non_system = [m for m in session.history if m["role"] != "system"]
-        system_msgs = [m for m in session.history if m["role"] == "system"]
-        keep = non_system[-10:]
+        conversation_messages = [
+            message for message in session.history if message["role"] != "system"
+        ]
+        system_messages = [
+            message for message in session.history if message["role"] == "system"
+        ]
+        retained_messages = conversation_messages[-10:]
         session.history.clear()
-        for m in system_msgs + keep:
-            session.history.append(m)
+        for message in system_messages + retained_messages:
+            session.history.append(message)
 
-    def build_user_parts(self, text: Optional[str], image_att: Optional[discord.Attachment]) -> List[Dict[str, Any]]:
+    def _build_user_content(
+        self,
+        text: Optional[str],
+        image_attachment: Optional[discord.Attachment],
+    ) -> List[Dict[str, Any]]:
         parts: List[Dict[str, Any]] = []
         if text and text.strip():
             parts.append({"type": "input_text", "text": text.strip()})
-        if image_att and (image_att.content_type or "").startswith("image/"):
-            parts.append({"type": "input_image", "image_url": image_att.url})
+        if image_attachment and (image_attachment.content_type or "").startswith(
+            "image/"
+        ):
+            parts.append(
+                {"type": "input_image", "image_url": image_attachment.url}
+            )
         if not parts:
             parts.append({"type": "input_text", "text": "(빈 입력)"})
         return parts
@@ -176,36 +196,40 @@ class HyacineChatCog(commands.Cog):
             chunks.append(prefix + raw + suffix)
         return chunks
 
-    async def send_chunked_followup(self, inter: discord.Interaction, text: str):
+    async def _send_chunked_followup(
+        self, interaction: discord.Interaction, text: str
+    ):
         parts = self._split_for_discord(text)
-        for p in parts:
-            if not p.strip():
+        for part in parts:
+            if not part.strip():
                 continue
-            await inter.followup.send(p)
+            await interaction.followup.send(part)
 
-    async def _run_talk(
+    async def _run_chat(
         self,
-        inter: discord.Interaction,
+        interaction: discord.Interaction,
         내용: str,
         이미지: Optional[discord.Attachment],
         model: str,
         reasoning_effort: str,
-        usage_command: str,
+        usage_category: str,
         daily_limit: int,
     ):
-        session = self.get_session(inter.channel_id)
+        session = self.get_or_create_session(interaction.channel_id)
         usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
         api_started = False
 
         if not usage_cog:
-            await inter.response.send_message("❌ 사용량 모듈 오류.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 사용량 모듈 오류.", ephemeral=True
+            )
             return
 
         reservation = await usage_cog.reserve_ai_usage(
-            inter.user.id, usage_command, daily_limit
+            interaction.user.id, usage_category, daily_limit
         )
         if reservation is None:
-            await inter.response.send_message(
+            await interaction.response.send_message(
                 "오늘 사용 횟수를 모두 사용했어요.", ephemeral=True
             )
             return
@@ -215,28 +239,36 @@ class HyacineChatCog(commands.Cog):
             if not api_started:
                 try:
                     await usage_cog.release_ai_usage(
-                        inter.user.id, usage_date, usage_command
+                        interaction.user.id, usage_date, usage_category
                     )
                 except Exception:
                     print(
                         "❌ [hyacine_chat] 일일 사용량 반환 실패 "
-                        f"(user={inter.user.id}, command={usage_command})"
+                        f"(user={interaction.user.id}, command={usage_category})"
                     )
                     traceback.print_exc()
 
         try:
-            await inter.response.defer()
+            await interaction.response.defer()
 
-            parts = self.build_user_parts(내용, 이미지)
+            parts = self._build_user_content(내용, 이미지)
 
             # defer()는 락 밖에 둬서 대기 중에도 인터랙션이 만료되지 않게 한다.
             async with session.lock:
-                self.trim(session)
+                self._trim_history(session)
 
                 # 최근 10개 메시지 (5턴) 사용
-                recent_turns = [m for m in list(session.history) if m["role"] != "system"][-10:]
+                recent_turns = [
+                    message
+                    for message in session.history
+                    if message["role"] != "system"
+                ][-10:]
 
-                max_tokens = self.MAX_ASSISTANT_DEEP if model == DEEP_MODEL else self.MAX_ASSISTANT_LIGHT
+                max_tokens = (
+                    MAX_DEEP_RESPONSE_TOKENS
+                    if model == DEEP_MODEL
+                    else MAX_LIGHT_RESPONSE_TOKENS
+                )
 
                 kwargs = {
                     "model": model,
@@ -249,21 +281,21 @@ class HyacineChatCog(commands.Cog):
                 # ponytail: API 호출이 시작되면 실패해도 일일 한도를 소비한다.
                 # provider 사용량 대조가 필요해질 때 request ID 원장을 추가한다.
                 api_started = True
-                resp = await self.client.responses.create(**kwargs)
+                response = await self.client.responses.create(**kwargs)
 
-                reply = (resp.output_text or "").strip()
+                reply = (response.output_text or "").strip()
 
                 if not reply.strip():
-                    await inter.followup.send(
+                    await interaction.followup.send(
                         "⚠️ 모델 응답이 비어 있어서 디스코드로 전송하지 않았어요. 콘솔 로그를 확인해 주세요."
                     )
                     return
 
                 session.last_usage = {
-                    "model": resp.model,
-                    "input_tokens": resp.usage.input_tokens,
-                    "output_tokens": resp.usage.output_tokens,
-                    "total_tokens": resp.usage.total_tokens
+                    "model": response.model,
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "total_tokens": response.usage.total_tokens
                 }
 
                 history_parts = [
@@ -272,10 +304,10 @@ class HyacineChatCog(commands.Cog):
                 if not history_parts:
                     history_parts = [{"type": "input_text", "text": "(이전 턴에 이미지 첨부됨)"}]
 
-                await self.send_chunked_followup(
-                    inter, f"**{inter.user.mention}**: {내용}"
+                await self._send_chunked_followup(
+                    interaction, f"**{interaction.user.mention}**: {내용}"
                 )
-                await self.send_chunked_followup(inter, reply)
+                await self._send_chunked_followup(interaction, reply)
 
                 # 사용자가 실제로 받은 턴만 다음 provider 입력에 포함한다.
                 session.history.append({"role": "user", "content": history_parts})
@@ -288,18 +320,17 @@ class HyacineChatCog(commands.Cog):
                     "[hyacine_chat] OpenAI API credit exhausted "
                     "(model=%s, channel=%s)",
                     model,
-                    inter.channel_id,
+                    interaction.channel_id,
                 )
                 error_message = (
                     "💳 OpenAI API 크레딧이 소진되어 텍스트 대화를 사용할 수 "
-                    "없어요. 운영자가 크레딧을 충전한 뒤 다시 시도해 주세요. "
-                    "`/이미지`는 별도 Gemini API를 사용하므로 계속 이용할 수 있어요."
+                    "없어요. 운영자가 크레딧을 충전한 뒤 다시 시도해 주세요."
                 )
             else:
                 # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
                 print(
                     f"❌ [hyacine_chat] '{model}' 호출 실패 "
-                    f"(channel={inter.channel_id})"
+                    f"(channel={interaction.channel_id})"
                 )
                 traceback.print_exc()
             if isinstance(exc, openai.RateLimitError) and not quota_exhausted:
@@ -307,24 +338,27 @@ class HyacineChatCog(commands.Cog):
             elif not quota_exhausted:
                 error_message = "❌ 응답 생성에 실패했어요. 잠시 후 다시 시도해 주세요."
             try:
-                if inter.response.is_done():
-                    await inter.followup.send(error_message)
+                if interaction.response.is_done():
+                    await interaction.followup.send(error_message)
                 else:
-                    await inter.response.send_message(error_message)
+                    await interaction.response.send_message(error_message)
             except Exception:
-                print(f"❌ [hyacine_chat] 오류 메시지 전송 실패 (channel={inter.channel_id})")
+                print(
+                    "❌ [hyacine_chat] 오류 메시지 전송 실패 "
+                    f"(channel={interaction.channel_id})"
+                )
                 traceback.print_exc()
         finally:
             await release_usage()
 
     async def cog_app_command_error(
         self,
-        inter: discord.Interaction,
+        interaction: discord.Interaction,
         error: app_commands.AppCommandError,
     ):
         # 쿨다운은 콜백 진입 전에 걸리므로 일일 한도는 아직 예약되지 않았다.
         if isinstance(error, app_commands.CommandOnCooldown):
-            await inter.response.send_message(
+            await interaction.response.send_message(
                 f"⏳ 조금만 쉬어 가요~ {error.retry_after:.0f}초 뒤에 다시 불러 주세요.",
                 ephemeral=True,
             )
@@ -333,58 +367,74 @@ class HyacineChatCog(commands.Cog):
 
     @app_commands.command(name="기본대화", description="AI와 빠르게 대화합니다.")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
-    @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
-    async def _light_talk(
+    @app_commands.checks.cooldown(
+        1, AI_COOLDOWN_SECONDS, key=lambda interaction: interaction.user.id
+    )
+    async def _light_chat(
         self,
-        inter: discord.Interaction,
+        interaction: discord.Interaction,
         내용: str,
         이미지: Optional[discord.Attachment] = None,
     ):
-        await self._run_talk(
-            inter, 내용, 이미지, LIGHT_MODEL, "none", "light", LIMIT_LIGHT
+        await self._run_chat(
+            interaction, 내용, 이미지, LIGHT_MODEL, "none", "light", LIMIT_LIGHT
         )
 
     @app_commands.command(name="고급대화", description="AI와 깊이 대화합니다.")
     @app_commands.describe(내용="메시지", 이미지="(선택) 이미지")
-    @app_commands.checks.cooldown(1, AI_COOLDOWN_SECONDS, key=lambda i: i.user.id)
-    async def _deep_talk(
+    @app_commands.checks.cooldown(
+        1, AI_COOLDOWN_SECONDS, key=lambda interaction: interaction.user.id
+    )
+    async def _deep_chat(
         self,
-        inter: discord.Interaction,
+        interaction: discord.Interaction,
         내용: str,
         이미지: Optional[discord.Attachment] = None,
     ):
-        await self._run_talk(
-            inter, 내용, 이미지, DEEP_MODEL, "medium", "deep", LIMIT_DEEP
+        await self._run_chat(
+            interaction, 내용, 이미지, DEEP_MODEL, "medium", "deep", LIMIT_DEEP
         )
 
     @app_commands.command(name="상태", description="이 채널의 현재 상태 확인")
-    async def _status(self, inter: discord.Interaction):
-        session = self.get_session(inter.channel_id)
+    async def _status(self, interaction: discord.Interaction):
+        session = self.get_or_create_session(interaction.channel_id)
         usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
-        msg = (
+        status_message = (
             "- **대화 명령**\n"
             f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`)\n"
             f"- `/고급대화`: `{DEEP_MODEL}` (Reasoning: `medium`)\n"
         )
         if usage_cog:
-            light = max(0, LIMIT_LIGHT - await usage_cog.get_ai_usage(inter.user.id, "light"))
-            deep = max(0, LIMIT_DEEP - await usage_cog.get_ai_usage(inter.user.id, "deep"))
-            image = max(0, LIMIT_IMAGE - await usage_cog.get_ai_usage(inter.user.id, "image"))
-            msg += (
+            light = max(
+                0,
+                LIMIT_LIGHT
+                - await usage_cog.get_ai_usage(interaction.user.id, "light"),
+            )
+            deep = max(
+                0,
+                LIMIT_DEEP
+                - await usage_cog.get_ai_usage(interaction.user.id, "deep"),
+            )
+            image = max(
+                0,
+                LIMIT_IMAGE
+                - await usage_cog.get_ai_usage(interaction.user.id, "image"),
+            )
+            status_message += (
                 " \n- **오늘 남은 횟수 (KST · 사용자별 · 봇 인스턴스 전체)**\n"
                 f"- `/기본대화`: {light}/{LIMIT_LIGHT}회\n"
                 f"- `/고급대화`: {deep}/{LIMIT_DEEP}회\n"
                 f"- `/이미지`: {image}/{LIMIT_IMAGE}회\n"
             )
         else:
-            msg += " \n- **오늘 남은 횟수 (KST)**: 확인할 수 없어요.\n"
+            status_message += " \n- **오늘 남은 횟수 (KST)**: 확인할 수 없어요.\n"
         if session.last_usage:
-            msg += (
+            status_message += (
                 " \n"
                 f"- **직전 사용 모델**: `{session.last_usage.get('model')}`\n"
                 f"직전 토큰: {session.last_usage.get('total_tokens')}\n"
             )
-        await inter.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(status_message, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HyacineChatCog(bot))
