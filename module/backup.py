@@ -9,10 +9,9 @@ import os
 import shutil
 import sqlite3
 import stat
-import sys
 import tempfile
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,37 +52,6 @@ _CURRENT_SCHEMA_VERSIONS = {
 _LEGACY_ATTENDANCE_TABLES = {"users", "point_ledger"}
 _LEGACY_PARTY_TABLES = {"parties", "participants"}
 _LEGACY_GUILD_SETTINGS_TABLES = {"guild_settings"}
-
-
-@contextmanager
-def pid_file(pid_path: Path):
-    if sys.platform != "darwin":
-        yield
-        return
-
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = pid_path.with_name(f"{pid_path.name}.lock")
-    temporary_path = pid_path.with_name(f"{pid_path.name}.tmp")
-    with lock_path.open("a+b") as lock_file:
-        try:
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                f"PID 파일이 이미 사용 중입니다: {pid_path}"
-            ) from exc
-
-        try:
-            with temporary_path.open("w", encoding="ascii") as temporary:
-                temporary.write(f"{os.getpid()}\n")
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_path, pid_path)
-            try:
-                yield
-            finally:
-                pid_path.unlink(missing_ok=True)
-        finally:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _require_positive(config_name: str, configured_value: int) -> None:
@@ -654,15 +622,14 @@ def main() -> int:
         return 0
 
     _validate_backup_settings()
-    with pid_file(BACKUP_DIR / ".backup.pid"):
-        while True:
-            try:
-                print(create_backup_set())
-            except Exception as exc:
-                print(f"백업 실패: {exc}", flush=True)
-                time.sleep(min(60, BACKUP_INTERVAL_SECONDS))
-                continue
-            time.sleep(BACKUP_INTERVAL_SECONDS)
+    while True:
+        try:
+            print(create_backup_set())
+        except Exception as exc:
+            print(f"백업 실패: {exc}", flush=True)
+            time.sleep(min(60, BACKUP_INTERVAL_SECONDS))
+            continue
+        time.sleep(BACKUP_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

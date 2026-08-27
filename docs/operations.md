@@ -4,8 +4,6 @@
 
 이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다. Docker container에서 실행하는 명령은 `docker compose run`으로 따로 표시합니다.
 
-> launchd와 Docker를 동시에 실행하지 마세요. 같은 Discord 토큰과 SQLite 파일을 두 프로세스가 함께 사용하게 됩니다.
-
 ## 환경 설정
 
 슬래시 명령은 전역으로 등록됩니다. 봇이 어느 서버에 초대될지 미리 알 수 없으므로 길드 한정 동기화를 쓰지 않습니다. 전역 등록은 Discord 쪽 전파에 최대 1시간이 걸릴 수 있습니다.
@@ -14,7 +12,7 @@
 
 `/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 시작되며 32자 이상의 무작위 값이어야 합니다. host/launchd 실행은 `127.0.0.1:8080`에 bind하고, Compose는 container 내부의 `0.0.0.0:8080`을 host의 `127.0.0.1:8080`에만 publish합니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. HTTP `Host`는 `127.0.0.1`과 `localhost`만 허용하고 로그인 실패 횟수도 제한합니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 시작되며 32자 이상의 무작위 값이어야 합니다. Compose는 container 내부의 `0.0.0.0:8080`을 host의 `127.0.0.1:8080`에만 publish합니다. 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. HTTP `Host`는 `127.0.0.1`과 `localhost`만 허용하고 로그인 실패 횟수도 제한합니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
 
 웹 관리 공지는 Discord의 `/설정 공지허용`에서 opt-in한 Guild의 지정 공지 채널에만 보냅니다. 공지당 PNG·JPEG·GIF·WebP 이미지 1개를 최대 8 MiB까지 첨부할 수 있습니다. 건너뜀·실패가 있으면 Guild별로 채널 미지정·삭제, 권한 부족, Discord 오류, 시간 초과 같은 핵심 원인을 화면에 표시합니다.
 
@@ -38,7 +36,7 @@
 
 OpenAI가 `429`와 `credit_balance_exhausted`를 반환하면 모델 혼잡이 아니라 계정 크레딧 소진입니다. OpenAI API 결제 크레딧을 충전해야 `/기본대화`와 `/고급대화`가 다시 동작합니다. `/이미지`는 별도 Gemini API를 사용하며, Gemini가 `429` 또는 `RESOURCE_EXHAUSTED`를 반환하면 Google AI Studio의 할당량·요금제·결제 상태를 확인하라는 안내를 표시합니다.
 
-이전 버전의 파티 `created_at` 중 timezone이 없는 값은 Docker가 UTC, launchd가 KST로 기록했을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석합니다. 기존 launchd 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
+이전 버전의 파티 `created_at` 중 timezone이 없는 값은 실행 방식에 따라 UTC 또는 KST로 기록됐을 수 있습니다. 마이그레이션은 조기 만료를 막기 위해 모호한 값을 UTC로 해석하므로, 일부 기존 파티는 원래 만료 시각보다 최대 9시간 더 남을 수 있지만 일찍 삭제되지는 않습니다.
 
 파티 DB v2는 방장을 저장하고 한 사용자의 서버 내 활성 파티를 하나로 제한합니다. 업그레이드 전 중복 참가 데이터가 있으면 게임 이름 오름차순의 첫 파티만 보존하고, 기존 파티의 방장은 남은 참가자 중 가장 작은 사용자 ID로 결정합니다. 배포 전 백업 절차를 먼저 수행하세요.
 
@@ -80,83 +78,7 @@ chmod 600 "$target_file"
 )
 ```
 
-## 실행 방식 선택
-
-운영 호스트에서는 아래 방식 중 하나만 선택하세요.
-
-### macOS LaunchAgent
-
-README의 1~3단계로 env와 settings를 준비한 뒤 Docker 전용 4~5단계 대신 아래를 따릅니다. LaunchAgent는 현재 로그인 사용자가 실행하므로 settings/runtime도 그 사용자가 소유해야 합니다.
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip install -r requirements-audit.txt
-.venv/bin/python -m pip_audit -r requirements.lock
-chown -R "$(id -u):$(id -g)" settings runtime
-find settings runtime -type d -exec chmod 700 {} +
-find settings runtime -type f -exec chmod 600 {} +
-test -z "$(find settings runtime \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" -o -perm -022 \) -print -quit)"
-```
-
-제공된 템플릿은 현재 저장소 경로와 로그인 사용자의 그룹을 자동으로 넣어 설치용 파일을 만듭니다. newsyslog 설정 형식은 경로의 공백을 지원하지 않으므로 저장소는 공백이 없는 경로에 복제해야 합니다.
-
-최초 설치:
-
-```bash
-mkdir -p "$HOME/Library/LaunchAgents" runtime/data runtime/backups runtime/logs
-.venv/bin/python deploy/macos/render_templates.py
-cp runtime/generated/macos/com.discordbot.hsr.plist "$HOME/Library/LaunchAgents/"
-cp runtime/generated/macos/com.discordbot.hsr-backup.plist "$HOME/Library/LaunchAgents/"
-sudo cp runtime/generated/macos/com.discordbot.hsr.conf /etc/newsyslog.d/
-plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
-plutil -lint "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
-```
-
-기존의 주기 실행 방식 백업 job을 설치한 호스트는 아래 1회 업그레이드를 먼저 수행합니다. job이 없으면 `launchctl print` 조건이 bootout을 건너뛰며, 다른 실패는 `set -e`로 즉시 중단됩니다.
-
-```bash
-(
-set -euo pipefail
-launchd_domain="gui/$(id -u)"
-backup_target="$launchd_domain/com.discordbot.hsr-backup"
-backup_plist="$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
-
-if launchctl print "$backup_target" >/dev/null 2>&1; then
-  launchctl bootout --wait "$backup_target"
-fi
-.venv/bin/python deploy/macos/render_templates.py
-cp runtime/generated/macos/com.discordbot.hsr-backup.plist "$backup_plist"
-plutil -lint "$backup_plist"
-launchctl bootstrap "$launchd_domain" "$backup_plist"
-launchctl kickstart -k "$backup_target"
-)
-```
-
-로그 로테이션 설치와 구문 확인:
-
-```bash
-sudo newsyslog -nvv
-```
-
-네 newsyslog 항목은 봇의 `DATA_DIR/.bot.pid` 또는 백업의 `BACKUP_DIR/.backup.pid`를 읽어 SIGHUP(1)을 보냅니다. PID와 companion lock은 launchd로 실행하는 macOS에서만 생성되며 Docker에서는 만들지 않습니다. SIGHUP 뒤 남은 PID는 launchd 재시작이 lock을 다시 획득한 뒤 원자적으로 교체합니다. 기본 SIGHUP 종료 뒤 launchd의 `KeepAlive`가 해당 LaunchAgent를 재시작해 새 로그 파일을 다시 엽니다. 따라서 rotation 때 해당 프로세스가 잠시 재시작됩니다.
-
-상태와 로그:
-
-```bash
-launchctl print gui/$(id -u)/com.discordbot.hsr
-tail -n 100 runtime/logs/bot.log
-tail -n 100 runtime/logs/bot-error.log
-```
-
-LaunchAgent는 로그인한 사용자 세션에서만 실행됩니다. Mac이 잠들면 봇과 예약 백업도 중단됩니다.
-
-### Docker Desktop
+## Docker Desktop 실행
 
 Docker 이미지는 의존성과 `module/` 소스만 포함합니다. `.env.secrets`, `.env.runtime`, 실제 금지어, DB, 백업, 로그는 이미지에 들어가지 않습니다. 두 환경 파일은 호스트에만 두고 Compose가 `bot`과 `backup` 프로세스에 주입합니다. Compose는 중복 이름에 대해 목록의 마지막 파일을 사용하므로 `.env.runtime`, `.env.secrets` 순서로 두어 자격 증명을 우선합니다. Compose가 호스트의 `runtime/data/`와 `runtime/backups/`를 bind mount하므로 컨테이너 재생성 뒤에도 데이터와 비밀정보가 호스트에 남습니다. `bot`의 `settings` mount는 웹 관리의 원자 교체를 위해 read/write이고 `backup`의 `settings` mount는 read-only입니다. web port를 포함해 공개 포트는 없습니다.
 
@@ -183,21 +105,13 @@ docker compose up -d
 docker compose logs --tail=100 bot
 ```
 
-Docker Compose CLI가 없는 개발 환경에서 콘솔 suite는 rendered Compose 검사만 `SKIP`하고 plist/newsyslog 검사를 계속합니다. CI 또는 실제 Docker 배포 호스트에서는 `docker compose config --quiet`가 반드시 성공해야 하며 이 `SKIP`을 배포 검증으로 대신할 수 없습니다.
+Docker Compose CLI가 없는 개발 환경에서 콘솔 suite는 rendered Compose 검사를 `SKIP`합니다. CI 또는 실제 Docker 배포 호스트에서는 `docker compose config --quiet`가 반드시 성공해야 하며 이 `SKIP`을 배포 검증으로 대신할 수 없습니다.
 
 Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 
 ## 백업 운영
 
-launchd 수동 점검:
-
-```bash
-.venv/bin/python -m module.backup create
-.venv/bin/python -m module.backup verify
-.venv/bin/python -m module.backup restore-test
-```
-
-Docker 수동 점검은 같은 명령을 `backup` container에서 실행합니다.
+수동 점검은 `backup` container에서 실행합니다.
 
 ```bash
 docker compose run --rm --no-deps backup python -m module.backup create
@@ -205,7 +119,7 @@ docker compose run --rm --no-deps backup python -m module.backup verify
 docker compose run --rm --no-deps backup python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker와 launchd 모두 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용합니다. 값을 변경한 뒤 백업 LaunchAgent를 `launchctl bootout --wait gui/$(id -u)/com.discordbot.hsr-backup`으로 내리고 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"`으로 다시 등록합니다. launchd의 별도 백업 LaunchAgent와 Docker의 `backup` 서비스는 SQLite 온라인 백업을 생성합니다.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker의 `backup` 서비스는 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용해 SQLite 온라인 백업을 생성합니다. 값을 변경한 뒤 `docker compose up -d --force-recreate backup`으로 백업 서비스를 다시 만드세요.
 
 DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도** `-shm`/`-wal` 파일을 만들 수 있어야 하므로, Docker `backup` 서비스의 `./runtime/data` 마운트는 `:ro`가 아니라 쓰기 가능해야 합니다. `:ro`로 되돌리면 봇이 정지한 상태(= `-shm` 부재)에서만 백업이 `attempt to write a readonly database`로 실패하고, `module.backup loop`이 예외를 삼켜 조용히 재시도만 반복합니다. 백업 코드는 SQLite 온라인 백업 API로 읽기만 하므로 rw 마운트가 데이터를 바꾸지는 않습니다.
 
@@ -241,74 +155,33 @@ docker compose run --rm --no-deps bot python -m module.export_legacy
 
 ## 검증된 백업으로 실제 복구
 
-복구는 자동화하지 않습니다. 서비스 중지 → manifest 검증과 내장 stage restore → DB 교체 → 존재한 설정 파일별 확인 교체 → 파일 권한 확인 → 서비스 시작 → health/log 확인 순서로 진행합니다. 아래 블록의 `DEPLOYMENT`와 `MANIFEST`를 운영자가 선택하고, 덮어쓰기 전 비상 사본을 보관하세요. `stage_restore`가 manifest의 크기·체크섬·DB 무결성을 검증하고 stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 복사를 거부했다면 서비스를 시작하지 마세요.
+복구는 자동화하지 않습니다. 서비스 중지 → manifest 검증과 내장 stage restore → DB 교체 → 존재한 설정 파일별 확인 교체 → 파일 권한 확인 → 서비스 시작 → health/log 확인 순서로 진행합니다. 아래 블록의 `MANIFEST`를 운영자가 선택하고, 덮어쓰기 전 비상 사본을 보관하세요. `stage_restore`가 manifest의 크기·체크섬·DB 무결성을 검증하고 stage의 복사본만 현재 스키마로 올립니다. 어느 단계든 실패하거나 복사를 거부했다면 서비스를 시작하지 마세요.
 
 ```bash
 (
 set -euo pipefail
 
-DEPLOYMENT=launchd
 MANIFEST=runtime/backups/20260728T000000Z-manifest.json
 
-case "$DEPLOYMENT" in
-  launchd)
-    launchd_domain="gui/$(id -u)"
-    stop_launchd_job() {
-      launchd_target="$launchd_domain/$1"
-      if launchctl print "$launchd_target" >/dev/null 2>&1; then
-        launchctl bootout --wait "$launchd_target"
-      fi
-      if launchctl print "$launchd_target" >/dev/null 2>&1; then
-        echo "launchd job이 아직 실행 중입니다: $launchd_target" >&2
-        return 1
-      fi
-    }
-    stop_launchd_job com.discordbot.hsr
-    stop_launchd_job com.discordbot.hsr-backup
-    ;;
-  docker)
-    docker compose stop bot backup
-    running_services=$(docker compose ps --status running --services)
-    if grep -Eq '^(bot|backup)$' <<<"$running_services"; then
-      echo "Compose 서비스가 아직 실행 중입니다." >&2
-      exit 1
-    fi
-    ;;
-  *)
-    echo "DEPLOYMENT는 launchd 또는 docker여야 합니다." >&2
-    exit 1
-    ;;
-esac
+docker compose stop bot backup
+running_services=$(docker compose ps --status running --services)
+if grep -Eq '^(bot|backup)$' <<<"$running_services"; then
+  echo "Compose 서비스가 아직 실행 중입니다." >&2
+  exit 1
+fi
 
-case "$DEPLOYMENT" in
-  launchd)
-    test -f "$MANIFEST"
-    RESTORE_STAGE=$(mktemp -d runtime/restore-stage.XXXXXX)
-    .venv/bin/python - "$MANIFEST" "$RESTORE_STAGE" <<'PY'
+MANIFEST_NAME=${MANIFEST##*/}
+test "$MANIFEST" = "runtime/backups/$MANIFEST_NAME"
+RESTORE_STAGE_NAME="restore-stage.$(date -u +%Y%m%dT%H%M%SZ).$$"
+RESTORE_STAGE="runtime/data/$RESTORE_STAGE_NAME"
+docker compose run --rm --no-deps -T --entrypoint python backup \
+  - "/app/runtime/backups/$MANIFEST_NAME" "/app/runtime/data/$RESTORE_STAGE_NAME" <<'PY'
 import sys
 from pathlib import Path
 from module.backup import stage_restore
 stage_restore(Path(sys.argv[1]), Path(sys.argv[2]))
 PY
-    ;;
-  docker)
-    MANIFEST_NAME=${MANIFEST##*/}
-    test "$MANIFEST" = "runtime/backups/$MANIFEST_NAME"
-    RESTORE_STAGE_NAME="restore-stage.$(date -u +%Y%m%dT%H%M%SZ).$$"
-    RESTORE_STAGE="runtime/data/$RESTORE_STAGE_NAME"
-    docker compose run --rm --no-deps -T --entrypoint python backup \
-      - "$MANIFEST_NAME" "$RESTORE_STAGE_NAME" <<'PY'
-import sys
-from pathlib import Path
-from module.backup import stage_restore
-stage_restore(
-    Path("/app/runtime/backups") / sys.argv[1],
-    Path("/app/runtime/data") / sys.argv[2],
-)
-PY
-    sudo chown -R "$(id -u):$(id -g)" settings runtime
-    ;;
-esac
+sudo chown -R "$(id -u):$(id -g)" settings runtime
 
 EMERGENCY_DIR=$(mktemp -d "runtime/emergency.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
 for staged in "$RESTORE_STAGE"/*.db; do
@@ -331,49 +204,26 @@ for name in persona.json forbidden_words.json games.json; do
   cmp -s "$staged" "settings/$name"
 done
 
-case "$DEPLOYMENT" in
-  launchd)
-    SERVICE_UID=$(id -u)
-    SERVICE_GID=$(id -g)
-    chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime
-    find settings runtime -type d -exec chmod 700 {} +
-    find settings runtime -type f -exec chmod 600 {} +
-    test -z "$(find settings runtime \( ! -uid "$SERVICE_UID" -o ! -gid "$SERVICE_GID" -o -perm -022 \) -print -quit)"
-    ;;
-  docker)
-    SERVICE_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
-    SERVICE_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
-    sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime
-    sudo find settings runtime -type d -exec chmod 700 {} +
-    sudo find settings runtime -type f -exec chmod 600 {} +
-    test -z "$(sudo find settings runtime \( ! -uid "$SERVICE_UID" -o ! -gid "$SERVICE_GID" -o -perm -022 \) -print -quit)"
-    ;;
-esac
-
-case "$DEPLOYMENT" in
-  launchd)
-    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr-backup.plist"
-    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.discordbot.hsr.plist"
-    launchctl print gui/$(id -u)/com.discordbot.hsr
-    tail -n 100 runtime/logs/bot.log
-    ;;
-  docker)
-    docker compose run --rm --no-deps --entrypoint sh bot -c '
-      test -r /app/settings/persona.json && test -w /app/settings/persona.json &&
-      test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json &&
-      test -r /app/settings/games.json && test -w /app/settings/games.json &&
-      test -w /app/runtime/data && test -w /app/runtime/backups'
-    docker compose run --rm --no-deps --entrypoint sh backup -c '
-      test -r /app/settings/persona.json && test ! -w /app/settings/persona.json &&
-      test -r /app/settings/forbidden_words.json && test -r /app/settings/games.json'
-    docker compose start backup
-    docker compose start bot
-    BOT_CONTAINER_ID=$(docker compose ps -q bot)
-    test -n "$BOT_CONTAINER_ID"
-    docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER_ID"
-    docker compose logs --tail=100 bot
-    ;;
-esac
+SERVICE_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)
+SERVICE_GID=$(docker compose run --rm --no-deps --entrypoint id bot -g)
+sudo chown -R "$SERVICE_UID:$SERVICE_GID" settings runtime
+sudo find settings runtime -type d -exec chmod 700 {} +
+sudo find settings runtime -type f -exec chmod 600 {} +
+test -z "$(sudo find settings runtime \( ! -uid "$SERVICE_UID" -o ! -gid "$SERVICE_GID" -o -perm -022 \) -print -quit)"
+docker compose run --rm --no-deps --entrypoint sh bot -c '
+  test -r /app/settings/persona.json && test -w /app/settings/persona.json &&
+  test -r /app/settings/forbidden_words.json && test -w /app/settings/forbidden_words.json &&
+  test -r /app/settings/games.json && test -w /app/settings/games.json &&
+  test -w /app/runtime/data && test -w /app/runtime/backups'
+docker compose run --rm --no-deps --entrypoint sh backup -c '
+  test -r /app/settings/persona.json && test ! -w /app/settings/persona.json &&
+  test -r /app/settings/forbidden_words.json && test -r /app/settings/games.json'
+docker compose start backup
+docker compose start bot
+BOT_CONTAINER_ID=$(docker compose ps -q bot)
+test -n "$BOT_CONTAINER_ID"
+docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER_ID"
+docker compose logs --tail=100 bot
 )
 ```
 
@@ -381,26 +231,9 @@ esac
 
 ## 배포
 
-변경을 모아 한 번에 배포합니다. 두 방식 모두 **현재 코드로 온라인 백업 생성·검증 → pull → 테스트·빌드 → 봇·백업 재시작** 순서로 진행합니다. 이렇게 해야 새 코드의 스키마 마이그레이션 전에 구버전 DB 백업이 남습니다. 각 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
+변경을 모아 한 번에 배포합니다. **현재 코드로 온라인 백업 생성·검증 → pull → 테스트·빌드 → 봇·백업 재시작** 순서로 진행합니다. 이렇게 해야 새 코드의 스키마 마이그레이션 전에 구버전 DB 백업이 남습니다. 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.
 
 각 배포·롤백 workflow는 Git 작업 전에 host virtualenv executable 존재 여부를 확인합니다.
-
-macOS:
-
-```bash
-(
-set -euo pipefail
-test -x .venv/bin/python
-git rev-parse HEAD
-.venv/bin/python -m module.backup create
-.venv/bin/python -m module.backup verify
-git pull --ff-only
-.venv/bin/python -m test.console_tests
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
-tail -n 100 runtime/logs/bot.log
-)
-```
 
 Docker:
 
@@ -461,27 +294,6 @@ docker compose logs --tail=100 bot
 ## 코드 롤백
 
 시작 실패 시 블록이 출력한 pull 전 커밋으로 돌아갑니다. 운영자가 변경 내용을 확인한 뒤 `ROLLBACK_MODE=revert`에는 문제 커밋을, 이 호스트만 임시 복구하는 `ROLLBACK_MODE=checkout`에는 이전 커밋을 `TARGET_COMMIT`으로 넣습니다. `git reset --hard`는 사용하지 않습니다.
-
-macOS:
-
-```bash
-(
-set -euo pipefail
-test -x .venv/bin/python
-ROLLBACK_MODE=revert
-TARGET_COMMIT=replace-with-reviewed-commit
-
-case "$ROLLBACK_MODE" in
-  revert) git revert "$TARGET_COMMIT" ;;
-  checkout) git checkout "$TARGET_COMMIT" ;;
-  *) echo "ROLLBACK_MODE는 revert 또는 checkout이어야 합니다." >&2; exit 1 ;;
-esac
-
-.venv/bin/python -m test.console_tests
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr-backup
-launchctl kickstart -k gui/$(id -u)/com.discordbot.hsr
-)
-```
 
 Docker:
 
@@ -547,7 +359,6 @@ DB 복구가 필요한 경우에만 위의 수동 복구 절차를 별도로 따
 
 ## 호스트 한계
 
-- Mac 절전은 LaunchAgent와 Docker Desktop 컨테이너를 모두 중단시킵니다.
+- Mac 절전은 Docker Desktop 컨테이너를 중단시킵니다.
 - Docker 방식은 Docker Desktop이 로그인 시 시작되어야 합니다.
-- LaunchAgent는 로그인한 사용자 세션에서 실행됩니다.
-- 네트워크 또는 전원 장애가 나면 어떤 방식이든 봇이 오프라인이 됩니다.
+- 네트워크 또는 전원 장애가 나면 봇이 오프라인이 됩니다.

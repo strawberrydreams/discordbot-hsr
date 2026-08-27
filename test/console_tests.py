@@ -345,8 +345,7 @@ def test_readme_public_distribution_contract():
         "사용자별 KST 일일 AI 한도",
         "`LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`",
         "provider 계정에도 예산 상한",
-        "Docker Compose를 권장",
-        "launchd 선택 사항",
+        "Docker Compose로 운영",
         "금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`",
         "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
         "`Administrator` 권한",
@@ -638,8 +637,6 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
 
 
 def test_deployment_contracts():
-    import plistlib
-
     services = None
     dockerignore = (
         (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
@@ -677,25 +674,6 @@ def test_deployment_contracts():
                 capture_output=True,
             )
             services = json.loads(compose_result.stdout)["services"]
-
-    bot_plist = plistlib.loads(
-        (
-            PROJECT_ROOT / "deploy/macos/com.discordbot.hsr.plist.example"
-        ).read_bytes()
-    )
-    backup_plist = plistlib.loads(
-        (
-            PROJECT_ROOT / "deploy/macos/com.discordbot.hsr-backup.plist.example"
-        ).read_bytes()
-    )
-    newsyslog_entries = [
-        line.split()
-        for line in (
-            PROJECT_ROOT
-            / "deploy/macos/com.discordbot.hsr.newsyslog.conf.example"
-        ).read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
 
     if services is None:
         print(
@@ -790,151 +768,9 @@ def test_deployment_contracts():
                 for service in (bot, backup)
             ),
         )
-    check(
-        "launchd 백업은 env 주기 loop 사용",
-        backup_plist["ProgramArguments"]
-        == [
-            bot_plist["ProgramArguments"][0],
-            "-m",
-            "module.backup",
-            "loop",
-        ]
-        and "StartInterval" not in backup_plist
-        and backup_plist.get("KeepAlive") is True,
-    )
-    check(
-        "newsyslog는 두 LaunchAgent 로그만 관리",
-        len(newsyslog_entries) == 4
-        and all(len(entry) == 9 for entry in newsyslog_entries)
-        and {entry[0] for entry in newsyslog_entries}
-        == {
-            bot_plist["StandardOutPath"],
-            bot_plist["StandardErrorPath"],
-            backup_plist["StandardOutPath"],
-            backup_plist["StandardErrorPath"],
-        },
-    )
-    check(
-        "newsyslog template owner/group placeholder 명시",
-        all(entry[1] == "__USER__:__GROUP__" for entry in newsyslog_entries),
-    )
-    working_directory = pathlib.Path(bot_plist["WorkingDirectory"])
-    expected_pid_by_log = {
-        bot_plist["StandardOutPath"]: str(
-            working_directory / "runtime/data/.bot.pid"
-        ),
-        bot_plist["StandardErrorPath"]: str(
-            working_directory / "runtime/data/.bot.pid"
-        ),
-        backup_plist["StandardOutPath"]: str(
-            working_directory / "runtime/backups/.backup.pid"
-        ),
-        backup_plist["StandardErrorPath"]: str(
-            working_directory / "runtime/backups/.backup.pid"
-        ),
-    }
-    check(
-        "newsyslog 네 항목은 올바른 PID에 SIGHUP 전달",
-        all(
-            len(entry) == 9
-            and entry[7] == expected_pid_by_log.get(entry[0])
-            and entry[8] == "1"
-            for entry in newsyslog_entries
-        ),
-    )
 
 
-def test_macos_templates_render_portably():
-    import plistlib
-    from deploy.macos.render_templates import render_templates
-
-    template_dir = PROJECT_ROOT / "deploy/macos"
-    template_texts = [
-        (template_dir / name).read_text(encoding="utf-8")
-        for name in (
-            "com.discordbot.hsr.plist.example",
-            "com.discordbot.hsr-backup.plist.example",
-            "com.discordbot.hsr.newsyslog.conf.example",
-        )
-    ]
-    check(
-        "macOS templates have no author-specific values",
-        all(
-            "/Users/strawberrydreams" not in text
-            and "strawberrydreams:staff" not in text
-            for text in template_texts
-        ),
-    )
-
-    project_root = pathlib.Path("/tmp/portable&<clone>#/discordbot-hsr")
-    with tempfile.TemporaryDirectory() as directory:
-        output_dir = pathlib.Path(directory)
-        render_templates(project_root, output_dir, "portable-user", "portable-group")
-        bot_plist = plistlib.loads((output_dir / "com.discordbot.hsr.plist").read_bytes())
-        backup_plist = plistlib.loads(
-            (output_dir / "com.discordbot.hsr-backup.plist").read_bytes()
-        )
-        newsyslog = (output_dir / "com.discordbot.hsr.conf").read_text(encoding="utf-8")
-
-    check(
-        "rendered plist paths use clone root",
-        all(
-            project_root.as_posix() in value
-            for plist in (bot_plist, backup_plist)
-            for value in (
-                plist["ProgramArguments"][0],
-                plist["WorkingDirectory"],
-                plist["StandardOutPath"],
-                plist["StandardErrorPath"],
-            )
-        ),
-    )
-    check(
-        "rendered newsyslog uses clone user and group",
-        "/tmp/portable&<clone>\\#/discordbot-hsr" in newsyslog
-        and "portable-user:portable-group" in newsyslog
-        and not any(
-            placeholder in newsyslog
-            for placeholder in ("__PROJECT_ROOT__", "__USER__", "__GROUP__")
-        ),
-    )
-    with tempfile.TemporaryDirectory() as directory:
-        output_dir = pathlib.Path(directory)
-        try:
-            render_templates(
-                pathlib.Path("/tmp/portable clone/discordbot-hsr"),
-                output_dir,
-                "portable-user",
-                "portable-group",
-            )
-            rejected = False
-        except RuntimeError:
-            rejected = True
-        check(
-            "newsyslog-incompatible whitespace path rejected before output",
-            rejected and not any(output_dir.iterdir()),
-        )
-
-    collision_cases = (
-        (pathlib.Path("/tmp/__USER__/discordbot-hsr"), "portable-user", "portable-group"),
-        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable__GROUP__", "portable-group"),
-        (pathlib.Path("/tmp/portable/discordbot-hsr"), "portable-user", "__PROJECT_ROOT__"),
-    )
-    for index, (root, user, group) in enumerate(collision_cases):
-        with tempfile.TemporaryDirectory() as directory:
-            output_dir = pathlib.Path(directory)
-            try:
-                render_templates(root, output_dir, user, group)
-                rejected = False
-            except RuntimeError:
-                rejected = True
-            check(
-                f"reserved renderer token input {index + 1} rejected before output",
-                rejected and not any(output_dir.iterdir()),
-            )
-
-
-def test_deployment_contracts_skip_only_compose_when_cli_missing():
+def test_deployment_contracts_skip_compose_when_cli_missing():
     output = StringIO()
     error = None
     with patch.object(shutil, "which", return_value=None), redirect_stdout(output):
@@ -948,11 +784,6 @@ def test_deployment_contracts_skip_only_compose_when_cli_missing():
     check(
         "Compose CLI 부재를 명시적 SKIP으로 출력",
         "SKIP: rendered Compose deployment checks" in rendered,
-    )
-    check(
-        "Compose CLI 부재에도 plist/newsyslog 검증 유지",
-        "launchd 백업은 env 주기 loop 사용" in rendered
-        and "newsyslog 네 항목은 올바른 PID에 SIGHUP 전달" in rendered,
     )
 
 
@@ -1228,12 +1059,10 @@ def test_main_holds_instance_lock_while_bot_runs():
         return
 
     events = []
-    data_dir = _TMP_DIR / "main-pid-data"
-    backup_dir = _TMP_DIR / "main-pid-backups"
+    data_dir = _TMP_DIR / "main-lock-data"
+    backup_dir = _TMP_DIR / "main-lock-backups"
     data_dir.mkdir(exist_ok=True)
     backup_dir.mkdir(exist_ok=True)
-    pid_path = data_dir / ".bot.pid"
-    pid_path.unlink(missing_ok=True)
 
     class FakeLock:
         def __enter__(self):
@@ -1244,8 +1073,6 @@ def test_main_holds_instance_lock_while_bot_runs():
 
     class FakeBot:
         def run(self, token):
-            value = pid_path.read_text(encoding="ascii").strip() if pid_path.exists() else "missing"
-            events.append(f"pid:{value}")
             events.append("run")
 
     def acquire(path):
@@ -1256,23 +1083,20 @@ def test_main_holds_instance_lock_while_bot_runs():
          patch.object(main, "DATA_DIR", data_dir), \
          patch.object(main, "BACKUP_DIR", backup_dir), \
          patch.object(main, "acquire_instance_lock", side_effect=acquire), \
-         patch.object(main, "HyacineBot", FakeBot), \
-         patch.object(sys, "platform", "darwin"):
+         patch.object(main, "HyacineBot", FakeBot):
         main.main()
 
     check(
-        "봇 실행 수명 동안 lock과 현재 PID 유지",
+        "봇 실행 수명 동안 instance lock 유지",
         events
         == [
             "acquire:.bot.lock",
             "lock",
-            f"pid:{os.getpid()}",
             "run",
             "unlock",
         ],
         f"({events})",
     )
-    check("봇 정상 종료 시 PID 파일 정리", not pid_path.exists())
 
 
 def test_importing_main_does_not_construct_bot():
@@ -2755,337 +2579,6 @@ def test_invalid_interval_prevents_loop_entry():
     backup.BACKUP_INTERVAL_SECONDS = 21600
 
 
-def test_backup_loop_pid_lifecycle():
-    import module.backup as backup
-
-    backup_dir = _TMP_DIR / "loop-pid-backups"
-    backup_dir.mkdir(exist_ok=True)
-    pid_path = backup_dir / ".backup.pid"
-    pid_path.unlink(missing_ok=True)
-    observed = []
-
-    def stop_loop():
-        observed.append(
-            pid_path.read_text(encoding="ascii").strip()
-            if pid_path.exists()
-            else "missing"
-        )
-        raise KeyboardInterrupt
-
-    with patch.object(backup, "BACKUP_DIR", backup_dir), \
-         patch.object(backup, "_validate_backup_settings"), \
-         patch.object(backup, "create_backup_set", side_effect=stop_loop), \
-         patch.object(sys, "argv", ["backup", "loop"]), \
-         patch.object(sys, "platform", "darwin"):
-        try:
-            backup.main()
-        except KeyboardInterrupt:
-            pass
-
-    check("backup loop 실행 중 현재 PID 게시", observed == [str(os.getpid())])
-    check("backup loop 정상 unwind 시 PID 파일 정리", not pid_path.exists())
-
-
-def test_pid_file_darwin_publishes_and_cleans():
-    import module.backup as backup
-
-    root = _TMP_DIR / "darwin-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    lock_path = root / ".service.pid.lock"
-    temporary_path = root / ".service.pid.tmp"
-    pid_path.unlink(missing_ok=True)
-    lock_path.unlink(missing_ok=True)
-    temporary_path.unlink(missing_ok=True)
-
-    with patch.object(sys, "platform", "darwin"):
-        with backup.pid_file(pid_path):
-            published = pid_path.read_text(encoding="ascii")
-            lock_held = lock_path.exists()
-            temporary_absent = not temporary_path.exists()
-
-    check("Darwin PID context는 현재 PID를 게시", published == f"{os.getpid()}\n")
-    check("Darwin PID context는 companion lock을 사용", lock_held)
-    check(
-        "Darwin PID 정상 종료는 PID/임시 파일만 정리",
-        not pid_path.exists()
-        and temporary_absent
-        and not temporary_path.exists()
-        and lock_path.exists(),
-    )
-
-
-def test_pid_file_linux_is_noop_without_artifacts():
-    import module.backup as backup
-
-    root = _TMP_DIR / "linux-pid"
-    pid_path = root / ".service.pid"
-    with patch.object(sys, "platform", "linux"):
-        with backup.pid_file(pid_path):
-            clean_inside = not root.exists()
-
-    check(
-        "Linux PID context는 PID/lock/디렉터리를 만들지 않음",
-        clean_inside and not root.exists(),
-    )
-
-
-def test_pid_file_rejects_contention_before_handoff():
-    import module.backup as backup
-
-    root = _TMP_DIR / "contended-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    pid_path.unlink(missing_ok=True)
-
-    with patch.object(sys, "platform", "darwin"):
-        with backup.pid_file(pid_path):
-            try:
-                with backup.pid_file(pid_path):
-                    pass
-                rejected = False
-            except RuntimeError:
-                rejected = True
-            first_publication_intact = (
-                pid_path.exists()
-                and pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
-            )
-        with backup.pid_file(pid_path):
-            next_holder_published = (
-                pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
-            )
-
-    check(
-        "같은 PID 경로의 두 번째 holder 거부",
-        rejected and first_publication_intact,
-    )
-    check(
-        "첫 holder cleanup 뒤 다음 holder만 게시",
-        next_holder_published and not pid_path.exists(),
-    )
-
-
-def test_pid_file_replaces_stale_after_lock_release():
-    import module.backup as backup
-
-    root = _TMP_DIR / "stale-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    lock_path = root / ".service.pid.lock"
-    pid_path.write_text("12345\n", encoding="ascii")
-    with lock_path.open("a+b") as stale_lock:
-        backup.fcntl.flock(stale_lock, backup.fcntl.LOCK_EX)
-        backup.fcntl.flock(stale_lock, backup.fcntl.LOCK_UN)
-
-    with patch.object(sys, "platform", "darwin"):
-        with backup.pid_file(pid_path):
-            replaced = pid_path.read_text(encoding="ascii")
-
-    check(
-        "release된 lock의 stale PID를 현재 PID로 교체",
-        replaced == f"{os.getpid()}\n" and not pid_path.exists(),
-    )
-
-
-def test_pid_file_replace_occurs_while_companion_lock_is_held():
-    import module.backup as backup
-
-    root = _TMP_DIR / "replace-order-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    lock_path = root / ".service.pid.lock"
-    events = []
-    real_flock = backup.fcntl.flock
-    real_replace = backup.os.replace
-
-    def recording_flock(lock, operation):
-        result = real_flock(lock, operation)
-        if operation & backup.fcntl.LOCK_EX:
-            events.append(("flock", operation))
-        return result
-
-    def recording_replace(source, destination):
-        with lock_path.open("a+b") as contender:
-            try:
-                real_flock(
-                    contender,
-                    backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
-                )
-                held = False
-                real_flock(contender, backup.fcntl.LOCK_UN)
-            except BlockingIOError:
-                held = True
-        events.append(("replace", held))
-        return real_replace(source, destination)
-
-    with patch.object(sys, "platform", "darwin"), \
-         patch.object(backup.fcntl, "flock", side_effect=recording_flock), \
-         patch.object(backup.os, "replace", side_effect=recording_replace):
-        with backup.pid_file(pid_path):
-            pass
-
-    replace_events = [event for event in events if event[0] == "replace"]
-    check(
-        "PID publication은 flock 획득 뒤 os.replace로 수행",
-        len(replace_events) == 1
-        and replace_events[0] == ("replace", True)
-        and events.index(replace_events[0]) > 0
-        and events[0][0] == "flock",
-        f"({events})",
-    )
-
-
-def test_pid_file_unlinks_before_companion_lock_release():
-    import module.backup as backup
-
-    root = _TMP_DIR / "unlink-order-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    lock_path = root / ".service.pid.lock"
-    cleanup_lock_states = []
-    real_unlink = pathlib.Path.unlink
-
-    def recording_unlink(path, *args, **kwargs):
-        if path == pid_path:
-            with lock_path.open("a+b") as contender:
-                try:
-                    backup.fcntl.flock(
-                        contender,
-                        backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
-                    )
-                    held = False
-                    backup.fcntl.flock(contender, backup.fcntl.LOCK_UN)
-                except BlockingIOError:
-                    held = True
-            cleanup_lock_states.append(held)
-        return real_unlink(path, *args, **kwargs)
-
-    with patch.object(sys, "platform", "darwin"), \
-         patch.object(pathlib.Path, "unlink", new=recording_unlink):
-        with backup.pid_file(pid_path):
-            pass
-
-    check(
-        "PID 정상 cleanup은 companion lock 해제 전에 unlink",
-        cleanup_lock_states == [True] and not pid_path.exists(),
-        f"({cleanup_lock_states})",
-    )
-
-
-def test_pid_file_recovers_after_actual_abnormal_child_exit():
-    import module.backup as backup
-
-    root = _TMP_DIR / "abnormal-exit-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    lock_path = root / ".service.pid.lock"
-    child_code = (
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        "import module.backup as backup\n"
-        "backup.sys.platform = 'darwin'\n"
-        "with backup.pid_file(Path(sys.argv[1])):\n"
-        "    os._exit(0)\n"
-    )
-    child = subprocess.Popen(
-        [sys.executable, "-c", child_code, str(pid_path)],
-        cwd=PROJECT_ROOT,
-    )
-    child_pid = child.pid
-    timed_out = False
-    try:
-        try:
-            exit_code = child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            child.kill()
-            exit_code = child.wait()
-        stale_contents = (
-            pid_path.read_text(encoding="ascii") if pid_path.exists() else None
-        )
-
-        with lock_path.open("a+b") as probe:
-            try:
-                backup.fcntl.flock(
-                    probe,
-                    backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB,
-                )
-                released = True
-                backup.fcntl.flock(probe, backup.fcntl.LOCK_UN)
-            except BlockingIOError:
-                released = False
-
-        with patch.object(sys, "platform", "darwin"):
-            with backup.pid_file(pid_path):
-                replacement = pid_path.read_text(encoding="ascii")
-
-        check(
-            "os._exit child는 stale PID를 남기고 kernel lock은 해제",
-            not timed_out
-            and exit_code == 0
-            and stale_contents == f"{child_pid}\n"
-            and released,
-        )
-        check(
-            "abnormal exit 뒤 다음 holder가 stale PID 교체 후 정상 정리",
-            replacement == f"{os.getpid()}\n" and not pid_path.exists(),
-        )
-    finally:
-        try:
-            if child.poll() is None:
-                child.kill()
-        finally:
-            child.wait()
-
-
-def test_pid_file_publication_failure_cleans_temp_lock_and_fds():
-    import module.backup as backup
-
-    root = _TMP_DIR / "failed-publication-pid"
-    root.mkdir(exist_ok=True)
-    pid_path = root / ".service.pid"
-    temporary_path = root / ".service.pid.tmp"
-    fd_root = "/dev/fd" if pathlib.Path("/dev/fd").exists() else "/proc/self/fd"
-    open_fds_before = len(os.listdir(fd_root))
-
-    with patch.object(sys, "platform", "darwin"), \
-         patch.object(backup.os, "replace", side_effect=OSError("publish failed")):
-        try:
-            with backup.pid_file(pid_path):
-                pass
-            failed = False
-        except OSError:
-            failed = True
-
-    gc.collect()
-    open_fds_after_failure = len(os.listdir(fd_root))
-    cleaned_after_failure = not temporary_path.exists() and not pid_path.exists()
-    with patch.object(sys, "platform", "darwin"):
-        try:
-            with backup.pid_file(pid_path):
-                reacquired = True
-        except RuntimeError:
-            reacquired = False
-    gc.collect()
-    open_fds_after_reacquire = len(os.listdir(fd_root))
-
-    check(
-        "PID publication 실패는 temp/PID 파일 정리",
-        failed and cleaned_after_failure,
-    )
-    check(
-        "PID publication 실패 뒤 lock 재획득 및 FD 정리",
-        reacquired
-        and open_fds_after_failure == open_fds_before
-        and open_fds_after_reacquire == open_fds_before,
-        (
-            f"(fd before={open_fds_before}, "
-            f"failure={open_fds_after_failure}, "
-            f"reacquire={open_fds_after_reacquire})"
-        ),
-    )
-
-
 def test_backup_same_timestamp_rejected():
     import module.backup as backup
 
@@ -3399,8 +2892,7 @@ if __name__ == "__main__":
         test_operations_document_contract()
         test_final_installation_and_operations_contract()
         test_deployment_contracts()
-        test_macos_templates_render_portably()
-        test_deployment_contracts_skip_only_compose_when_cli_missing()
+        test_deployment_contracts_skip_compose_when_cli_missing()
         test_forbidden_words_degrade_gracefully()
         test_forbidden_words_load_logs_to_stdout()
         test_startup_syncs_commands_globally()
@@ -3435,15 +2927,6 @@ if __name__ == "__main__":
         test_invalid_backup_settings_prevent_creation()
         test_invalid_retention_prevents_pruning()
         test_invalid_interval_prevents_loop_entry()
-        test_backup_loop_pid_lifecycle()
-        test_pid_file_darwin_publishes_and_cleans()
-        test_pid_file_linux_is_noop_without_artifacts()
-        test_pid_file_rejects_contention_before_handoff()
-        test_pid_file_replaces_stale_after_lock_release()
-        test_pid_file_replace_occurs_while_companion_lock_is_held()
-        test_pid_file_unlinks_before_companion_lock_release()
-        test_pid_file_recovers_after_actual_abnormal_child_exit()
-        test_pid_file_publication_failure_cleans_temp_lock_and_fds()
         test_backup_same_timestamp_rejected()
         test_prune_requires_timestamp_bound_filenames()
         test_backup_publication_is_synced()

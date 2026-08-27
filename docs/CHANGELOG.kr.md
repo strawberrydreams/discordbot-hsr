@@ -18,6 +18,10 @@
 
 ### Improved (기존 기능 개선)
 
+- 프로덕션 배포 방식을 Docker Compose로 통일하고 더 이상 사용하지 않는 macOS
+  LaunchAgent 경로를 제거했습니다.
+- OpenAI 2.x, Google Gen AI, python-dotenv 직접 의존성을 업데이트했습니다.
+- 의존성 감사 workflow의 checkout과 setup-python을 v7로 업데이트했습니다.
 - `/설정` 하위 명령을 `Administrator` 권한 사용자에게만 표시하고 실행하도록
   제한했습니다.
 - `/게임카드` 제목에 Discord 닉네임과 게임 이름을, 본문 두 줄에 게임 계정과 첫 진열

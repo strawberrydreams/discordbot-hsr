@@ -160,7 +160,7 @@ AI 명령은 사용자별 KST 일일 AI 한도를 명령별로 적용합니다. 
 
 OpenAI가 `credit_balance_exhausted`를 반환하면 `/기본대화`와 `/고급대화`는 운영자에게 API 크레딧 충전이 필요하다고 안내합니다. `/이미지`에서 Google Gemini API가 `429` 또는 `RESOURCE_EXHAUSTED`를 반환하면 할당량 또는 결제 한도를 확인하라는 별도 안내를 표시합니다.
 
-일반 운영에는 Docker Compose를 권장합니다. macOS에서 Docker 대신 LaunchAgent를 직접 관리해야 하는 고급 운영자만 [launchd 선택 사항](docs/operations.md#macos-launchagent)을 따르세요. launchd와 Docker를 동시에 실행하지 마세요. 백업·복구 절차도 [운영 가이드](docs/operations.md)를 따르세요.
+프로덕션은 Docker Compose로 운영합니다. 백업·복구 절차는 [운영 가이드](docs/operations.md)를 따르세요.
 
 ## 운영 시 주의
 
@@ -177,4 +177,4 @@ Hyacine은 [GNU General Public License v3.0](LICENSE)으로 배포합니다. 이
 
 ## 상세 운영
 
-Docker Compose·launchd 실행, 백업, 복구, 배포, 롤백은 [운영 가이드](docs/operations.md)를 참고하세요.
+Docker Compose 실행, 백업, 복구, 배포, 롤백은 [운영 가이드](docs/operations.md)를 참고하세요.

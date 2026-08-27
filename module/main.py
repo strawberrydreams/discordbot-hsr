@@ -4,7 +4,7 @@ from typing import BinaryIO
 
 import discord
 from discord.ext import commands
-from module.backup import DATABASES, pid_file, verify_database
+from module.backup import DATABASES, verify_database
 from module.config import (
     ADMIN_TOKEN,
     BACKUP_DIR,
@@ -138,8 +138,7 @@ def main() -> None:
     validate_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    with acquire_instance_lock(DATA_DIR / ".bot.lock"), \
-         pid_file(DATA_DIR / ".bot.pid"):
+    with acquire_instance_lock(DATA_DIR / ".bot.lock"):
         HyacineBot().run(DISCORD_TOKEN)
 
 if __name__ == "__main__":

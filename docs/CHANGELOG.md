@@ -19,6 +19,10 @@ the last change included in that milestone.
 
 ### Improved
 
+- Standardized production deployment on Docker Compose and removed the retired
+  macOS LaunchAgent path.
+- Updated the direct OpenAI, Google Gen AI, and python-dotenv dependencies.
+- Updated the dependency-audit workflow to checkout and setup-python v7.
 - Restricted `/설정` subcommands to members with the `Administrator`
   permission.
 - Game cards now show the Discord nickname and game name in the title, followed
