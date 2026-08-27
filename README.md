@@ -15,13 +15,13 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 - 금지어 경고 — 서버별로 끌 수 있고, 응답 문구와 예외 목록을 설정할 수 있습니다
 - `/인사` — AI 키 없이도 동작하는 정적 인삿말
 - `/등록`, `/등록해제`, `/게임카드` — 원신 · 붕괴: 스타레일 · 젠레스 존 제로의 첫 진열 캐릭터 카드
-- `/설정 시작`, `/설정 확인` — `Administrator` 권한이 있는 서버 관리자가 기본 파티 채널을 만들고 현재 설정을 확인
+- `/설정 시작`, `/설정 공지허용`, `/설정 확인` — `Administrator` 권한이 있는 서버 관리자가 기본 파티 채널을 만들고 웹 공지 수신 동의를 결정하며 현재 설정을 확인
 
 ## 빠른 시작
 
 ### 1. Discord Application과 토큰 준비
 
-Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 생성합니다. Bot 설정에서 privileged intent인 `Message Content`와 `Server Members`를 활성화합니다. 전자는 금지어 필터에, 후자는 퇴장 시 파티 정리에 필요합니다. 운영자 전용 앱은 `Public Bot`을 끄세요. 이는 Portal에서 하는 설정이며, 이 저장소의 코드가 Portal 설정을 변경하지는 않습니다. Guild 설치는 봇을 시작한 뒤 6단계에서 합니다.
+Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 생성합니다. Bot 설정에서 privileged intent인 `Message Content`와 `Server Members`를 활성화합니다. 전자는 금지어 필터에, 후자는 퇴장 시 파티 참가·금지어 카운트·게임 UID 정리에 필요합니다. 운영자 전용 앱은 `Public Bot`을 끄세요. 이는 Portal에서 하는 설정이며, 이 저장소의 코드가 Portal 설정을 변경하지는 않습니다. Guild 설치는 봇을 시작한 뒤 6단계에서 합니다.
 
 ### 2. 환경 파일 작성
 
@@ -30,10 +30,20 @@ Discord Developer Portal에서 자신의 Discord Application과 봇 토큰을 �
 - `.env.secrets`: 방금 만든 Discord 토큰과 선택적인 OpenAI·Google 자격 증명
 - `.env.runtime`: 데이터·백업 경로, 백업 주기, AI 쿨다운과 한도
 
+웹 관리를 켤 때 `ADMIN_TOKEN`은 아래처럼 32바이트 무작위 값으로 생성해
+`.env.secrets`에 넣습니다. 32자보다 짧으면 봇이 기동하지 않습니다.
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
 ```bash
 touch .env.secrets .env.runtime
 chmod 600 .env.secrets .env.runtime
 ```
+
+봇은 두 파일이 현재 사용자 소유의 일반 파일이고 group/world 권한이 없는지
+기동 전에 확인하며, symlink나 느슨한 권한이면 비밀값을 읽지 않고 종료합니다.
 
 ### 3. 설정 파일 초기화
 
@@ -53,7 +63,9 @@ mkdir -p runtime/data runtime/backups runtime/logs runtime/enka
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install -r requirements-audit.txt
+.venv/bin/python -m pip_audit -r requirements.lock
 docker compose config --quiet
 docker compose build bot
 ```
@@ -92,9 +104,9 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 - `Attach Files`
 - `Manage Channels` — 봇 전용 category와 파티 채널 생성
 
-설치 후 `Administrator` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, 파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리에서 Guild별로 저장합니다. Discord에는 `/설정 시작`과 `/설정 확인`만 남으며, `/설정 확인`으로 현재 상태를 볼 수 있습니다.
+설치 후 `Administrator` 권한이 있는 서버 관리자가 Discord에서 `/설정 시작`을 실행합니다. 채널 ID는 환경변수가 아니며, 파티·공지·이벤트 채널과 금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리에서 Guild별로 저장합니다. 웹 공지 수신 동의는 서버 관리자가 Discord의 `/설정 공지허용`에서만 변경하며, `/설정 확인`으로 현재 상태를 볼 수 있습니다.
 
-슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 봇을 서버에서 내보내면 해당 서버의 금지어 카운트·파티·설정·게임 UID 등록은 자동으로 삭제됩니다.
+슬래시 명령은 전역으로 등록되므로 초대 직후 반영까지 최대 1시간이 걸릴 수 있습니다. 멤버가 서버를 나가면 그 서버에 속한 금지어 카운트·파티 참가·게임 UID 등록을 삭제하고, 봇을 서버에서 내보내면 해당 서버의 금지어 카운트·파티·설정·게임 UID 등록을 모두 삭제합니다. 삭제 전 백업 사본은 기본 보존 기간인 최대 30일 뒤 제거됩니다.
 
 ### 패널과 선택 기능
 
@@ -140,11 +152,11 @@ Developer Portal의 Installation은 **Guild Install만** 사용하고 scope는 `
 
 Hyacine은 HoYoverse와 제휴하지 않았고 Enka Network와도 무관합니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 비어 있으면 웹 관리를 시작하지 않습니다. host에서 직접 실행하면 웹 관리는 `127.0.0.1:8080`에 bind됩니다. Docker Compose에서는 container 내부의 `0.0.0.0:8080`에서 받고 host의 `127.0.0.1:8080`에만 publish하므로, 어느 실행 방식이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열 수 있고 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다. 필요하다면 별도 보안 설계를 먼저 하세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 비어 있으면 웹 관리를 시작하지 않으며, 설정할 때는 32자 이상의 무작위 값이어야 합니다. host에서 직접 실행하면 웹 관리는 `127.0.0.1:8080`에 bind됩니다. Docker Compose에서는 container 내부의 `0.0.0.0:8080`에서 받고 host의 `127.0.0.1:8080`에만 publish하므로, 어느 실행 방식이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열 수 있고 다른 network interface에는 노출되지 않습니다. HTTP `Host`도 `127.0.0.1`과 `localhost`만 허용하고 로그인 실패는 제한합니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다. 필요하다면 별도 보안 설계를 먼저 하세요.
 
-웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. system prompt는 최대 16,000자, 인삿말은 최대 1,974자입니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부를 저장합니다. 공지는 opt-in한 Guild의 지정 채널로 임베드와 선택 이미지 1개(최대 8 MiB)를 보낼 수 있고, 작성 폼 안의 Discord Markdown 문법 가이드를 참고할 수 있습니다. 전송을 건너뛰거나 실패하면 결과와 함께 Guild별 핵심 원인을 표시합니다.
+웹 관리에서는 AI 페르소나(system prompt와 인삿말), 금지어 목록, 파티 게임 목록을 편집합니다. system prompt는 최대 16,000자, 인삿말은 최대 1,974자입니다. 금지어는 저장 즉시 다시 불러오고, 페르소나는 새로 시작하는 AI 채널 세션부터, 게임 목록은 봇 재시작 후 반영됩니다. 같은 화면에서 Guild별 파티·공지·이벤트 채널과 금지어 필터 사용 여부를 필드별로 저장하고 웹 공지 opt-in은 읽기 전용으로 표시합니다. 공지는 Discord에서 opt-in한 Guild의 지정 채널로 임베드와 선택 이미지 1개(최대 8 MiB)를 보낼 수 있고, 작성 폼 안의 Discord Markdown 문법 가이드를 참고할 수 있습니다. 전송을 건너뛰거나 실패하면 결과와 함께 Guild별 핵심 원인을 표시합니다.
 
-AI 명령은 사용자별 KST 일일 AI 한도를 명령별로 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
+AI 명령은 사용자별 KST 일일 AI 한도를 명령별로 적용합니다. `.env.runtime`의 `LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`로 각각 조정하며 매일 KST 자정에 리셋됩니다. 이 한도는 같은 봇 인스턴스 안에서 모든 Guild에 걸쳐 사용자별로 공유됩니다. 날짜별 사용 기록은 `AI_USAGE_RETENTION_DAYS`(기본 30일) 뒤 다음 AI 예약 시 삭제됩니다. 앱 한도와 별개로 OpenAI·Google provider 계정에도 예산 상한을 설정하세요.
 
 OpenAI가 `credit_balance_exhausted`를 반환하면 `/기본대화`와 `/고급대화`는 운영자에게 API 크레딧 충전이 필요하다고 안내합니다. `/이미지`에서 Google Gemini API가 `429` 또는 `RESOURCE_EXHAUSTED`를 반환하면 할당량 또는 결제 한도를 확인하라는 별도 안내를 표시합니다.
 
@@ -154,6 +166,7 @@ OpenAI가 `credit_balance_exhausted`를 반환하면 `/기본대화`와 `/고급
 
 - `.env.secrets`, `.env.runtime`, `runtime/`은 Git에 추가하지 마세요. `git add -f`도 사용하지 않습니다.
 - 운영 백엔드는 SQLite만 지원합니다.
+- `settings/`와 `runtime/`은 소유자 전용 권한으로 유지하고 host의 전체 디스크 암호화를 켜세요. 백업을 다른 host나 object storage로 옮길 때는 전송·저장 암호화를 별도로 적용하세요.
 - plain HTTP 관리자 세션 cookie는 포트가 아니라 host에 묶입니다. localhost 웹 관리를 켠 OS 사용자/loopback host 경계의 모든 로컬 서비스·프로세스를 신뢰할 수 있을 때만 `ADMIN_TOKEN`을 설정하세요.
 
 ## 라이선스와 기여

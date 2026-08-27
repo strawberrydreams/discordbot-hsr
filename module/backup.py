@@ -23,6 +23,8 @@ from module.config import (
     DATA_DIR,
     SETTINGS_DIR,
     SETTINGS_FILES,
+    ensure_private_directory,
+    ensure_private_file,
 )
 from module.database import (
     SQLITE_TIMEOUT_SECONDS,
@@ -276,7 +278,7 @@ def _create_backup_directory() -> None:
     while not directory.exists():
         missing.append(directory)
         directory = directory.parent
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(BACKUP_DIR)
     for created in missing:
         _fsync_directory(created)
     if missing:
@@ -286,7 +288,14 @@ def _create_backup_directory() -> None:
 def create_backup_set(now: datetime | None = None) -> Path:
     _validate_backup_settings()
     _create_backup_directory()
-    with (BACKUP_DIR / ".backup.lock").open("a+b") as lock:
+    lock_path = BACKUP_DIR / ".backup.lock"
+    lock_descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(lock_descriptor, "a+b") as lock:
+        ensure_private_file(lock_path)
         fcntl.flock(lock, fcntl.LOCK_EX)
         return _create_backup_set(now)
 
@@ -525,10 +534,10 @@ def stage_restore(manifest_path: Path, stage: Path) -> None:
         raise RuntimeError(f"복구 stage에 DB 파일이 이미 있습니다: {stage}")
     if any(path.exists() for path in setting_destinations):
         raise RuntimeError(f"복구 stage에 설정 파일이 이미 있습니다: {stage}")
-    stage.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(stage)
     settings_descriptor = None
     if setting_destinations:
-        settings_stage.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(settings_stage)
         settings_descriptor = _open_settings_stage(settings_stage)
     try:
         for database_entry, restored in zip(

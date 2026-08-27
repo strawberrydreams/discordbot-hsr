@@ -27,8 +27,15 @@ import pathlib
 import sqlite3
 from abc import ABC, abstractmethod
 from contextlib import closing
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from module.config import DATA_DIR, DB_BACKEND
+from module.config import (
+    AI_USAGE_RETENTION_DAYS,
+    DATA_DIR,
+    DB_BACKEND,
+    ensure_private_directory,
+    ensure_private_file,
+)
 
 
 # ─────────── 연결 정책 ─────────── #
@@ -37,18 +44,40 @@ from module.config import DATA_DIR, DB_BACKEND
 SQLITE_TIMEOUT_SECONDS = 30.0
 
 
+def _secure_sqlite_paths(db_path: pathlib.Path) -> None:
+    db_path = pathlib.Path(db_path)
+    ensure_private_directory(db_path.parent)
+    for path in (
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+    ):
+        if path.is_symlink():
+            raise PermissionError(f"SQLite 경로는 symlink일 수 없습니다: {path}")
+        if path.exists():
+            ensure_private_file(path)
+
+
 def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection:
     """이 모듈의 유일한 SQLite 연결 지점. timeout/journal 정책을 한 곳에 모은다."""
+    db_path = pathlib.Path(db_path)
+    _secure_sqlite_paths(db_path)
     conn = sqlite3.connect(
         db_path,
         timeout=SQLITE_TIMEOUT_SECONDS,
         isolation_level=isolation_level,
     )
-    # journal_mode는 DB 파일에 영속되므로 매 연결 설정은 멱등하다.
-    # WAL이면 쓰기 프로세스가 없어도 백업이 읽을 수 있다(단, 디렉터리가 쓰기 가능해야 함).
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    try:
+        ensure_private_file(db_path)
+        # journal_mode는 DB 파일에 영속되므로 매 연결 설정은 멱등하다.
+        # WAL이면 쓰기 프로세스가 없어도 백업이 읽을 수 있다(단, 디렉터리가 쓰기 가능해야 함).
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _secure_sqlite_paths(db_path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -118,6 +147,10 @@ class UsageRepository(ABC):
         self, user_id: int, usage_date: str, usage_category: str
     ) -> int:
         """인스턴스 전역 일일 사용량을 반환한다."""
+
+    @abstractmethod
+    def delete_user(self, guild_id: int, user_id: int) -> None:
+        """멤버가 나갔을 때 해당 길드의 금지어 기록을 지운다."""
 
     @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
@@ -296,6 +329,10 @@ class ProfileRepository(ABC):
         """이 서버에서 이 유저가 등록한 게임별 UID."""
 
     @abstractmethod
+    def delete_user(self, guild_id: int, user_id: int) -> None:
+        """멤버가 나갔을 때 해당 길드의 UID 등록을 모두 지운다."""
+
+    @abstractmethod
     def delete_guild(self, guild_id: int) -> None:
         """봇이 길드에서 제거됐을 때 해당 길드 등록을 모두 지운다."""
 
@@ -307,8 +344,8 @@ class SQLiteUsageRepository(UsageRepository):
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        _secure_sqlite_paths(self.db_path)
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
@@ -349,7 +386,12 @@ class SQLiteUsageRepository(UsageRepository):
         usage_category: str,
         daily_limit: int,
     ) -> Optional[int]:
+        cutoff = (
+            date.fromisoformat(usage_date)
+            - timedelta(days=AI_USAGE_RETENTION_DAYS - 1)
+        ).isoformat()
         with closing(_connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM ai_usage WHERE usage_date < ?", (cutoff,))
             cursor = conn.execute(
                 """
                 INSERT INTO ai_usage (user_id, usage_date, command, count)
@@ -374,6 +416,12 @@ class SQLiteUsageRepository(UsageRepository):
                 (user_id, usage_date, usage_category),
             )
             released = cursor.rowcount > 0
+            if released:
+                conn.execute(
+                    "DELETE FROM ai_usage "
+                    "WHERE user_id = ? AND usage_date = ? AND command = ? AND count = 0",
+                    (user_id, usage_date, usage_category),
+                )
             conn.commit()
             return released
 
@@ -447,14 +495,22 @@ class SQLiteUsageRepository(UsageRepository):
             cursor.execute("DELETE FROM users WHERE guild_id = ?", (guild_id,))
             conn.commit()
 
+    def delete_user(self, guild_id: int, user_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                "DELETE FROM users WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            conn.commit()
+
 
 class SQLitePartyRepository(PartyRepository):
     _SCHEMA_VERSION = 2
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        _secure_sqlite_paths(self.db_path)
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
@@ -792,8 +848,8 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        _secure_sqlite_paths(self.db_path)
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
@@ -1019,17 +1075,6 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
         with closing(_connect(self.db_path)) as conn:
             conn.execute(
                 """
-                DELETE FROM party_panels
-                WHERE guild_id = ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM guild_settings
-                      WHERE guild_id = ? AND party_channel_id IS ?
-                  )
-                """,
-                (guild_id, guild_id, party_channel_id),
-            )
-            conn.execute(
-                """
                 INSERT INTO guild_settings (
                     guild_id, party_channel_id, announcement_channel_id,
                     event_channel_id, allow_host_announce,
@@ -1132,8 +1177,8 @@ class SQLiteProfileRepository(ProfileRepository):
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        _secure_sqlite_paths(self.db_path)
 
     def _init_db(self):
         with closing(_connect(self.db_path)) as conn:
@@ -1198,6 +1243,14 @@ class SQLiteProfileRepository(ProfileRepository):
                     (guild_id, user_id),
                 )
             }
+
+    def delete_user(self, guild_id: int, user_id: int) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            conn.execute(
+                "DELETE FROM game_uids WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            conn.commit()
 
     def delete_guild(self, guild_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:

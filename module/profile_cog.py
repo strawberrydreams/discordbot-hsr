@@ -39,6 +39,15 @@ class ProfileCog(commands.Cog):
         """봇이 서버에서 제거되면 그 서버의 UID 등록을 남기지 않는다."""
         await run_db(self.profile_repository.delete_guild, guild.id)
 
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """멤버가 나가면 해당 서버에 등록한 UID를 모두 지운다."""
+        await run_db(
+            self.profile_repository.delete_user,
+            member.guild.id,
+            member.id,
+        )
+
     @app_commands.command(name="등록", description="게임 계정 UID를 이 서버에 등록합니다.")
     @app_commands.describe(게임="UID를 등록할 게임", uid="게임 안에서 확인할 수 있는 숫자 UID")
     @app_commands.choices(게임=GAME_CHOICES)

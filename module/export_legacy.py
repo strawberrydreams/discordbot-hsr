@@ -13,7 +13,9 @@ null로 기록되고 나머지는 그대로 나온다. 두 번 실행해도 원�
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import sys
 import tempfile
 from contextlib import closing
@@ -107,11 +109,29 @@ def build_export(data_dir: Path | None = None) -> dict:
 def write_export(destination: Path, data_dir: Path | None = None) -> Path:
     """기존 파일은 덮어쓰지 않는다. 앞서 받아둔 export를 날리면 안 된다."""
     destination = Path(destination)
-    if destination.exists():
-        raise FileExistsError(f"이미 존재하는 파일입니다: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_stat = destination.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_stat.st_mode) & 0o022
+    ):
+        raise PermissionError(
+            f"export directory는 현재 사용자 소유이며 group/world 쓰기 불가여야 합니다: {destination.parent}"
+        )
     payload = json.dumps(build_export(data_dir), ensure_ascii=False, indent=2) + "\n"
-    destination.write_text(payload, encoding="utf-8")
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
     return destination
 
 

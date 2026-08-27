@@ -8,17 +8,18 @@ import discord
 _PANEL_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 
 
-def is_sendable_panel_channel(guild, channel) -> bool:
+def channel_send_capabilities(guild, channel) -> tuple[bool, bool]:
+    """한 번의 권한 조회로 (패널 전송 가능, 첨부 공지 가능)을 반환한다."""
     if channel is None or getattr(channel, "type", None) not in {
         discord.ChannelType.text,
         discord.ChannelType.news,
     }:
-        return False
+        return False, False
     member = getattr(guild, "me", None)
     if member is None:
-        return False
+        return False, False
     permissions = channel.permissions_for(member)
-    return all(
+    panel_allowed = all(
         getattr(permissions, name, False)
         for name in (
             "view_channel",
@@ -27,12 +28,17 @@ def is_sendable_panel_channel(guild, channel) -> bool:
             "embed_links",
         )
     )
+    return panel_allowed, panel_allowed and bool(
+        getattr(permissions, "attach_files", False)
+    )
+
+
+def is_sendable_panel_channel(guild, channel) -> bool:
+    return channel_send_capabilities(guild, channel)[0]
 
 
 def is_sendable_announcement_channel(guild, channel) -> bool:
-    if not is_sendable_panel_channel(guild, channel):
-        return False
-    return bool(getattr(channel.permissions_for(guild.me), "attach_files", False))
+    return channel_send_capabilities(guild, channel)[1]
 
 
 def panel_lock(guild_id: int, panel_key: str) -> asyncio.Lock:

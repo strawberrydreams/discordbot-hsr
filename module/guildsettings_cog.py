@@ -1,7 +1,8 @@
 """서버별 봇 설정.
 
 봇이 여러 서버에 설치되므로 채널 ID를 환경변수에 둘 수 없다. 설정 시작과
-현재 상태 확인은 Discord에서, 나머지 값은 호스트의 로컬 웹 관리에서 다룬다.
+현재 상태와 웹 공지 opt-in은 Discord에서, 채널과 필터 값은 호스트의 로컬 웹
+관리에서 다룬다.
 """
 
 import logging
@@ -185,6 +186,21 @@ class GuildSettingsCog(commands.Cog):
             ephemeral=True,
         )
 
+    @설정.command(name="공지허용", description="웹 관리 공지를 허용하거나 차단합니다.")
+    @app_commands.describe(허용="설정한 공지 채널로 웹 관리 공지를 받을지 선택합니다.")
+    async def _set_host_announcements(
+        self, interaction: discord.Interaction, 허용: bool
+    ):
+        await run_db(
+            self.settings_repository.set_allow_host_announce,
+            interaction.guild_id,
+            허용,
+        )
+        await interaction.response.send_message(
+            f"✅ 웹 관리 공지를 {'허용' if 허용 else '차단'}했습니다.",
+            ephemeral=True,
+        )
+
     @설정.command(name="확인", description="현재 서버의 설정을 봅니다.")
     async def _show_settings(self, interaction: discord.Interaction):
         party_channel_id = await run_db(
@@ -253,7 +269,7 @@ class GuildSettingsCog(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text="이 설정은 봇 호스트 컴퓨터에서 실행되는 localhost 웹 관리 페이지에서만 변경할 수 있습니다."
+            text="웹 공지 허용은 /설정 공지허용, 채널·금지어 설정은 localhost 웹 관리에서 변경합니다."
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

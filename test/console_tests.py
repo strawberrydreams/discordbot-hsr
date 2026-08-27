@@ -29,7 +29,6 @@ import threading
 import time
 from contextlib import closing, redirect_stdout
 from io import StringIO
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from dotenv import dotenv_values
@@ -174,6 +173,7 @@ def test_config_validation():
             "DISCORD_TOKEN",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
+            "ADMIN_TOKEN",
         )
         if hasattr(config, name)
     }
@@ -181,6 +181,7 @@ def test_config_validation():
         config.DISCORD_TOKEN = "test-token"
         config.OPENAI_API_KEY = None
         config.GOOGLE_API_KEY = None
+        config.ADMIN_TOKEN = None
         # 채널/길드 ID는 더 이상 환경변수가 아니다. 서버 관리자가 /설정으로 지정한다.
         config.validate_config()
         check(
@@ -211,6 +212,8 @@ def test_split_env_loading():
         "OVERLAP_TEST=runtime-loses\n",
         encoding="utf-8",
     )
+    (root / ".env.secrets").chmod(0o600)
+    (root / ".env.runtime").chmod(0o600)
 
     names = (
         "OPENAI_API_KEY",
@@ -249,6 +252,7 @@ def test_public_env_contract():
         "BACKUP_INTERVAL_SECONDS",
         "BACKUP_RETENTION_DAYS",
         "AI_COOLDOWN_SECONDS",
+        "AI_USAGE_RETENTION_DAYS",
         "DB_BACKEND",
         "CHAT_MODEL_LIGHT",
         "CHAT_MODEL_DEEP",
@@ -422,7 +426,9 @@ cp settings/games.example.json settings/games.json""" in quick_start,
         "Docker quick-start는 host test virtualenv를 build 전에 설치",
         """python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install -r requirements-audit.txt
+.venv/bin/python -m pip_audit -r requirements.lock
 docker compose config --quiet
 docker compose build bot""" in quick_start,
     )
@@ -450,9 +456,9 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
         ),
     )
     check(
-        "Discord 설정은 시작·확인만 남고 나머지는 localhost 웹 관리",
-        "Discord에는 `/설정 시작`과 `/설정 확인`만 남으며" in quick_start
-        and "파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리" in quick_start,
+        "공지 opt-in은 Discord, 채널·필터는 localhost 웹 관리",
+        "`/설정 공지허용`에서만 변경" in quick_start
+        and "파티·공지·이벤트 채널과 금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리" in quick_start,
     )
     check(
         "channel permission block 유지",
@@ -473,7 +479,7 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "공지는 opt-in Guild의 configured announcement channel만 대상",
-        "웹 관리 공지는 같은 화면에서 opt-in하고 지정한 Guild 공지 채널에만 보냅니다." in operations,
+        "웹 관리 공지는 Discord의 `/설정 공지허용`에서 opt-in한 Guild의 지정 공지 채널에만 보냅니다." in operations,
     )
     check(
         "GPL-3.0과 무기여 정책을 유지",
@@ -496,7 +502,6 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
                 "event_channel_id",
                 "/설정 파티채널",
                 "/설정 공지채널",
-                "/설정 공지허용",
                 "/설정 금지어",
             )
         ),

@@ -11,11 +11,64 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SECRETS_ENV_FILE = PROJECT_ROOT / ".env.secrets"
 RUNTIME_ENV_FILE = PROJECT_ROOT / ".env.runtime"
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def _owned_path_stat(path: Path, expected_type: int) -> os.stat_result:
+    path_stat = path.lstat()
+    if stat.S_IFMT(path_stat.st_mode) != expected_type:
+        raise PermissionError(f"안전한 일반 경로가 아닙니다: {path}")
+    if path_stat.st_uid != os.geteuid():
+        raise PermissionError(f"현재 프로세스 소유 경로가 아닙니다: {path}")
+    return path_stat
+
+
+def ensure_private_directory(path: Path) -> Path:
+    """민감 데이터 directory를 현재 사용자 전용으로 만들고 drift를 교정한다."""
+    path = Path(path)
+    path.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+    _owned_path_stat(path, stat.S_IFDIR)
+    if stat.S_IMODE(path.lstat().st_mode) != PRIVATE_DIRECTORY_MODE:
+        path.chmod(PRIVATE_DIRECTORY_MODE)
+    return path
+
+
+def ensure_private_file(path: Path) -> Path:
+    """존재하는 민감 데이터 파일을 현재 사용자 전용으로 제한한다."""
+    path = Path(path)
+    _owned_path_stat(path, stat.S_IFREG)
+    if stat.S_IMODE(path.lstat().st_mode) != PRIVATE_FILE_MODE:
+        path.chmod(PRIVATE_FILE_MODE)
+    return path
+
+
+def _validate_private_env_file(path: Path) -> None:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_IFMT(path_stat.st_mode) != stat.S_IFREG:
+        raise PermissionError(
+            f"환경 파일은 symlink가 아닌 일반 파일이어야 합니다: {path.name}"
+        )
+    if path_stat.st_uid != os.geteuid():
+        raise PermissionError(
+            f"환경 파일은 현재 프로세스 소유여야 합니다: {path.name}"
+        )
+    if stat.S_IMODE(path_stat.st_mode) & 0o077:
+        raise PermissionError(
+            f"환경 파일은 group/world 권한이 없어야 합니다: {path.name}"
+        )
 
 
 def _load_env_files(project_root: Path = PROJECT_ROOT) -> None:
-    load_dotenv(project_root / ".env.secrets")
-    load_dotenv(project_root / ".env.runtime")
+    secrets_file = project_root / ".env.secrets"
+    runtime_file = project_root / ".env.runtime"
+    _validate_private_env_file(secrets_file)
+    _validate_private_env_file(runtime_file)
+    load_dotenv(secrets_file)
+    load_dotenv(runtime_file)
 
 
 _load_env_files()
@@ -289,6 +342,7 @@ BACKUP_INTERVAL_SECONDS = _int_from_env("BACKUP_INTERVAL_SECONDS", 21600)
 BACKUP_RETENTION_DAYS = _int_from_env("BACKUP_RETENTION_DAYS", 30)
 # 일일 한도가 총량을 묶고, 쿨다운은 그 한도를 한 번에 소진하는 연타를 막는다.
 AI_COOLDOWN_SECONDS = _int_from_env("AI_COOLDOWN_SECONDS", 15)
+AI_USAGE_RETENTION_DAYS = _int_from_env("AI_USAGE_RETENTION_DAYS", 30)
 DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
 
 
@@ -306,6 +360,10 @@ def validate_config() -> None:
         raise RuntimeError("BACKUP_RETENTION_DAYS는 양의 정수여야 합니다.")
     if AI_COOLDOWN_SECONDS <= 0:
         raise RuntimeError("AI_COOLDOWN_SECONDS는 양의 정수여야 합니다.")
+    if AI_USAGE_RETENTION_DAYS <= 0:
+        raise RuntimeError("AI_USAGE_RETENTION_DAYS는 양의 정수여야 합니다.")
+    if ADMIN_TOKEN is not None and len(ADMIN_TOKEN) < 32:
+        raise RuntimeError("ADMIN_TOKEN은 32자 이상의 무작위 문자열이어야 합니다.")
     for name, configured_limit in (
         ("LIMIT_LIGHT", LIMIT_LIGHT),
         ("LIMIT_DEEP", LIMIT_DEEP),

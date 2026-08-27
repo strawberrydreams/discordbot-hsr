@@ -10,17 +10,17 @@
 
 슬래시 명령은 전역으로 등록됩니다. 봇이 어느 서버에 초대될지 미리 알 수 없으므로 길드 한정 동기화를 쓰지 않습니다. 전역 등록은 Discord 쪽 전파에 최대 1시간이 걸릴 수 있습니다.
 
-채널 지정은 환경변수가 아니라 서버별 설정입니다. `Administrator` 권한이 있는 각 서버 관리자는 `/설정 시작`으로 `🎮-디스코-파티` 채널을 만들고 `/설정 확인`으로 현재 값을 봅니다. 파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리에서 `guild_settings.db`에 Guild별로 저장합니다. 파티 채널에는 게임 선택 패널 하나가 유지되고, 게임을 누르면 해당 게임의 활성 모집 패널이 생깁니다. 역할 버튼은 참가·변경, 별도 `나가기` 버튼은 이탈에 사용하며 마지막 인원이 나가거나 24시간이 지나면 게임 패널이 삭제됩니다. `settings/games.json`을 바꾸면 새 게임 구성과 패널을 반영하도록 봇을 재시작해야 합니다. `/이벤트` 전용 채널을 미지정하면 어느 서버 채널에서나 사용할 수 있습니다.
+채널 지정은 환경변수가 아니라 서버별 설정입니다. `Administrator` 권한이 있는 각 서버 관리자는 `/설정 시작`으로 `🎮-디스코-파티` 채널을 만들고 `/설정 공지허용`으로 웹 공지 opt-in을 결정하며 `/설정 확인`으로 현재 값을 봅니다. 파티·공지·이벤트 채널과 금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리에서 `guild_settings.db`에 Guild별로 저장합니다. 웹 화면의 공지 opt-in은 읽기 전용입니다. 파티 채널에는 게임 선택 패널 하나가 유지되고, 게임을 누르면 해당 게임의 활성 모집 패널이 생깁니다. 역할 버튼은 참가·변경, 별도 `나가기` 버튼은 이탈에 사용하며 마지막 인원이 나가거나 24시간이 지나면 게임 패널이 삭제됩니다. `settings/games.json`을 바꾸면 새 게임 구성과 패널을 반영하도록 봇을 재시작해야 합니다. `/이벤트` 전용 채널을 미지정하면 어느 서버 채널에서나 사용할 수 있습니다.
 
 `/설정 시작`에는 봇의 `Manage Channels` 권한이 필요합니다.
 
-`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 시작됩니다. host/launchd 실행은 `127.0.0.1:8080`에 bind하고, Compose는 container 내부의 `0.0.0.0:8080`을 host의 `127.0.0.1:8080`에만 publish합니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
+`ADMIN_TOKEN`은 선택 사항입니다. 설정한 경우에만 웹 관리가 시작되며 32자 이상의 무작위 값이어야 합니다. host/launchd 실행은 `127.0.0.1:8080`에 bind하고, Compose는 container 내부의 `0.0.0.0:8080`을 host의 `127.0.0.1:8080`에만 publish합니다. 어느 쪽이든 봇을 실행한 컴퓨터의 브라우저에서 `http://127.0.0.1:8080`으로 열며, 다른 network interface에는 노출되지 않습니다. HTTP `Host`는 `127.0.0.1`과 `localhost`만 허용하고 로그인 실패 횟수도 제한합니다. 원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며 필요하면 별도 보안 설계를 먼저 하세요. 관리자 session cookie는 port가 아닌 host-scoped입니다. 같은 OS 사용자·loopback host trust boundary의 모든 로컬 서비스와 프로세스를 신뢰할 수 있을 때만 plain-HTTP 관리를 켜세요.
 
-웹 관리 공지는 같은 화면에서 opt-in하고 지정한 Guild 공지 채널에만 보냅니다. 공지당 PNG·JPEG·GIF·WebP 이미지 1개를 최대 8 MiB까지 첨부할 수 있습니다. 건너뜀·실패가 있으면 Guild별로 채널 미지정·삭제, 권한 부족, Discord 오류, 시간 초과 같은 핵심 원인을 화면에 표시합니다.
+웹 관리 공지는 Discord의 `/설정 공지허용`에서 opt-in한 Guild의 지정 공지 채널에만 보냅니다. 공지당 PNG·JPEG·GIF·WebP 이미지 1개를 최대 8 MiB까지 첨부할 수 있습니다. 건너뜀·실패가 있으면 Guild별로 채널 미지정·삭제, 권한 부족, Discord 오류, 시간 초과 같은 핵심 원인을 화면에 표시합니다.
 
 서버 간 데이터는 섞이지 않습니다. 금지어 카운트·파티·설정·게임 UID 등록은 `guild_id`로 스키마 수준에서 분리됩니다. 같은 사용자가 여러 서버에 있어도 카운트는 서버마다 독립입니다. AI 일일 한도는 예외로, 하나의 봇 인스턴스 전체에서 사용자별로 공유됩니다. DM 메시지는 귀속시킬 서버가 없어 금지어 집계에서 제외되고, 파티 패널 버튼도 서버 밖이나 최신 패널이 아닌 메시지에서는 거부됩니다.
 
-봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 금지어 카운트·파티·설정·게임 UID 등록을 삭제합니다. 다른 서버 데이터는 영향받지 않습니다.
+멤버가 서버에서 나가면 해당 서버의 금지어 카운트·파티 참가·게임 UID 등록을 삭제합니다. 봇이 서버에서 추방되거나 나가면 `on_guild_remove`가 해당 서버의 모든 금지어 카운트·파티·설정·게임 UID 등록을 삭제합니다. 삭제 전 백업 사본은 기본 보존 기간인 최대 30일 뒤 제거됩니다. 다른 서버 데이터는 영향받지 않습니다.
 
 ### AI 일일 한도
 
@@ -30,9 +30,9 @@
 | `/고급대화` | `LIMIT_DEEP` |
 | `/이미지` | `LIMIT_IMAGE` |
 
-한도는 명령별로 적용되며, 사용자별·봇 인스턴스 전역으로 집계하고 매일 KST 자정에 리셋됩니다. `.env.runtime`의 `LIMIT_LIGHT`·`LIMIT_DEEP`·`LIMIT_IMAGE`로 각 명령의 횟수를 조정하며, `/상태`에서 오늘 남은 횟수를 확인할 수 있습니다. `AI_COOLDOWN_SECONDS`(기본 15초)는 사용자별 연속 호출 속도를 추가로 제한합니다. 값을 바꾼 뒤에는 봇을 재시작하세요.
+한도는 명령별로 적용되며, 사용자별·봇 인스턴스 전역으로 집계하고 매일 KST 자정에 리셋됩니다. `.env.runtime`의 `LIMIT_LIGHT`·`LIMIT_DEEP`·`LIMIT_IMAGE`로 각 명령의 횟수를 조정하며, `/상태`에서 오늘 남은 횟수를 확인할 수 있습니다. `AI_COOLDOWN_SECONDS`(기본 15초)는 사용자별 연속 호출 속도를 추가로 제한합니다. 날짜별 기록은 `AI_USAGE_RETENTION_DAYS`(기본 30일)보다 오래되면 다음 AI 예약 시 삭제됩니다. 값을 바꾼 뒤에는 봇을 재시작하세요.
 
-한도는 API 호출이 시작되기 전에 예약되고, 호출 전에 실패하면 반환됩니다. 호출이 시작된 뒤의 실패는 한도를 소비합니다 — provider 쪽에서 이미 비용이 발생했을 수 있기 때문입니다.
+한도는 API 호출이 시작되기 전에 예약되고, 호출 전에 실패하면 반환됩니다. provider가 호출을 수락한 뒤의 실패는 비용이 발생했을 수 있어 한도를 소비하지만, Gemini가 `429`/`RESOURCE_EXHAUSTED`로 요청 자체를 거부하면 이미지 예약을 반환합니다.
 
 **최후의 안전망은 앱이 아니라 OpenAI 계정 예산 한도입니다.** 앱에는 전역 kill switch를 두지 않았으므로, OpenAI 대시보드에서 월 예산 상한을 반드시 설정해 두세요.
 
@@ -91,7 +91,9 @@ README의 1~3단계로 env와 settings를 준비한 뒤 Docker 전용 4~5단계 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install -r requirements-audit.txt
+.venv/bin/python -m pip_audit -r requirements.lock
 chown -R "$(id -u):$(id -g)" settings runtime
 find settings runtime -type d -exec chmod 700 {} +
 find settings runtime -type f -exec chmod 600 {} +
@@ -209,7 +211,7 @@ DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도**
 
 `backup` 서비스에는 `.env.secrets`를 전달하지 않습니다. `module.backup`은 Discord·OpenAI·Google 자격증명을 사용하지 않고 `module/config.py`가 import 시점에 `validate_config()`를 부르지 않으므로, 토큰 없이도 정상 기동합니다.
 
-`runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
+`runtime/backups/`는 Time Machine 또는 외장 디스크 백업에 반드시 포함하세요. DB와 백업은 애플리케이션 수준에서 암호화하지 않으므로 host의 전체 디스크 암호화를 켜고 `0700/0600` 권한을 유지해야 합니다. 다른 host나 object storage로 복사할 때는 전송·저장 암호화와 별도 key 관리를 적용하세요. 활성 DB가 있는 `runtime/data/` 자체는 iCloud Drive, Dropbox 같은 클라우드 동기화 폴더에 두지 마세요.
 
 ## 삭제 예정 데이터 export
 
@@ -233,7 +235,7 @@ docker compose run --rm --no-deps bot python -m module.export_legacy
 - `point_ledger` — 포인트 이동 원장 전체
 - `music_settings` — 길드별 음악 채널·패널 메시지 ID
 
-원본 DB는 읽지도 쓰지도 않습니다. SQLite 온라인 백업 API로 스냅숏을 뜬 뒤 그 사본에서 읽으므로 봇이 켜져 있어도 안전하고, 결과는 특정 시점에서 일관됩니다. 이미 마이그레이션이 끝난 DB에 실행하면 사라진 항목이 `null`로 기록될 뿐 실패하지 않습니다. 기존 파일은 덮어쓰지 않으므로, 같은 경로로 두 번 실행하면 두 번째가 거부됩니다.
+원본 DB는 읽지도 쓰지도 않습니다. SQLite 온라인 백업 API로 스냅숏을 뜬 뒤 그 사본에서 읽으므로 봇이 켜져 있어도 안전하고, 결과는 특정 시점에서 일관됩니다. 이미 마이그레이션이 끝난 DB에 실행하면 사라진 항목이 `null`로 기록될 뿐 실패하지 않습니다. export는 `0600` exclusive 파일로 생성하고 기존 파일·symlink는 덮어쓰지 않습니다.
 
 `forbidden_count`와 AI 사용량(`ai_usage`)은 삭제 대상이 아니므로 export에 포함되지 않고 마이그레이션 후에도 그대로 남습니다.
 

@@ -15,6 +15,7 @@ from module.config import (
     GOOGLE_API_KEY,
     IMAGE_MODEL,
     LIMIT_IMAGE,
+    ensure_private_directory,
 )
 
 # 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패한다.
@@ -39,7 +40,7 @@ class HyacineImageCog(commands.Cog):
         
         # CWD 상대 경로는 Docker 볼륨 밖이라 재시작 시 고아 파일이 남는다.
         self.temporary_image_directory = DATA_DIR / "temp_images"
-        self.temporary_image_directory.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.temporary_image_directory)
         self._sweep_stale_images()
 
     def _sweep_stale_images(self):
@@ -149,7 +150,16 @@ class HyacineImageCog(commands.Cog):
                     break
 
             if image_data is None:
-                print(f"⚠️ Image generation blocked/failed. Response: {response}")
+                finish_reasons = [
+                    str(getattr(candidate, "finish_reason", "unknown"))
+                    for candidate in list(
+                        getattr(response, "candidates", None) or ()
+                    )[:3]
+                ]
+                print(
+                    "⚠️ [hyacine_image] 이미지 없는 provider 응답 "
+                    f"(model={IMAGE_MODEL}, finish={','.join(finish_reasons) or 'unknown'})"
+                )
                 await interaction.followup.send(
                     "❌ 이미지를 생성하지 못했어요."
                     "\n(구글의 안전 필터 또는 인물 생성 정책에 의해 차단되었을 가능성이 높습니다.)"
@@ -160,11 +170,16 @@ class HyacineImageCog(commands.Cog):
             
             # 2. Save to a local file
             image_filename = f"{uuid.uuid4()}.png"
-            image_path = os.path.join(
-                self.temporary_image_directory, image_filename
+            image_path = self.temporary_image_directory / image_filename
+            descriptor = os.open(
+                image_path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
             )
-            
-            with open(image_path, "wb") as image_file:
+            with os.fdopen(descriptor, "wb") as image_file:
                 image_file.write(image_data)
                 
             # 3. Upload to Discord
@@ -194,11 +209,19 @@ class HyacineImageCog(commands.Cog):
 
         except Exception as error:
             quota_error = _is_gemini_quota_error(error)
+            if quota_error:
+                # provider가 생성 요청을 수락하지 않았으므로 사용자 일일 예약을 반환한다.
+                api_started = False
             print(
                 "❌ [hyacine_image] 이미지 생성 실패 "
                 f"(user={interaction.user.id})"
             )
-            if not quota_error:
+            if quota_error:
+                print(
+                    "⚠️ [hyacine_image] provider quota/billing 제한 "
+                    f"(provider=google, status={getattr(error, 'code', 'RESOURCE_EXHAUSTED')})"
+                )
+            else:
                 # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
                 traceback.print_exc()
             if image_generated:

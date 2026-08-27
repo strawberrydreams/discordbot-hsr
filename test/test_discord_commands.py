@@ -7,11 +7,11 @@ import json
 import os
 import pathlib
 import secrets
+import stat
 import tempfile
 import unittest
 import warnings
 from datetime import datetime, timezone
-from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -23,7 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from discord.ext import commands
 
 import module.config as config
-import module.guildsettings_cog as guildsettings_cog
+import module.database as database_module
 import module.main as bot_main
 from module.usage_cog import KST_TIMEZONE, UsageCog
 from module.database import (
@@ -47,6 +47,7 @@ import module.game_profile as game_profile
 import module.profile_cog as profile_cog
 from module.database import SQLiteProfileRepository
 import module.backup as backup
+import module.export_legacy as export_legacy
 import module.webadmin_cog as webadmin_cog
 
 
@@ -71,7 +72,8 @@ class MinimalConfigTest(unittest.TestCase):
     def test_only_discord_token_is_required(self):
         with patch.object(config, "DISCORD_TOKEN", "t"), \
              patch.object(config, "OPENAI_API_KEY", None), \
-             patch.object(config, "GOOGLE_API_KEY", None):
+             patch.object(config, "GOOGLE_API_KEY", None), \
+             patch.object(config, "ADMIN_TOKEN", None):
             config.validate_config()
 
     def test_missing_discord_token_still_raises(self):
@@ -85,7 +87,105 @@ class MinimalConfigTest(unittest.TestCase):
         self.assertGreater(config.LIMIT_LIGHT, 0)
         self.assertGreater(config.LIMIT_DEEP, 0)
         self.assertGreater(config.LIMIT_IMAGE, 0)
+        self.assertGreater(config.AI_USAGE_RETENTION_DAYS, 0)
 
+    def test_short_admin_token_is_rejected(self):
+        with patch.object(config, "DISCORD_TOKEN", "t"), patch.object(
+            config, "ADMIN_TOKEN", "short"
+        ), self.assertRaisesRegex(RuntimeError, "ADMIN_TOKEN"):
+            config.validate_config()
+
+
+class LocalDataSecurityTests(unittest.TestCase):
+    def test_environment_files_fail_closed_on_unsafe_mode_or_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            secrets_file = root / ".env.secrets"
+            runtime_file = root / ".env.runtime"
+            secrets_file.write_text("DISCORD_TOKEN=dummy\n", encoding="utf-8")
+            runtime_file.write_text("DATA_DIR=runtime/data\n", encoding="utf-8")
+            secrets_file.chmod(0o644)
+            runtime_file.chmod(0o600)
+            with self.assertRaises(PermissionError) as rejected:
+                config._load_env_files(root)
+            self.assertNotIn("dummy", str(rejected.exception))
+
+            secrets_file.chmod(0o600)
+            with patch.object(config, "load_dotenv") as loaded:
+                config._load_env_files(root)
+            self.assertEqual(loaded.call_count, 2)
+
+            runtime_file.unlink()
+            runtime_file.symlink_to(secrets_file)
+            with self.assertRaises(PermissionError):
+                config._load_env_files(root)
+
+    def test_sqlite_database_and_sidecars_are_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = pathlib.Path(directory) / "data"
+            data_directory.mkdir(mode=0o755)
+            database_path = data_directory / "usage.db"
+            repository = SQLiteUsageRepository(database_path)
+            repository.increment_forbidden_count(1, 2)
+            database_path.chmod(0o644)
+
+            SQLiteUsageRepository(database_path)
+
+            self.assertEqual(stat.S_IMODE(data_directory.stat().st_mode), 0o700)
+            for path in (
+                database_path,
+                database_path.with_name("usage.db-wal"),
+                database_path.with_name("usage.db-shm"),
+            ):
+                if path.exists():
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_legacy_export_is_exclusive_and_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "legacy.json"
+            export_legacy.write_export(destination, data_dir=root / "missing")
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            with self.assertRaises(FileExistsError):
+                export_legacy.write_export(destination, data_dir=root / "missing")
+
+    def test_ai_usage_prunes_expired_rows(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            database_module, "AI_USAGE_RETENTION_DAYS", 30
+        ):
+            repository = SQLiteUsageRepository(
+                pathlib.Path(directory) / "usage.db"
+            )
+            repository.consume_ai_usage(1, "2026-06-01", "light", 3)
+            repository.consume_ai_usage(1, "2026-08-01", "light", 3)
+
+            self.assertEqual(
+                repository.get_ai_usage(1, "2026-06-01", "light"), 0
+            )
+            self.assertEqual(
+                repository.get_ai_usage(1, "2026-08-01", "light"), 1
+            )
+
+
+class MemberDataLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_member_departure_deletes_guild_scoped_personal_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            usage_repository = SQLiteUsageRepository(root / "usage.db")
+            profile_repository = SQLiteProfileRepository(root / "profile.db")
+            usage_repository.increment_forbidden_count(7, 8)
+            profile_repository.set_uid(7, 8, "genshin", "123456789")
+            member = SimpleNamespace(guild=SimpleNamespace(id=7), id=8)
+
+            await UsageCog(None, usage_repository).on_member_remove(member)
+            await profile_cog.ProfileCog(
+                None,
+                profile_repository,
+                profile_service=SimpleNamespace(),
+            ).on_member_remove(member)
+
+            self.assertEqual(usage_repository.get_forbidden_count(7, 8), 0)
+            self.assertEqual(profile_repository.list_uids(7, 8), {})
 
 class ConditionalExtensionTest(unittest.TestCase):
     def test_all_extensions_load_when_every_key_present(self):
@@ -245,6 +345,16 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.google_key.start()
         self.addCleanup(self.google_key.stop)
 
+    async def test_temporary_image_directory_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            hyacine_image_cog, "DATA_DIR", pathlib.Path(directory) / "data"
+        ):
+            cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: None))
+            self.assertEqual(
+                stat.S_IMODE(cog.temporary_image_directory.stat().st_mode),
+                0o700,
+            )
+
     async def test_daily_limit_stops_before_the_provider_call(self):
         usage_cog = RecordingUsage(reserve_result=None)
         interaction = FakeInteraction(channel_id=1)
@@ -302,7 +412,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         cog.client = SimpleNamespace(
             models=SimpleNamespace(generate_content=generate_content)
         )
-        with patch("module.hyacine_image_cog.print"), patch(
+        with patch("module.hyacine_image_cog.print") as printed, patch(
             "module.hyacine_image_cog.traceback.print_exc"
         ) as print_traceback:
             await HyacineImageCog._generate_image.callback(cog, interaction, "test")
@@ -310,7 +420,42 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         message = interaction.followup.messages[-1][0][0]
         self.assertIn("요청 할당량 또는 결제 한도", message)
         self.assertIn("Google AI Studio", message)
+        self.assertEqual(usage_cog.releases, [(123, "2026-08-04", "image")])
+        self.assertIn(
+            "quota/billing",
+            " ".join(str(call.args[0]) for call in printed.call_args_list),
+        )
         print_traceback.assert_not_called()
+
+    async def test_empty_provider_response_log_does_not_reflect_response_or_prompt(self):
+        usage_cog = RecordingUsage()
+        interaction = FakeInteraction(channel_id=1)
+        cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
+
+        class SensitiveResponse:
+            parts = []
+            candidates = [SimpleNamespace(finish_reason="SAFETY")]
+
+            def __str__(self):
+                return "response-secret-marker"
+
+        cog.client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **_: SensitiveResponse()
+            )
+        )
+        with patch("module.hyacine_image_cog.print") as printed:
+            await HyacineImageCog._generate_image.callback(
+                cog, interaction, "prompt-secret-marker"
+            )
+
+        log_text = " ".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in printed.call_args_list
+        )
+        self.assertIn("SAFETY", log_text)
+        self.assertNotIn("response-secret-marker", log_text)
+        self.assertNotIn("prompt-secret-marker", log_text)
 
     async def test_long_prompt_is_truncated_in_embed(self):
         usage_cog = RecordingUsage()
@@ -318,7 +463,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
-        cog.temporary_image_directory = temporary_directory.name
+        cog.temporary_image_directory = pathlib.Path(temporary_directory.name)
         cog.bot = SimpleNamespace(
             get_cog=lambda _: usage_cog,
             loop=SimpleNamespace(create_task=lambda coro: coro.close()),
@@ -340,6 +485,8 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(description.endswith("…"))
         # 모델에는 원본이 그대로 간다.
         self.assertEqual(captured["contents"], [prompt])
+        image_path = next(pathlib.Path(temporary_directory.name).iterdir())
+        self.assertEqual(stat.S_IMODE(image_path.stat().st_mode), 0o600)
 
     async def test_failed_discord_upload_deletes_temporary_image_immediately(self):
         usage_cog = RecordingUsage()
@@ -348,7 +495,7 @@ class ImageCommandTests(unittest.IsolatedAsyncioTestCase):
         cog = HyacineImageCog(SimpleNamespace(get_cog=lambda _: usage_cog))
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
-        cog.temporary_image_directory = temporary_directory.name
+        cog.temporary_image_directory = pathlib.Path(temporary_directory.name)
         part = SimpleNamespace(inline_data=SimpleNamespace(data=b"png"))
         cog.client = SimpleNamespace(
             models=SimpleNamespace(
@@ -1589,6 +1736,29 @@ class PanelLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(panel_module.is_sendable_panel_channel(guild, channel))
 
+    async def test_stored_panel_from_previous_channel_is_not_current(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "discord.ext.tasks.Loop.start"
+        ):
+            root = pathlib.Path(directory)
+            settings = SQLiteGuildSettingsRepository(root / "settings.db")
+            settings.set_party_channel(1, 77)
+            settings.set_party_panel(1, playwith_cog.SELECTOR_PANEL_KEY, 100)
+            cog = PlayWithCog(
+                None,
+                party_repository=SQLitePartyRepository(root / "party.db"),
+                settings_repository=settings,
+            )
+            interaction = SimpleNamespace(
+                guild_id=1,
+                channel_id=88,
+                message=SimpleNamespace(id=100),
+            )
+
+            self.assertFalse(await cog._is_current_selector(interaction))
+            interaction.channel_id = 77
+            self.assertTrue(await cog._is_current_selector(interaction))
+
 
 class _SetupChannel:
     type = discord.ChannelType.text
@@ -1702,7 +1872,9 @@ class GuildSettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(
                 settings.get_forbidden_filter_enabled(TEST_GUILD_ID)
             )
-            self.assertEqual(settings.get_party_panels(TEST_GUILD_ID), {})
+            self.assertEqual(
+                settings.get_party_panels(TEST_GUILD_ID), {"selector": 999}
+            )
 
     async def test_show_reports_the_filter_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1725,7 +1897,7 @@ class GuildSettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             f for f in embed.fields if f.name == "이벤트 전용 채널"
         )
         self.assertEqual(event_field.value, "<#77>")
-        self.assertIn("localhost 웹 관리 페이지", embed.footer.text)
+        self.assertIn("/설정 공지허용", embed.footer.text)
 
 
 class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
@@ -1756,11 +1928,29 @@ class GreetingOutsideAIGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuildSetupTests(unittest.IsolatedAsyncioTestCase):
-    def test_only_start_and_show_settings_commands_remain(self):
+    def test_only_supported_settings_commands_remain(self):
         self.assertEqual(
             {command.name for command in GuildSettingsCog.설정.commands},
-            {"시작", "확인"},
+            {"시작", "공지허용", "확인"},
         )
+
+    async def test_guild_administrator_controls_host_announcement_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SQLiteGuildSettingsRepository(
+                pathlib.Path(directory) / "settings.db"
+            )
+            cog = GuildSettingsCog(_SetupBot(), settings)
+            interaction = SimpleNamespace(
+                guild_id=TEST_GUILD_ID,
+                response=RecordingResponse(),
+            )
+
+            await GuildSettingsCog._set_host_announcements.callback(
+                cog, interaction, True
+            )
+            self.assertTrue(settings.get_allow_host_announce(TEST_GUILD_ID))
+
+        self.assertIn("허용", interaction.response.messages[0][0][0])
 
     async def test_settings_commands_are_administrator_only(self):
         permissions = GuildSettingsCog.설정.default_permissions
@@ -3117,6 +3307,18 @@ class _WebSettingsRepository:
     def set_event_channel(self, guild_id, channel_id):
         self.event_channels[guild_id] = channel_id
 
+    def set_party_channel(self, guild_id, channel_id):
+        value = self.party_channels.get(guild_id)
+        if isinstance(value, Exception):
+            raise value
+        self.party_channels[guild_id] = channel_id
+
+    def set_announcement_channel(self, guild_id, channel_id):
+        self.channels[guild_id] = channel_id
+
+    def set_forbidden_filter_enabled(self, guild_id, enabled):
+        self.forbidden_filters[guild_id] = enabled
+
     def get_allow_host_announce(self, guild_id):
         return guild_id in self.guild_ids
 
@@ -3577,8 +3779,8 @@ class WebAdminTemplateDesignTests(unittest.TestCase):
                 '<select name="party_channel_id"></select>'
                 '<select name="announcement_channel_id"></select>'
                 '<select name="event_channel_id"></select>'
-                '<select name="allow_host_announce"></select>'
                 '<select name="forbidden_filter_enabled"></select>'
+                '<button name="setting" value="party_channel_id"></button>'
                 '</form></td></tr>'
             ),
             guild_options='<option value="">전체</option>',
@@ -3605,8 +3807,8 @@ class WebAdminTemplateDesignTests(unittest.TestCase):
             "party_channel_id",
             "announcement_channel_id",
             "event_channel_id",
-            "allow_host_announce",
             "forbidden_filter_enabled",
+            "setting",
             "title",
             "body",
             "image",
@@ -3637,7 +3839,9 @@ class WebAdminTemplateDesignTests(unittest.TestCase):
 class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
     async def test_security_headers_middleware_accepts_aiohttp_handler_keyword(self):
         handler = AsyncMock(return_value=webadmin_cog.web.Response(text="ok"))
-        request = SimpleNamespace(method="GET", path="/")
+        request = SimpleNamespace(
+            method="GET", path="/", headers={"Host": "127.0.0.1:8080"}
+        )
 
         response = await webadmin_cog._security_headers(
             request,
@@ -3647,11 +3851,27 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         handler.assert_awaited_once_with(request)
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
 
+    async def test_security_middleware_rejects_untrusted_host(self):
+        request = SimpleNamespace(
+            method="GET", path="/", headers={"Host": "attacker.example"}
+        )
+        with self.assertRaises(webadmin_cog.web.HTTPBadRequest) as rejected:
+            await webadmin_cog._security_headers(
+                request, handler=AsyncMock()
+            )
+        self.assertEqual(
+            rejected.exception.headers["X-Content-Type-Options"], "nosniff"
+        )
+
     async def test_unhandled_web_error_reports_only_the_core_cause(self):
         async def handler(_):
             raise RuntimeError("secret internal detail")
 
-        request = SimpleNamespace(method="POST", path="/guilds/settings")
+        request = SimpleNamespace(
+            method="POST",
+            path="/guilds/settings",
+            headers={"Host": "127.0.0.1"},
+        )
         with patch.object(webadmin_cog.logger, "exception"):
             response = await webadmin_cog._security_headers(request, handler)
 
@@ -3659,7 +3879,7 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("예상하지 못한 서버 오류 (RuntimeError)", response.text)
         self.assertNotIn("secret internal detail", response.text)
 
-    async def test_guild_settings_handler_persists_all_guild_settings(self):
+    async def test_guild_settings_handler_persists_selected_setting(self):
         permissions = SimpleNamespace(
             view_channel=True,
             send_messages=True,
@@ -3681,10 +3901,8 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         )
         bot = _WebBot()
         bot.guilds = [guild]
-        invalidated = Mock()
         ensure_panels = AsyncMock()
         bot.cogs = {
-            "ForbiddenFilterCog": SimpleNamespace(invalidate_guild=invalidated),
             "PlayWithCog": SimpleNamespace(ensure_panels=ensure_panels),
         }
         repository = _WebSettingsRepository()
@@ -3699,11 +3917,8 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "csrf": "csrf",
                     "guild_id": "1",
+                    "setting": "party_channel_id",
                     "party_channel_id": "77",
-                    "announcement_channel_id": "77",
-                    "event_channel_id": "77",
-                    "allow_host_announce": "1",
-                    "forbidden_filter_enabled": "0",
                 }
             ),
         ), patch.object(cog, "_require_session"), patch.object(
@@ -3719,11 +3934,6 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, response)
         self.assertEqual(repository.party_channels[1], 77)
-        self.assertEqual(repository.channels[1], 77)
-        self.assertEqual(repository.event_channels[1], 77)
-        self.assertIn(1, repository.guild_ids)
-        self.assertFalse(repository.forbidden_filters[1])
-        invalidated.assert_called_once_with(1)
         ensure_panels.assert_awaited_once_with(guild)
 
     async def test_guild_settings_failure_reports_a_sanitized_cause(self):
@@ -3742,11 +3952,8 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "csrf": "csrf",
                     "guild_id": "1",
+                    "setting": "party_channel_id",
                     "party_channel_id": "",
-                    "announcement_channel_id": "",
-                    "event_channel_id": "",
-                    "allow_host_announce": "0",
-                    "forbidden_filter_enabled": "1",
                 }
             ),
         ), patch.object(cog, "_require_session"), patch.object(
@@ -3772,11 +3979,18 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             embed_links=True,
             attach_files=True,
         )
+        permission_calls = 0
+
+        def permissions_for(_):
+            nonlocal permission_calls
+            permission_calls += 1
+            return permissions
+
         channel = SimpleNamespace(
             id=77,
             name="events",
             type=discord.ChannelType.text,
-            permissions_for=lambda member: permissions,
+            permissions_for=permissions_for,
         )
         guild = SimpleNamespace(
             id=1,
@@ -3800,10 +4014,18 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(problem, "")
         self.assertIn('action="/guilds/settings"', rows)
         self.assertEqual(rows.count('<option value="77" selected>#events</option>'), 3)
-        self.assertIn('name="allow_host_announce"', rows)
+        self.assertNotIn('name="allow_host_announce"', rows)
+        self.assertIn("/설정 공지허용", rows)
         self.assertIn('name="forbidden_filter_enabled"', rows)
         self.assertIn('<option value="0" selected>꺼짐</option>', rows)
         self.assertNotIn("<테스트>", rows)
+        self.assertEqual(permission_calls, 1)
+
+    def test_generic_value_error_is_not_reflected(self):
+        reason = webadmin_cog.WebAdminCog._operation_error_reason(
+            ValueError("private filesystem path")
+        )
+        self.assertNotIn("private filesystem path", reason)
 
 
 class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
@@ -3889,6 +4111,26 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         page = await index.text()
         self.assertNotIn("operator-secret", page)
 
+    async def test_login_is_rate_limited_and_untrusted_host_is_rejected(self):
+        for _ in range(webadmin_cog.LOGIN_FAILURE_LIMIT):
+            failed = await self.client.post(
+                "/login", data={"token": "wrong"}
+            )
+            self.assertEqual(failed.status, 401)
+        limited = await self.client.post(
+            "/login", data={"token": "operator-secret"}
+        )
+        self.assertEqual(limited.status, 429)
+        self.assertEqual(
+            limited.headers["Retry-After"],
+            str(webadmin_cog.LOGIN_FAILURE_WINDOW_SECONDS),
+        )
+
+        rejected = await self.client.get(
+            "/login", headers={"Host": "attacker.example"}
+        )
+        self.assertEqual(rejected.status, 400)
+
     async def test_cookie_attributes_csrf_logout_and_restart_memory(self):
         response = await self.client.post(
             "/login", data={"token": "operator-secret"}, allow_redirects=False
@@ -3927,45 +4169,165 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         channel = _AnnouncementChannel(name="events")
         guild = _AnnouncementGuild({77: channel}, guild_id=1, name="테스트 길드")
         self.bot.guilds = [guild]
+        self.repository.guild_ids = [1]
+        self.bot.cogs = {
+            "PlayWithCog": SimpleNamespace(ensure_panels=AsyncMock()),
+            "ForbiddenFilterCog": SimpleNamespace(invalidate_guild=Mock()),
+        }
 
-        selected = await self.client.post(
-            "/guilds/settings",
-            data={
-                "csrf": csrf,
-                "guild_id": "1",
-                "party_channel_id": "77",
-                "announcement_channel_id": "77",
-                "event_channel_id": "77",
-                "allow_host_announce": "1",
-                "forbidden_filter_enabled": "0",
-            },
-        )
-        self.assertEqual(selected.status, 200)
+        for setting, value in (
+            ("party_channel_id", "77"),
+            ("announcement_channel_id", "77"),
+            ("event_channel_id", "77"),
+            ("forbidden_filter_enabled", "0"),
+        ):
+            selected = await self.client.post(
+                "/guilds/settings",
+                data={
+                    "csrf": csrf,
+                    "guild_id": "1",
+                    "setting": setting,
+                    setting: value,
+                },
+            )
+            self.assertEqual(selected.status, 200)
+            self.assertIn("설정을 저장했습니다", await selected.text())
         self.assertEqual(self.repository.party_channels[1], 77)
         self.assertEqual(self.repository.channels[1], 77)
         self.assertEqual(self.repository.event_channels[1], 77)
         self.assertIn(1, self.repository.guild_ids)
         self.assertFalse(self.repository.forbidden_filters[1])
-        self.assertIn("설정을 저장했습니다", await selected.text())
 
-        cleared = await self.client.post(
+        for setting, value in (
+            ("party_channel_id", ""),
+            ("announcement_channel_id", ""),
+            ("event_channel_id", ""),
+            ("forbidden_filter_enabled", "1"),
+        ):
+            cleared = await self.client.post(
+                "/guilds/settings",
+                data={
+                    "csrf": csrf,
+                    "guild_id": "1",
+                    "setting": setting,
+                    setting: value,
+                },
+            )
+            self.assertEqual(cleared.status, 200)
+        self.assertIsNone(self.repository.party_channels[1])
+        self.assertIsNone(self.repository.channels[1])
+        self.assertIsNone(self.repository.event_channels[1])
+        self.assertIn(1, self.repository.guild_ids)
+        self.assertTrue(self.repository.forbidden_filters[1])
+
+    async def test_unusable_existing_channel_does_not_block_another_setting(self):
+        _, csrf = await self._login()
+        self.bot.guilds = [_AnnouncementGuild({}, guild_id=1)]
+        self.repository.party_channels[1] = 999
+
+        response = await self.client.post(
             "/guilds/settings",
             data={
                 "csrf": csrf,
                 "guild_id": "1",
-                "party_channel_id": "",
-                "announcement_channel_id": "",
-                "event_channel_id": "",
-                "allow_host_announce": "0",
-                "forbidden_filter_enabled": "1",
+                "setting": "forbidden_filter_enabled",
+                "forbidden_filter_enabled": "0",
+                "party_channel_id": "999",
             },
         )
-        self.assertEqual(cleared.status, 200)
-        self.assertIsNone(self.repository.party_channels[1])
-        self.assertIsNone(self.repository.channels[1])
-        self.assertIsNone(self.repository.event_channels[1])
-        self.assertNotIn(1, self.repository.guild_ids)
-        self.assertTrue(self.repository.forbidden_filters[1])
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(self.repository.forbidden_filters[1])
+        self.assertEqual(self.repository.party_channels[1], 999)
+
+    async def test_party_channel_requires_all_bot_permissions(self):
+        _, csrf = await self._login()
+        for missing_permission in (
+            "view_channel",
+            "send_messages",
+            "read_message_history",
+            "embed_links",
+        ):
+            with self.subTest(missing_permission=missing_permission):
+                blocked = _SetupChannel(
+                    77, "party", **{missing_permission: False}
+                )
+                self.bot.guilds = [
+                    _AnnouncementGuild({77: blocked}, guild_id=1)
+                ]
+                self.repository.party_channels.clear()
+
+                response = await self.client.post(
+                    "/guilds/settings",
+                    data={
+                        "csrf": csrf,
+                        "guild_id": "1",
+                        "setting": "party_channel_id",
+                        "party_channel_id": "77",
+                    },
+                )
+
+                self.assertIn("권한이 부족합니다", await response.text())
+                self.assertNotIn(1, self.repository.party_channels)
+
+    async def test_party_save_repairs_same_channel_and_reports_missing_or_timeout(self):
+        _, csrf = await self._login()
+        channel = _AnnouncementChannel()
+        guild = _AnnouncementGuild({77: channel}, guild_id=1)
+        self.bot.guilds = [guild]
+        self.repository.party_channels[1] = 77
+        ensure_panels = AsyncMock()
+        self.bot.cogs["PlayWithCog"] = SimpleNamespace(
+            ensure_panels=ensure_panels
+        )
+        payload = {
+            "csrf": csrf,
+            "guild_id": "1",
+            "setting": "party_channel_id",
+            "party_channel_id": "77",
+        }
+
+        repaired = await self.client.post("/guilds/settings", data=payload)
+        self.assertIn("설정을 저장했습니다", await repaired.text())
+        ensure_panels.assert_awaited_once_with(guild)
+
+        self.bot.cogs.pop("PlayWithCog")
+        missing = await self.client.post("/guilds/settings", data=payload)
+        self.assertIn("파티 모듈이 로드되지 않아", await missing.text())
+
+        async def hang(_):
+            await asyncio.sleep(3600)
+
+        self.bot.cogs["PlayWithCog"] = SimpleNamespace(ensure_panels=hang)
+        with patch.object(
+            webadmin_cog, "PANEL_REFRESH_TIMEOUT_SECONDS", 0.01
+        ), patch.object(webadmin_cog.logger, "exception"):
+            timed_out = await self.client.post("/guilds/settings", data=payload)
+        self.assertIn("작업 시간이 초과되었습니다", await timed_out.text())
+
+    async def test_non_ascii_snowflakes_are_rejected_without_500(self):
+        _, csrf = await self._login()
+        self.bot.guilds = [_AnnouncementGuild({}, guild_id=1)]
+        for payload in (
+            {
+                "csrf": csrf,
+                "guild_id": "²",
+                "setting": "forbidden_filter_enabled",
+                "forbidden_filter_enabled": "1",
+            },
+            {
+                "csrf": csrf,
+                "guild_id": "1",
+                "setting": "party_channel_id",
+                "party_channel_id": "²",
+            },
+        ):
+            with self.subTest(payload=payload):
+                response = await self.client.post(
+                    "/guilds/settings", data=payload
+                )
+                self.assertEqual(response.status, 200)
+                self.assertIn("올바르지 않습니다", await response.text())
 
     async def test_session_expiry_relogin_revocation_and_stale_cookie(self):
         with patch.object(webadmin_cog.time, "monotonic", return_value=100.0):
@@ -4043,6 +4405,58 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("</textarea><script>", page)
         self.assertIn("&lt;/textarea&gt;&lt;script&gt;", page)
         self.assertIn(session_id, self.cog.admin_sessions)
+
+    async def test_forbidden_file_write_and_reload_are_serialized(self):
+        _, csrf = await self._login()
+        first_reload_started = asyncio.Event()
+        release_first_reload = asyncio.Event()
+        reload_count = 0
+
+        async def reload_forbidden_words():
+            nonlocal reload_count
+            reload_count += 1
+            if reload_count == 1:
+                first_reload_started.set()
+                await release_first_reload.wait()
+
+        self.bot.cogs["ForbiddenFilterCog"] = SimpleNamespace(
+            reload_forbidden_words=reload_forbidden_words
+        )
+        first = asyncio.create_task(
+            self.client.post(
+                "/settings/forbidden_words.json",
+                data={"csrf": csrf, "document": '["first"]'},
+            )
+        )
+        await asyncio.wait_for(first_reload_started.wait(), timeout=1)
+        second = asyncio.create_task(
+            self.client.post(
+                "/settings/forbidden_words.json",
+                data={"csrf": csrf, "document": '["second"]'},
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(
+            json.loads(
+                (self.settings_dir / "forbidden_words.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            ["first"],
+        )
+
+        release_first_reload.set()
+        responses = await asyncio.gather(first, second)
+        self.assertTrue(all(response.status == 200 for response in responses))
+        self.assertEqual(reload_count, 2)
+        self.assertEqual(
+            json.loads(
+                (self.settings_dir / "forbidden_words.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            ["second"],
+        )
 
     def test_template_replaces_original_placeholders_once(self):
         page = self.cog._render_template(
@@ -4455,6 +4869,7 @@ class WebAdminAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         for guild_id, expected in (
             ("999", "공지를 허용하지 않은 길드입니다."),
             ("nope", "공지 대상 길드가 올바르지 않습니다."),
+            ("²", "공지 대상 길드가 올바르지 않습니다."),
         ):
             with self.subTest(guild_id=guild_id):
                 response = await self.client.post(

@@ -204,18 +204,52 @@ class PlayWithCog(commands.Cog):
         return False
 
     async def _is_current_panel(self, interaction: discord.Interaction, game: str) -> bool:
-        panels = await run_db(
-            self.settings_repository.get_party_panels, interaction.guild_id
+        party_channel_id, panels = await asyncio.gather(
+            run_db(
+                self.settings_repository.get_party_channel,
+                interaction.guild_id,
+            ),
+            run_db(
+                self.settings_repository.get_party_panels,
+                interaction.guild_id,
+            ),
         )
         message = getattr(interaction, "message", None)
-        return message is not None and panels.get(game) == message.id
+        interaction_channel_id = getattr(interaction, "channel_id", None)
+        if interaction_channel_id is None and message is not None:
+            interaction_channel_id = getattr(
+                getattr(message, "channel", None), "id", None
+            )
+        return (
+            message is not None
+            and party_channel_id is not None
+            and interaction_channel_id == party_channel_id
+            and panels.get(game) == message.id
+        )
 
     async def _is_current_selector(self, interaction: discord.Interaction) -> bool:
-        panels = await run_db(
-            self.settings_repository.get_party_panels, interaction.guild_id
+        party_channel_id, panels = await asyncio.gather(
+            run_db(
+                self.settings_repository.get_party_channel,
+                interaction.guild_id,
+            ),
+            run_db(
+                self.settings_repository.get_party_panels,
+                interaction.guild_id,
+            ),
         )
         message = getattr(interaction, "message", None)
-        return message is not None and panels.get(SELECTOR_PANEL_KEY) == message.id
+        interaction_channel_id = getattr(interaction, "channel_id", None)
+        if interaction_channel_id is None and message is not None:
+            interaction_channel_id = getattr(
+                getattr(message, "channel", None), "id", None
+            )
+        return (
+            message is not None
+            and party_channel_id is not None
+            and interaction_channel_id == party_channel_id
+            and panels.get(SELECTOR_PANEL_KEY) == message.id
+        )
 
     async def handle_game_select(
         self, interaction: discord.Interaction, game: str

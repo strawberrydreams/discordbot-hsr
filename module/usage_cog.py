@@ -80,6 +80,15 @@ class UsageCog(commands.Cog):
         """봇이 서버에서 제거되면 그 서버의 금지어 카운트를 남기지 않는다."""
         await run_db(self.usage_repository.delete_guild, guild.id)
 
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """멤버가 나가면 해당 서버의 개인별 금지어 기록을 남기지 않는다."""
+        await run_db(
+            self.usage_repository.delete_user,
+            member.guild.id,
+            member.id,
+        )
+
     # ── Slash Commands ── #
 
     @app_commands.command(name="프로필", description="사용자의 서버 프로필 정보를 확인합니다.")

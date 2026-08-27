@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import html
 import io
 import json
@@ -23,7 +24,11 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.panel import is_sendable_announcement_channel, is_sendable_panel_channel
+from module.panel import (
+    channel_send_capabilities,
+    is_sendable_announcement_channel,
+    is_sendable_panel_channel,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -31,6 +36,11 @@ ALLOWED_HOSTS = frozenset({DEFAULT_HOST, "0.0.0.0"})
 PORT = 8080
 SESSION_COOKIE = "admin_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
+LOGIN_FAILURE_LIMIT = 10
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+PANEL_REFRESH_TIMEOUT_SECONDS = 10
+REQUEST_HOSTS = frozenset({"127.0.0.1", "localhost"})
+MAX_SNOWFLAKE = (1 << 64) - 1
 # form body는 percent-encoded라 UTF-8 한 바이트가 최대 "%XX" 3자로 늘어난다. 한글
 # 설정 파일이 파일 한도 안인데도 413으로 막히면 안 된다. 실제 파일 크기는
 # config.atomic_write_settings가 따로 강제하므로 여기는 전송 한도일 뿐이다.
@@ -47,6 +57,8 @@ SECURITY_HEADERS = {
         "form-action 'self'; frame-ancestors 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
 }
@@ -61,6 +73,41 @@ PLACEHOLDER_PATTERN = re.compile(
 # 먼저 확인할 것.
 RAW_PLACEHOLDERS = frozenset({"guild_options", "guild_rows"})
 logger = logging.getLogger(__name__)
+
+
+class PublicInputError(ValueError):
+    """검증된 사용자 입력 오류만 HTTP 응답에 원문을 노출한다."""
+
+
+def _request_host_allowed(request: web.Request) -> bool:
+    raw_host = request.headers.get("Host", "")
+    if not raw_host or "," in raw_host or "@" in raw_host:
+        return False
+    if raw_host.startswith("["):
+        closing = raw_host.find("]")
+        host = raw_host[1:closing] if closing > 0 else ""
+        remainder = raw_host[closing + 1 :] if closing > 0 else raw_host
+        if remainder and not re.fullmatch(r":[0-9]{1,5}", remainder):
+            return False
+    else:
+        if raw_host.count(":") > 1:
+            return False
+        host, separator, port = raw_host.partition(":")
+        if separator and not re.fullmatch(r"[0-9]{1,5}", port):
+            return False
+    return host.lower() in REQUEST_HOSTS
+
+
+def _parse_snowflake(raw_value: str, *, optional: bool = False) -> int | None:
+    value = raw_value.strip()
+    if optional and not value:
+        return None
+    if not re.fullmatch(r"[0-9]+", value):
+        raise PublicInputError("Discord ID는 ASCII 숫자여야 합니다.")
+    parsed = int(value)
+    if not 0 < parsed <= MAX_SNOWFLAKE:
+        raise PublicInputError("Discord ID 범위가 올바르지 않습니다.")
+    return parsed
 
 
 def _bind_host() -> str:
@@ -87,6 +134,8 @@ class AnnouncementUpload:
 @web.middleware
 async def _security_headers(request: web.Request, handler):
     try:
+        if not _request_host_allowed(request):
+            raise web.HTTPBadRequest(text="허용되지 않은 Host입니다.")
         response = await handler(request)
     except web.HTTPException as response:
         response.headers.update(SECURITY_HEADERS)
@@ -115,6 +164,7 @@ class WebAdminCog(commands.Cog):
             settings_repository or create_guild_settings_repository()
         )
         self.admin_sessions: dict[str, AdminSession] = {}
+        self._failed_login_attempts: deque[float] = deque()
         self.web_runner: web.AppRunner | None = None
         self.web_site: web.TCPSite | None = None
         self._mutation_lock = asyncio.Lock()
@@ -265,7 +315,9 @@ class WebAdminCog(commands.Cog):
         }
         extension_and_check = image_signatures.get(upload.content_type)
         if extension_and_check is None or not extension_and_check[1](upload.payload):
-            raise ValueError("공지 이미지는 PNG, JPEG, GIF, WebP 파일이어야 합니다.")
+            raise PublicInputError(
+                "공지 이미지는 PNG, JPEG, GIF, WebP 파일이어야 합니다."
+            )
         return f"announcement.{extension_and_check[0]}"
 
     def _get_active_session(
@@ -363,7 +415,7 @@ class WebAdminCog(commands.Cog):
 
     @staticmethod
     def _channel_options(
-        guild,
+        channels: list[tuple[object, bool, bool]],
         selected_channel_id: int | None,
         *,
         unset_label: str,
@@ -376,16 +428,12 @@ class WebAdminCog(commands.Cog):
             )
         ]
         selected_channel_found = False
-        for channel in getattr(guild, "text_channels", ()):
+        for channel, panel_allowed, announcement_allowed in channels:
             channel_id = int(channel.id)
             selected = channel_id == selected_channel_id
             selected_channel_found |= selected
             label = f"#{channel.name}"
-            usable = (
-                is_sendable_announcement_channel(guild, channel)
-                if announcement
-                else is_sendable_panel_channel(guild, channel)
-            )
+            usable = announcement_allowed if announcement else panel_allowed
             if not usable:
                 label += " (권한 부족)"
             options.append(
@@ -444,6 +492,10 @@ class WebAdminCog(commands.Cog):
                     + self._operation_error_reason(error),
                 )
             escaped_guild_name = html.escape(str(guild.name), quote=True)
+            channels = [
+                (channel, *channel_send_capabilities(guild, channel))
+                for channel in getattr(guild, "text_channels", ())
+            ]
             settings_form = (
                 '<form class="guild-settings-form" method="post" '
                 'action="/guilds/settings">'
@@ -452,27 +504,29 @@ class WebAdminCog(commands.Cog):
                 '<div class="guild-settings-fields">'
                 '<label>파티 채널'
                 f'<select name="party_channel_id" aria-label="{escaped_guild_name} 파티 채널">'
-                f'{self._channel_options(guild, party_channel_id, unset_label="미지정")}'
-                '</select></label>'
+                f'{self._channel_options(channels, party_channel_id, unset_label="미지정")}'
+                '</select><button class="button button-secondary" name="setting" '
+                'value="party_channel_id" type="submit">저장</button></label>'
                 '<label>공지 채널'
                 f'<select name="announcement_channel_id" aria-label="{escaped_guild_name} 공지 채널">'
-                f'{self._channel_options(guild, announcement_channel_id, unset_label="미지정", announcement=True)}'
-                '</select></label>'
+                f'{self._channel_options(channels, announcement_channel_id, unset_label="미지정", announcement=True)}'
+                '</select><button class="button button-secondary" name="setting" '
+                'value="announcement_channel_id" type="submit">저장</button></label>'
                 '<label>이벤트 채널'
                 f'<select name="event_channel_id" aria-label="{escaped_guild_name} 이벤트 채널">'
-                f'{self._channel_options(guild, event_channel_id, unset_label="제한 없음")}'
-                '</select></label>'
-                '<label>웹 공지'
-                f'<select name="allow_host_announce" aria-label="{escaped_guild_name} 웹 공지 허용">'
-                f'<option value="1"{" selected" if announcements_allowed else ""}>허용</option>'
-                f'<option value="0"{"" if announcements_allowed else " selected"}>차단</option>'
-                '</select></label>'
+                f'{self._channel_options(channels, event_channel_id, unset_label="제한 없음")}'
+                '</select><button class="button button-secondary" name="setting" '
+                'value="event_channel_id" type="submit">저장</button></label>'
+                '<label>웹 공지 '
+                f'<span>{"허용" if announcements_allowed else "차단"} — '
+                'Discord `/설정 공지허용`에서 변경</span></label>'
                 '<label>금지어 필터'
                 f'<select name="forbidden_filter_enabled" aria-label="{escaped_guild_name} 금지어 필터">'
                 f'<option value="1"{" selected" if forbidden_filter_enabled else ""}>켜짐</option>'
                 f'<option value="0"{"" if forbidden_filter_enabled else " selected"}>꺼짐</option>'
-                '</select></label>'
-                '</div><button class="button button-secondary" type="submit">설정 저장</button>'
+                '</select><button class="button button-secondary" name="setting" '
+                'value="forbidden_filter_enabled" type="submit">저장</button></label>'
+                '</div>'
                 '</form>'
             )
             row_fragments.append(
@@ -506,8 +560,10 @@ class WebAdminCog(commands.Cog):
             return "파일 또는 디렉터리에 접근할 권한이 없습니다."
         if isinstance(error, RecursionError):
             return "설정 구조가 너무 깊습니다. 중첩 단계를 줄여 주세요."
-        if isinstance(error, ValueError):
+        if isinstance(error, PublicInputError):
             return str(error)
+        if isinstance(error, ValueError):
+            return "입력값 또는 설정 내용이 올바르지 않습니다."
         if isinstance(error, OSError):
             return f"운영체제 작업에 실패했습니다 ({error.strerror or type(error).__name__})."
         if isinstance(error, discord.Forbidden):
@@ -564,11 +620,24 @@ class WebAdminCog(commands.Cog):
         form = await self._read_form(request)
         supplied = form.get("token", "")
         expected = config.ADMIN_TOKEN or ""
+        now = time.monotonic()
+        cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+        while self._failed_login_attempts and self._failed_login_attempts[0] <= cutoff:
+            self._failed_login_attempts.popleft()
+        if len(self._failed_login_attempts) >= LOGIN_FAILURE_LIMIT:
+            response = self._login_response(
+                "인증 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+                status=429,
+            )
+            response.headers["Retry-After"] = str(LOGIN_FAILURE_WINDOW_SECONDS)
+            return response
         if not supplied or not expected or not secrets.compare_digest(
             supplied.encode(), expected.encode()
         ):
+            self._failed_login_attempts.append(now)
             return self._login_response("인증에 실패했습니다.", status=401)
 
+        self._failed_login_attempts.clear()
         session_id = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
         self.admin_sessions.clear()
@@ -623,33 +692,40 @@ class WebAdminCog(commands.Cog):
                 return await self._index_response(
                     csrf, f"저장 실패: {self._operation_error_reason(error)}"
                 )
+        settings_saved = False
         try:
             async with self._mutation_lock:
                 await asyncio.to_thread(
                     config.atomic_write_settings, settings_filename, document
                 )
+                settings_saved = True
+                if settings_filename == "forbidden_words.json":
+                    forbidden_filter_cog = self.bot.get_cog(
+                        "ForbiddenFilterCog"
+                    )
+                    if forbidden_filter_cog is not None:
+                        await forbidden_filter_cog.reload_forbidden_words()
         except (OSError, ValueError, RecursionError) as error:
+            if settings_saved:
+                return await self._index_response(
+                    csrf,
+                    "파일은 저장했지만 즉시 반영에 실패했습니다. 원인: "
+                    + self._operation_error_reason(error),
+                )
             return await self._index_response(
                 csrf, f"저장 실패: {self._operation_error_reason(error)}"
             )
         except Exception as error:
             logger.exception("Web settings file save failed: %s", settings_filename)
+            if settings_saved:
+                return await self._index_response(
+                    csrf,
+                    "파일은 저장했지만 즉시 반영에 실패했습니다. 원인: "
+                    + self._operation_error_reason(error),
+                )
             return await self._index_response(
                 csrf, f"저장 실패: {self._operation_error_reason(error)}"
             )
-
-        if settings_filename == "forbidden_words.json":
-            forbidden_filter_cog = self.bot.get_cog("ForbiddenFilterCog")
-            if forbidden_filter_cog is not None:
-                try:
-                    await forbidden_filter_cog.reload_forbidden_words()
-                except Exception as error:
-                    logger.exception("Forbidden words reload failed after web save")
-                    return await self._index_response(
-                        csrf,
-                        "파일은 저장했지만 금지어 필터 즉시 반영에 실패했습니다. 원인: "
-                        + self._operation_error_reason(error),
-                    )
 
         notices = {
             "persona.json": "저장했습니다. 새 AI 세션부터 적용됩니다.",
@@ -663,92 +739,135 @@ class WebAdminCog(commands.Cog):
         form = await self._read_form(request)
         _, session = self._require_csrf(request, form)
         csrf = session.csrf
-        guild_id_text = form.get("guild_id", "").strip()
-        channel_fields = {
-            "파티": form.get("party_channel_id", "").strip(),
-            "공지": form.get("announcement_channel_id", "").strip(),
-            "이벤트": form.get("event_channel_id", "").strip(),
+        setting_name = form.get("setting", "")
+        channel_settings = {
+            "party_channel_id": (
+                "파티",
+                self.settings_repository.set_party_channel,
+                False,
+            ),
+            "announcement_channel_id": (
+                "공지",
+                self.settings_repository.set_announcement_channel,
+                True,
+            ),
+            "event_channel_id": (
+                "이벤트",
+                self.settings_repository.set_event_channel,
+                False,
+            ),
         }
-        allow_text = form.get("allow_host_announce", "")
-        filter_text = form.get("forbidden_filter_enabled", "")
-        if (
-            not guild_id_text.isdigit()
-            or any(value and not value.isdigit() for value in channel_fields.values())
-            or allow_text not in {"0", "1"}
-            or filter_text not in {"0", "1"}
-        ):
+        if setting_name not in {
+            *channel_settings,
+            "forbidden_filter_enabled",
+        }:
             return await self._index_response(csrf, "길드 설정 값이 올바르지 않습니다.")
 
-        guild_id = int(guild_id_text)
+        try:
+            guild_id = _parse_snowflake(form.get("guild_id", ""))
+        except PublicInputError:
+            return await self._index_response(
+                csrf, "길드 설정 값이 올바르지 않습니다."
+            )
+        assert guild_id is not None
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return await self._index_response(csrf, "참여 중인 길드를 찾지 못했습니다.")
 
-        channel_ids = {
-            label: int(value) if value else None
-            for label, value in channel_fields.items()
-        }
-        for label, channel_id in channel_ids.items():
-            if channel_id is None:
-                continue
-            channel = guild.get_channel(channel_id)
-            usable = (
-                is_sendable_announcement_channel(guild, channel)
-                if label == "공지"
-                else is_sendable_panel_channel(guild, channel)
-            )
-            if not usable:
-                extra_permission = ", 파일 첨부" if label == "공지" else ""
+        side_effect_problems: list[str] = []
+        if setting_name in channel_settings:
+            label, setter, announcement = channel_settings[setting_name]
+            try:
+                channel_id = _parse_snowflake(
+                    form.get(setting_name, ""), optional=True
+                )
+            except PublicInputError:
+                return await self._index_response(
+                    csrf, f"{label} 채널 값이 올바르지 않습니다."
+                )
+            if channel_id is not None:
+                channel = guild.get_channel(channel_id)
+                usable = (
+                    is_sendable_announcement_channel(guild, channel)
+                    if announcement
+                    else is_sendable_panel_channel(guild, channel)
+                )
+                if not usable:
+                    extra_permission = ", 파일 첨부" if announcement else ""
+                    return await self._index_response(
+                        csrf,
+                        f"{label} 채널을 찾을 수 없거나 봇의 채널 보기, 메시지 보내기, "
+                        f"메시지 기록 보기, 링크 임베드{extra_permission} 권한이 부족합니다.",
+                    )
+            try:
+                async with self._mutation_lock:
+                    await run_db(setter, guild_id, channel_id)
+            except Exception as error:
+                logger.exception(
+                    "Guild channel setting save failed for guild_id=%s setting=%s",
+                    guild_id,
+                    setting_name,
+                )
                 return await self._index_response(
                     csrf,
-                    f"{label} 채널을 찾을 수 없거나 봇의 채널 보기, 메시지 보내기, 메시지 기록 보기, 링크 임베드{extra_permission} 권한이 부족합니다.",
+                    f"길드 설정 저장 실패: {self._operation_error_reason(error)}",
                 )
 
-        try:
-            previous_party_channel_id = await run_db(
-                self.settings_repository.get_party_channel, guild_id
-            )
-            async with self._mutation_lock:
-                await run_db(
-                    self.settings_repository.set_guild_settings,
-                    guild_id,
-                    channel_ids["파티"],
-                    channel_ids["공지"],
-                    channel_ids["이벤트"],
-                    allow_text == "1",
-                    filter_text == "1",
+            if setting_name == "party_channel_id" and channel_id is not None:
+                play_with_cog = self.bot.get_cog("PlayWithCog")
+                if play_with_cog is None:
+                    side_effect_problems.append(
+                        "파티 모듈이 로드되지 않아 패널을 갱신하지 못했습니다."
+                    )
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            play_with_cog.ensure_panels(guild),
+                            timeout=PANEL_REFRESH_TIMEOUT_SECONDS,
+                        )
+                    except Exception as error:
+                        logger.exception(
+                            "Party panel refresh failed for guild_id=%s", guild_id
+                        )
+                        side_effect_problems.append(
+                            "파티 패널 갱신 실패 — "
+                            + self._operation_error_reason(error)
+                        )
+        else:
+            filter_text = form.get("forbidden_filter_enabled", "")
+            if filter_text not in {"0", "1"}:
+                return await self._index_response(
+                    csrf, "금지어 필터 값이 올바르지 않습니다."
                 )
-        except Exception as error:
-            logger.exception("Guild settings save failed for guild_id=%s", guild_id)
-            return await self._index_response(
-                csrf,
-                f"길드 설정 저장 실패: {self._operation_error_reason(error)}",
-            )
+            try:
+                async with self._mutation_lock:
+                    await run_db(
+                        self.settings_repository.set_forbidden_filter_enabled,
+                        guild_id,
+                        filter_text == "1",
+                    )
+            except Exception as error:
+                logger.exception(
+                    "Forbidden filter setting save failed for guild_id=%s", guild_id
+                )
+                return await self._index_response(
+                    csrf,
+                    f"길드 설정 저장 실패: {self._operation_error_reason(error)}",
+                )
 
-        side_effect_problems: list[str] = []
-        forbidden_filter_cog = self.bot.get_cog("ForbiddenFilterCog")
-        if forbidden_filter_cog is not None:
-            try:
-                forbidden_filter_cog.invalidate_guild(guild_id)
-            except Exception as error:
-                logger.exception("Forbidden filter cache refresh failed for guild_id=%s", guild_id)
-                side_effect_problems.append(
-                    "금지어 필터 즉시 반영 실패 — "
-                    + self._operation_error_reason(error)
-                )
-        if (
-            channel_ids["파티"] is not None
-            and channel_ids["파티"] != previous_party_channel_id
-        ):
-            play_with_cog = self.bot.get_cog("PlayWithCog")
-            try:
-                if play_with_cog is not None:
-                    await play_with_cog.ensure_panels(guild)
-            except Exception as error:
-                logger.exception("Party panel refresh failed for guild_id=%s", guild_id)
-                side_effect_problems.append(
-                    "파티 패널 갱신 실패 — " + self._operation_error_reason(error)
-                )
+            forbidden_filter_cog = self.bot.get_cog("ForbiddenFilterCog")
+            if forbidden_filter_cog is not None:
+                try:
+                    forbidden_filter_cog.invalidate_guild(guild_id)
+                except Exception as error:
+                    logger.exception(
+                        "Forbidden filter cache refresh failed for guild_id=%s",
+                        guild_id,
+                    )
+                    side_effect_problems.append(
+                        "금지어 필터 즉시 반영 실패 — "
+                        + self._operation_error_reason(error)
+                    )
 
         if side_effect_problems:
             return await self._index_response(
@@ -758,7 +877,7 @@ class WebAdminCog(commands.Cog):
             )
         return await self._index_response(
             csrf,
-            f"{guild.name}의 채널·공지·금지어 설정을 저장했습니다.",
+            f"{guild.name}의 설정을 저장했습니다.",
         )
 
     async def announce_post(self, request: web.Request) -> web.StreamResponse:
@@ -772,14 +891,20 @@ class WebAdminCog(commands.Cog):
         colour_text = form.get("color", "").strip()
         try:
             image_name = self._announcement_image_name(upload) if upload else None
-        except ValueError as exc:
+        except PublicInputError as exc:
             return await self._index_response(csrf, str(exc))
         if not title or len(title) > ANNOUNCEMENT_TITLE_LIMIT:
             return await self._index_response(csrf, "공지 제목은 1~256자여야 합니다.")
         if not body or len(body) > ANNOUNCEMENT_BODY_LIMIT:
             return await self._index_response(csrf, "공지 본문은 1~4,096자여야 합니다.")
-        if target_guild_id_text and not target_guild_id_text.isdigit():
-            return await self._index_response(csrf, "공지 대상 길드가 올바르지 않습니다.")
+        try:
+            target_guild_id = _parse_snowflake(
+                target_guild_id_text, optional=True
+            )
+        except PublicInputError:
+            return await self._index_response(
+                csrf, "공지 대상 길드가 올바르지 않습니다."
+            )
         colour = discord.Colour.default()
         if colour_text:
             if not ANNOUNCEMENT_COLOUR_PATTERN.match(colour_text):
@@ -802,14 +927,14 @@ class WebAdminCog(commands.Cog):
                     "공지 대상 목록을 읽지 못했습니다. 원인: "
                     + self._operation_error_reason(error),
                 )
-            if target_guild_id_text:
+            if target_guild_id is not None:
                 # 옵트인 목록이 곧 신뢰 경계다. 드롭다운 표시 여부와 무관하게
                 # 전송 직전에 다시 확인해야 form을 조작한 요청이 통과하지 않는다.
-                if int(target_guild_id_text) not in guild_ids:
+                if target_guild_id not in guild_ids:
                     return await self._index_response(
                         csrf, "공지를 허용하지 않은 길드입니다."
                     )
-                guild_ids = [int(target_guild_id_text)]
+                guild_ids = [target_guild_id]
             embed = discord.Embed(title=title, description=body, colour=colour)
             if image_name:
                 embed.set_image(url=f"attachment://{image_name}")

@@ -14,8 +14,8 @@ the last change included in that milestone.
 
 ### Added
 
-- The web admin can save party, announcement, and event channels plus announcement
-  and forbidden-filter toggles per guild, and includes a Discord syntax guide.
+- The web admin can save party, announcement, and event channels plus the
+  forbidden-filter toggle per guild, and includes a Discord syntax guide.
 
 ### Improved
 
@@ -25,15 +25,22 @@ the last change included in that milestone.
   by the game account and first showcase character on two body lines.
 - Removed the separate image API explanation from exhausted OpenAI credit
   messages.
-- Kept only `/설정 시작` and `/설정 확인`, moving the other guild controls to the
-  localhost web admin. Skipped and failed web operations now include a concise
-  cause.
+- Kept `/설정 시작`, `/설정 공지허용`, and `/설정 확인`, moving channel and
+  forbidden-filter controls to the localhost web admin. Only guild administrators
+  can change announcement consent in Discord, and skipped or failed web operations
+  now include a concise cause.
 - Added actionable guidance for exhausted Gemini image quota or billing limits.
+- Restricted SQLite, backup, export, and generated-image files to the owner, and
+  hardened environment-file loading, localhost authentication, and dependency
+  auditing.
 
 ### Fixed
 
 - Fixed web admin requests failing when current aiohttp versions invoked the
   security-header middleware.
+- Fixed party-channel save failures discarding panel recovery state or reporting
+  success, and stopped rejected Gemini quota requests consuming a user's daily
+  image allowance.
 
 ## [0.7.0] - 2026-08-21 — Game cards and selective party recruitment
 
