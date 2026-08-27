@@ -55,10 +55,14 @@ class GameAdapter:
     def validate_uid(self, uid: str) -> str:
         """형식만 본다. 실존 확인은 조회가 한다."""
         cleaned = uid.strip()
-        if not cleaned.isdigit() or len(cleaned) not in self.uid_lengths:
+        if (
+            not cleaned.isascii()
+            or not cleaned.isdecimal()
+            or len(cleaned) not in self.uid_lengths
+        ):
             allowed_lengths = "·".join(str(length) for length in self.uid_lengths)
             raise ProfileLookupError(
-                f"{self.label} UID는 숫자 {allowed_lengths}자리여야 합니다."
+                f"{self.label} UID는 ASCII 숫자 {allowed_lengths}자리여야 합니다."
             )
         return cleaned
 

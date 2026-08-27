@@ -3003,6 +3003,20 @@ class ProfileRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr"))
         self.assertIn("9자리", interaction.followup.messages[0][0][0])
 
+    async def test_non_ascii_uid_digits_never_reach_the_network(self):
+        for uid in ("²" * 9, "８" * 9):
+            with self.subTest(uid=uid):
+                interaction = _ProfileInteraction()
+                await profile_cog.ProfileCog._register.callback(
+                    self.cog, interaction, _choice("hsr"), uid
+                )
+
+                self.assertEqual(self.profile_service.calls, [])
+                self.assertIsNone(
+                    self.repository.get_uid(TEST_GUILD_ID, FakeUser.id, "hsr")
+                )
+                self.assertIn("9자리", interaction.followup.messages[0][0][0])
+
     async def test_a_uid_that_does_not_exist_is_refused_at_registration(self):
         interaction = _ProfileInteraction()
 

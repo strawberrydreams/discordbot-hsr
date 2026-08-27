@@ -41,6 +41,16 @@ the last change included in that milestone.
 - Fixed party-channel save failures discarding panel recovery state or reporting
   success, and stopped rejected Gemini quota requests consuming a user's daily
   image allowance.
+- Restored the Python-version marker required for reproducible Python 3.12 image
+  builds, upgraded the vulnerable `cryptography` lock entry, and rejected non-ASCII
+  game UIDs before contacting Enka.
+
+### Breaking Changes
+
+- Removed attendance, point-economy, and music features together with their
+  commands and persistent fields. Before upgrading an older deployment, run
+  `python -m module.export_legacy` as described in the operations guide; startup
+  migration then removes the retired tables and columns.
 
 ## [0.7.0] - 2026-08-21 — Game cards and selective party recruitment
 
