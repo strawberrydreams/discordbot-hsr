@@ -1,6 +1,6 @@
 # Hyacine — Discord Bot HSR
 
-Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성, 게임 프로필 카드를 제공합니다. Python 3.12 이상과 SQLite를 사용합니다.
+Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리티 봇**입니다. 파티 모집, 서버 이벤트, 금지어 관리, GPT 대화와 이미지 생성, 게임 프로필 카드를 제공합니다. Python 3.12 이상과 SQLite를 사용합니다. macOS·Linux 같은 **POSIX 호스트**에서 동작하며, Windows에서는 WSL2 위에서 실행합니다(아래 [실행 환경](#실행-환경) 참고).
 
 각 운영자가 자신의 Discord Application과 토큰을 만들어 직접 운영합니다. 저장소 소유자는 다른 사람에게 봇을 호스팅하거나 Discord 서버를 대신 관리하지 않습니다. Hyacine은 *Honkai: Star Rail* 비공식 팬 프로젝트이며 HoYoverse와 제휴하거나 승인받지 않았습니다.
 
@@ -18,6 +18,17 @@ Hyacine은 한국어 Discord 서버용 **자가 호스팅 커뮤니티 유틸리
 - `/설정 시작`, `/설정 공지허용`, `/설정 확인` — `Administrator` 권한이 있는 서버 관리자가 기본 파티 채널을 만들고 웹 공지 수신 동의를 결정하며 현재 설정을 확인
 
 ## 빠른 시작
+
+### 실행 환경
+
+아래 설치·실행 명령은 **POSIX 호스트**를 전제로 합니다. **macOS·Linux 터미널**에서는 그대로 동작하고, 프로덕션은 어느 OS든 **Docker Compose**로 운영합니다.
+
+**Windows에서는 WSL2 위에서 실행합니다.** 봇 코드가 Unix 전용 기능(파일 락·소유자 권한 검사·원자적 파일 교체)을 사용하므로 네이티브 Windows Python으로는 실행되지 않습니다. 다음 두 가지 중 하나를 쓰세요.
+
+- **Docker Desktop (WSL2 백엔드)** — 아래 4·5단계의 Docker Compose 절차를 그대로 사용합니다. 컨테이너가 Linux라 코드 수정이 필요 없습니다. Docker Desktop 설치 시 WSL2 통합을 켜세요.
+- **WSL2 배포판(Ubuntu 등) 셸** — WSL2 셸을 열고 아래 모든 단계를 macOS·Linux와 동일하게 실행합니다. host virtualenv(`.venv`)로 봇을 직접 실행할 때도 이 셸을 씁니다.
+
+어느 방법이든 **리포지토리를 WSL 리눅스 파일시스템 안(예: `~/discordbot-hsr`)에 clone하세요.** Windows 쪽 경로(`/mnt/c/…`)에 두면 `chmod`·소유권·bind mount 권한이 리눅스 방식으로 매핑되지 않아, env 파일 권한 검사와 Compose 5단계의 소유권 설정이 실패합니다.
 
 ### 1. Discord Application과 토큰 준비
 
