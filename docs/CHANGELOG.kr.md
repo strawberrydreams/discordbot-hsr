@@ -43,6 +43,8 @@
 - Python 3.12 이미지 빌드에 필요한 Python 버전 marker를 복원하고, 취약한
   `cryptography` lock 항목을 상향했으며, 비ASCII 게임 UID를 Enka 호출 전에
   거부하도록 수정했습니다.
+- universal lock 재생성 시 Python 3.13+ `audioop-lts` marker를 유지해 Python
+  3.12 의존성 감사와 이미지 빌드가 실패하지 않도록 했습니다.
 
 ### Breaking Changes (호환성 변경)
 

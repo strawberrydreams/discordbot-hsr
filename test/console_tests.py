@@ -636,6 +636,26 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
 
 
+def test_requirements_lock_contract():
+    source = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    lock = (PROJECT_ROOT / "requirements.lock").read_text(encoding="utf-8")
+    audioop_line = next(
+        (line for line in lock.splitlines() if line.startswith("audioop-lts==")),
+        "",
+    )
+    check(
+        "lock 재생성 명령이 environment marker를 보존",
+        "--universal --no-strip-markers" in source
+        and "--universal --no-strip-markers" in lock,
+    )
+    check(
+        "Python 3.13+ audioop 호환 패키지는 3.12 설치에서 제외",
+        "python_version" in audioop_line
+        and ">=" in audioop_line
+        and "3.13" in audioop_line,
+    )
+
+
 def test_deployment_contracts():
     services = None
     dockerignore = (
@@ -2891,6 +2911,7 @@ if __name__ == "__main__":
         test_readme_public_distribution_contract()
         test_operations_document_contract()
         test_final_installation_and_operations_contract()
+        test_requirements_lock_contract()
         test_deployment_contracts()
         test_deployment_contracts_skip_compose_when_cli_missing()
         test_forbidden_words_degrade_gracefully()

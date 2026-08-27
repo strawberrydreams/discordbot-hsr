@@ -48,6 +48,8 @@ the last change included in that milestone.
 - Restored the Python-version marker required for reproducible Python 3.12 image
   builds, upgraded the vulnerable `cryptography` lock entry, and rejected non-ASCII
   game UIDs before contacting Enka.
+- Kept the Python 3.13+ `audioop-lts` marker when regenerating the universal lock,
+  preventing Python 3.12 dependency audits and image builds from failing.
 
 ### Breaking Changes
 
