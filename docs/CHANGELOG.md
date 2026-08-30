@@ -14,11 +14,27 @@ the last change included in that milestone.
 
 ### Added
 
+- Members can set a bio shown on `/프로필` with `/프로필설정`, up to 200
+  characters and separate per server.
+- The web admin screen is available in Korean and English, switchable from a
+  plain link in the top bar with no JavaScript.
+- The web admin shows the remaining session time and adds a `세션 연장` button
+  that pushes the 8-hour expiry out again.
 - The web admin can save party, announcement, and event channels plus the
   forbidden-filter toggle per guild, and includes a Discord syntax guide.
 
 ### Improved
 
+- The bot name on the web admin screens now comes from the Discord Application
+  instead of being hardcoded.
+- Moved the web admin styles into a single stylesheet so the two screens can no
+  longer drift apart on shared design tokens.
+- Renamed modules, classes, and database files to match what they actually
+  contain, and replaced string-based cog lookups with class references so a
+  future rename fails at import instead of silently returning nothing.
+- Added an import-ordering configuration (`ruff.toml`) and a startup self-check
+  that refuses to boot when a cog other cogs depend on is not registered.
+- Deployment and rollback now run both test suites, not only the console suite.
 - Standardized production deployment on Docker Compose and removed the retired
   macOS LaunchAgent path.
 - Updated the direct OpenAI, Google Gen AI, and python-dotenv dependencies.
@@ -40,6 +56,9 @@ the last change included in that milestone.
 
 ### Fixed
 
+- Fixed a race where a database operation could fail with a missing-file error
+  when SQLite removed the `-wal`/`-shm` sidecars while another connection was
+  opening the same database.
 - Fixed web admin requests failing when current aiohttp versions invoked the
   security-header middleware.
 - Fixed party-channel save failures discarding panel recovery state or reporting
@@ -53,6 +72,16 @@ the last change included in that milestone.
 
 ### Breaking Changes
 
+- **Two database files were renamed.** `attendance_data.db` is now
+  `usage_data.db` and `profile_data.db` is now `game_uid_data.db`. The bot looks
+  only for the new names, so an existing installation must move the files once
+  with the bot stopped — see "Migrating an existing installation's database
+  filenames" in the operations guide. Without the move, empty databases are
+  created and existing records become invisible.
+- The `usage_data.db` schema moved from v3 to v4 by adding a `bio` column to
+  `users`. The migration runs at startup and preserves existing counts.
+- `README.md` and `docs/operations.md` are now the English originals; the Korean
+  versions moved to `README.kr.md` and `docs/operations.kr.md`.
 - Removed attendance, point-economy, and music features together with their
   commands and persistent fields. Before upgrading an older deployment, run
   `python -m module.export_legacy` as described in the operations guide; startup
