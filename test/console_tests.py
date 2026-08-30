@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import stat
@@ -313,10 +314,26 @@ def test_web_admin_atomic_settings_contract():
         )
 
 
+# 공개 문서는 영문이 원본이고 `.kr.md`가 한국어 미러다. 절 순서와 셸 블록이
+# 두 언어에서 같으므로, 스크립트 계약은 인덱스로 잘라 원본에서 검사하고
+# 언어쌍 동기화는 test_language_pair_documents_stay_in_sync가 따로 지킨다.
+PUBLIC_DOCS = ("README.md", "docs/operations.md")
+PUBLIC_DOCS_KR = ("README.kr.md", "docs/operations.kr.md")
+
+
+def _doc(name):
+    return (PROJECT_ROOT / name).read_text(encoding="utf-8")
+
+
+def _sections(text):
+    """`## ` 최상위 절 목록. 0번은 머리말이다."""
+    return text.split("\n## ")
+
+
 def test_forbidden_word_document_path():
     public_docs = "\n".join(
         (PROJECT_ROOT / name).read_text(encoding="utf-8")
-        for name in ("README.md", "docs/operations.md")
+        for name in PUBLIC_DOCS + PUBLIC_DOCS_KR
     )
     check("금지어 기준 경로는 settings", "settings/forbidden_words.json" in public_docs)
     check(
@@ -326,41 +343,145 @@ def test_forbidden_word_document_path():
     check("폐기된 금지어 env 없음", "FORBIDDEN_WORDS_FILE" not in public_docs)
 
 
+def test_language_pair_documents_stay_in_sync():
+    """영문 원본과 `.kr.md` 미러가 같은 사실을 말하는지 구조로 확인한다.
+
+    번역 시점 이후에 들어간 변경이 한쪽에만 남기 쉬운 것이 이 축의 실패
+    양상이다. 산문은 기계적으로 비교할 수 없지만 절 구성과 셸 블록은 할 수 있고,
+    실제로 어긋나는 것은 대개 그쪽이다.
+    """
+    print("\n[0] 문서 언어쌍")
+    pairs = (("README.md", "README.kr.md"), ("docs/operations.md", "docs/operations.kr.md"))
+    for english, korean in pairs:
+        source_en, source_kr = _doc(english), _doc(korean)
+
+        # 상호 링크가 3번째 줄에 있다 — CHANGELOG가 세운 관례다.
+        check(
+            f"{english} 3번째 줄에 한국어 링크",
+            source_en.splitlines()[2].startswith("[한국어]"),
+            f"({source_en.splitlines()[2]!r})",
+        )
+        check(
+            f"{korean} 3번째 줄에 영문 링크",
+            source_kr.splitlines()[2].startswith("[English]"),
+            f"({source_kr.splitlines()[2]!r})",
+        )
+
+        for level in ("## ", "### "):
+            count_en = source_en.count(f"\n{level}")
+            count_kr = source_kr.count(f"\n{level}")
+            check(
+                f"{english} / {korean} `{level.strip()}` 절 수 일치",
+                count_en == count_kr,
+                f"(en={count_en} kr={count_kr})",
+            )
+
+        blocks_en = re.findall(r"```bash\n(.*?)\n```", source_en, re.S)
+        blocks_kr = re.findall(r"```bash\n(.*?)\n```", source_kr, re.S)
+        check(
+            f"{english} / {korean} 셸 블록 수 일치",
+            len(blocks_en) == len(blocks_kr),
+            f"(en={len(blocks_en)} kr={len(blocks_kr)})",
+        )
+        # 블록 안에서 언어에 따라 달라지는 것은 운영자에게 보이는 echo 문구뿐이다.
+        for index, (block_en, block_kr) in enumerate(zip(blocks_en, blocks_kr)):
+            differing = [
+                line
+                for line in set(block_en.splitlines()) ^ set(block_kr.splitlines())
+                if "echo " not in line and not line.lstrip().startswith("#")
+                and "#" not in line
+            ]
+            check(
+                f"{english} 블록 {index}의 명령이 미러와 동일",
+                not differing,
+                f"({differing[:2]})",
+            )
+
+    # 두 언어 모두 같은 DB 파일명을 말해야 한다.
+    for name in PUBLIC_DOCS + PUBLIC_DOCS_KR:
+        source = _doc(name)
+        check(
+            f"{name}에 폐기된 DB 파일명 없음",
+            not any(
+                stale in source.replace("| `attendance_data.db` |", "").replace(
+                    "| `profile_data.db` |", ""
+                ).replace("attendance_data.db$suffix", "").replace(
+                    '"attendance_data.db', ""
+                ).replace("profile_data.db$suffix", "").replace('"profile_data.db', "")
+                for stale in ("attendance_data.db", "profile_data.db")
+            ),
+            "(이관 안내 표와 mv 명령은 예외)",
+        )
+
+
 def test_readme_public_distribution_contract():
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    required = (
-        "자가 호스팅 커뮤니티 유틸리티 봇",
-        "자신의 Discord Application과 봇 토큰",
-        "Guild Install만",
+    readme = _doc("README.md")
+    readme_kr = _doc("README.kr.md")
+    # 코드 식별자·권한 이름·경로는 번역하지 않으므로 두 언어에서 똑같이 검사한다.
+    shared = (
         "`bot`, `applications.commands`",
         "`View Channel`",
         "`Send Messages`",
         "`Read Message History`",
         "`Embed Links`",
         "`Attach Files`",
-        "`Message Content`와 `Server Members`",
-        "`Public Bot`을 끄세요",
-        "Portal 설정을 변경하지는 않습니다",
+        "`Message Content`",
+        "`Server Members`",
+        "`Public Bot`",
         "settings/forbidden_words.json",
+        "`LIMIT_LIGHT`",
+        "`LIMIT_DEEP`",
+        "`LIMIT_IMAGE`",
+        "Docker Compose",
+        "`guild_id`",
+        "`Administrator`",
+        "Hyacine",
+        "HoYoverse",
+    )
+    for name, source in (("README.md", readme), ("README.kr.md", readme_kr)):
+        check(
+            f"{name} 공개 배포 계약(언어 무관)",
+            all(term in source for term in shared),
+            f"({[t for t in shared if t not in source]})",
+        )
+
+    korean_prose = (
+        "자가 호스팅 커뮤니티 유틸리티 봇",
+        "자신의 Discord Application과 봇 토큰",
+        "Guild Install만",
+        "Portal 설정을 변경하지는 않습니다",
         "사용자별 KST 일일 AI 한도",
-        "`LIMIT_LIGHT`, `LIMIT_DEEP`, `LIMIT_IMAGE`",
         "provider 계정에도 예산 상한",
-        "Docker Compose로 운영",
-        "금지어 카운트, 파티, 길드 설정, 게임 UID 등록 데이터는 `guild_id`",
-        "AI 사용량 한도만 사용자별·봇 인스턴스 전역",
-        "`Administrator` 권한",
+        "비공식 팬 프로젝트",
+        "다른 사람에게 봇을 호스팅",
     )
-    check("README 공개 배포 계약", all(term in readme for term in required))
     check(
-        "README는 Hyacine 팬 프로젝트 고지 유지",
-        "Hyacine" in readme and "비공식 팬 프로젝트" in readme and "HoYoverse" in readme,
+        "README.kr.md 공개 배포 계약(한국어 산문)",
+        all(term in readme_kr for term in korean_prose),
+        f"({[t for t in korean_prose if t not in readme_kr]})",
     )
-    check("README는 타인 호스팅을 약속하지 않음", "다른 사람에게 봇을 호스팅" in readme)
+
+    english_prose = (
+        "self-hosted community utility bot",
+        "your own Discord Application and bot token",
+        "**Guild Install only**",
+        "does not change Portal settings",
+        "per-user daily KST limit",
+        "budget cap on your OpenAI and Google provider accounts",
+        "unofficial *Honkai: Star Rail* fan project",
+        "does not host the bot for anyone else",
+    )
+    check(
+        "README.md 공개 배포 계약(영문 산문)",
+        all(term in readme for term in english_prose),
+        f"({[t for t in english_prose if t not in readme]})",
+    )
 
 
 def test_operations_document_contract():
-    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
-    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    operations = _doc("docs/operations.md")
+    operations_kr = _doc("docs/operations.kr.md")
+    restore = _sections(operations)[6]
     check(
         "복구는 내장 stage restore를 사용",
         "stage_restore(Path(sys.argv[1]), Path(sys.argv[2]))" in restore,
@@ -373,24 +494,42 @@ def test_operations_document_contract():
         and 'cmp -s "$staged" "settings/$name"' in restore,
     )
     check("복구 문서에 긴 DB 수리 one-liner 없음", "verify_database" not in restore)
-    check("AI 한도는 사용자별 인스턴스 전역", "사용자별·봇 인스턴스 전역" in operations)
-    check("AI 한도는 KST 자정 리셋", "매일 KST 자정에 리셋" in operations)
-    check("AI 한도는 명령별로 적용", "명령별로 적용" in operations)
-    check("provider 계정 예산 안전망 유지", "OpenAI 계정 예산 한도" in operations)
+    check(
+        "AI 한도는 사용자별 인스턴스 전역",
+        "사용자별·봇 인스턴스 전역" in operations_kr
+        and "per user across the whole bot instance" in operations,
+    )
+    check(
+        "AI 한도는 KST 자정 리셋",
+        "매일 KST 자정에 리셋" in operations_kr
+        and "reset at midnight KST" in operations,
+    )
+    check(
+        "AI 한도는 명령별로 적용",
+        "명령별로 적용" in operations_kr and "apply per command" in operations,
+    )
+    check(
+        "provider 계정 예산 안전망 유지",
+        "OpenAI 계정 예산 한도" in operations_kr
+        and "OpenAI account budget limit" in operations,
+    )
 
 
 def test_final_installation_and_operations_contract():
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
-    public_docs = f"{readme}\n{operations}"
+    readme = _doc("README.md")
+    readme_kr = _doc("README.kr.md")
+    operations = _doc("docs/operations.md")
+    operations_kr = _doc("docs/operations.kr.md")
+    public_docs = "\n".join(_doc(name) for name in PUBLIC_DOCS + PUBLIC_DOCS_KR)
     compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    quick_start = readme.split("## 빠른 시작", 1)[1].split("## 운영 시 주의", 1)[0]
-    restore = operations.split("## 검증된 백업으로 실제 복구", 1)[1].split("## 배포", 1)[0]
+    quick_start = _sections(readme)[2]
+    quick_start_kr = _sections(_doc("README.kr.md"))[2]
+    restore = _sections(operations)[6]
     restore_script = restore.split("```bash", 1)[1].split("```", 1)[0]
-    deployment = operations.split("## 배포", 1)[1].split("## 코드 롤백", 1)[0]
+    deployment = _sections(operations)[8]
     docker_deploy = deployment.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
-    rollback = operations.split("## 코드 롤백", 1)[1].split("## 호스트 한계", 1)[0]
+    rollback = _sections(operations)[9]
     docker_rollback = rollback.split("Docker:", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
 
     def ordered(text, *terms):
@@ -411,11 +550,19 @@ cp settings/games.example.json settings/games.json""" in quick_start,
         "빠른 시작은 env 작성→copy→build→ownership→up→Guild 설정 순서",
         ordered(
             quick_start,
-            "다음 단계로 가기 전에 값을 채웁니다.",
             "cp settings/persona.example.json settings/persona.json",
             "docker compose build bot",
             "BOT_UID=$(docker compose run --rm --no-deps --entrypoint id bot -u)",
             "test -z \"$(sudo find settings runtime",
+            "docker compose up -d",
+            "**Guild Install only**",
+            "runs `/설정 시작` in Discord",
+        )
+        and ordered(
+            quick_start_kr,
+            "다음 단계로 가기 전에 값을 채웁니다.",
+            "cp settings/persona.example.json settings/persona.json",
+            "docker compose build bot",
             "docker compose up -d",
             "Installation은 **Guild Install만**",
             "Discord에서 `/설정 시작`을 실행합니다.",
@@ -456,34 +603,57 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "공지 opt-in은 Discord, 채널·필터는 localhost 웹 관리",
-        "`/설정 공지허용`에서만 변경" in quick_start
-        and "파티·공지·이벤트 채널과 금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리" in quick_start,
+        "`/설정 공지허용`에서만 변경" in quick_start_kr
+        and "파티·공지·이벤트 채널과 금지어 필터 사용 여부는 봇 호스트 컴퓨터의 localhost 웹 관리"
+        in quick_start_kr
+        and "only by the server administrator through `/설정 공지허용`" in quick_start
+        and "stored per guild in the localhost web admin on the bot host machine"
+        in quick_start,
     )
     check(
         "channel permission block 유지",
-        "- `Manage Channels` — 봇 전용 category와 파티 채널 생성" in quick_start,
+        "- `Manage Channels` — 봇 전용 category와 파티 채널 생성" in quick_start_kr
+        and "- `Manage Channels` — creates the bot-only category and the party channel"
+        in quick_start,
     )
     check(
         "voice permission은 더 이상 요구하지 않음",
-        "`Connect`" not in quick_start and "`Speak`" not in quick_start,
+        all(
+            term not in source
+            for source in (quick_start, quick_start_kr)
+            for term in ("`Connect`", "`Speak`")
+        ),
     )
     check(
         "웹 관리는 선택 token·host loopback·unsupported remote 경계",
-        "`ADMIN_TOKEN`은 선택 사항입니다." in readme
-        and "host의 `127.0.0.1:8080`에만 publish" in readme
-        and "다른 network interface에는 노출되지 않습니다." in readme
-        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다." in readme
-        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며" in operations
-        and "port가 아닌 host-scoped" in operations,
+        "`ADMIN_TOKEN`은 선택 사항입니다." in readme_kr
+        and "host의 `127.0.0.1:8080`에만 publish" in readme_kr
+        and "다른 network interface에는 노출되지 않습니다." in readme_kr
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않습니다."
+        in readme_kr
+        and "원격 접근, reverse proxy, TLS, OAuth, 길드 관리자 웹 접근은 지원하지 않으며"
+        in operations_kr
+        and "port가 아닌 host-scoped" in operations_kr
+        and "`ADMIN_TOKEN` is optional." in readme
+        and "published only to the host's `127.0.0.1:8080`" in readme
+        and "not exposed on any other network interface" in readme
+        and "Remote access, reverse proxies, TLS, OAuth, and web access for guild"
+        " administrators are not supported" in readme
+        and "host-scoped, not port-scoped" in operations,
     )
     check(
         "공지는 opt-in Guild의 configured announcement channel만 대상",
-        "웹 관리 공지는 Discord의 `/설정 공지허용`에서 opt-in한 Guild의 지정 공지 채널에만 보냅니다." in operations,
+        "웹 관리 공지는 Discord의 `/설정 공지허용`에서 opt-in한 Guild의 지정 공지 채널에만 보냅니다."
+        in operations_kr
+        and "sent only to the designated announcement channel of guilds that opted in"
+        " through `/설정 공지허용` in Discord" in operations,
     )
     check(
         "GPL-3.0과 무기여 정책을 유지",
         "GNU General Public License v3.0" in readme
-        and "사용자 기여를 받지 않습니다" in readme
+        and "GNU General Public License v3.0" in readme_kr
+        and "사용자 기여를 받지 않습니다" in readme_kr
+        and "does not accept user contributions" in readme
         and "GNU GENERAL PUBLIC LICENSE" in (PROJECT_ROOT / "LICENSE").read_text(
             encoding="utf-8"
         ),
@@ -507,7 +677,10 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "백업은 네 DB와 존재한 세 settings를 exact same manifest로 설명",
-        """각 backup set은 `usage_data.db`, `party_data.db`, `guild_settings.db`, `game_uid_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+        """각 backup set은 `usage_data.db`, `party_data.db`, `guild_settings.db`, `game_uid_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다."""
+        in operations_kr
+        and """Each backup set puts `usage_data.db`, `party_data.db`, `guild_settings.db`, `game_uid_data.db` and whichever of `settings/persona.json`, `settings/forbidden_words.json`, and `settings/games.json` existed at the time into the same manifest."""
+        in operations,
     )
     check(
         "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
@@ -602,7 +775,9 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "모든 Docker host venv workflow는 setup과 executable guard에 연결",
-        "이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다." in operations
+        "이 문서의 모든 `.venv/bin/python` 명령은 README 4단계에서 만든 host virtualenv를 전제로 합니다."
+        in operations_kr
+        and "assumes the host virtualenv created in README step 4" in operations
         and ordered(docker_deploy, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests")
         and ordered(docker_rollback, "test -x .venv/bin/python", ".venv/bin/python -m test.console_tests"),
     )
@@ -3008,6 +3183,7 @@ if __name__ == "__main__":
         test_public_env_contract()
         test_web_admin_atomic_settings_contract()
         test_forbidden_word_document_path()
+        test_language_pair_documents_stay_in_sync()
         test_readme_public_distribution_contract()
         test_operations_document_contract()
         test_final_installation_and_operations_contract()
