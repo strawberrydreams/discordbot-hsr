@@ -6,6 +6,9 @@ from discord.ext import commands
 
 from module.database import UsageRepository, create_usage_repository, run_db
 
+# 임베드 필드 한도는 1,024자다. 그보다 낮게 잡아 레이아웃이 깨지지 않게 한다.
+BIO_MAX_LENGTH = 200
+
 
 class MemberProfileCog(commands.Cog):
     """서버 프로필 조회 명령을 담는다.
@@ -36,6 +39,11 @@ class MemberProfileCog(commands.Cog):
             interaction.guild_id,
             profile_member.id,
         )
+        bio = await run_db(
+            self.usage_repository.get_bio,
+            interaction.guild_id,
+            profile_member.id,
+        )
 
         # Join date
         joined_date = (
@@ -54,8 +62,37 @@ class MemberProfileCog(commands.Cog):
 
         embed.add_field(name="📅 서버 가입일", value=joined_date, inline=True)
         embed.add_field(name="🚫 금지어 경고", value=f"{forbidden_count}회", inline=True)
+        if bio:
+            embed.add_field(name="📝 자기소개", value=bio, inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="프로필설정", description="이 서버에서 보일 자기소개를 설정합니다."
+    )
+    @app_commands.describe(자기소개=f"최대 {BIO_MAX_LENGTH}자. 비우면 삭제합니다.")
+    @app_commands.guild_only()
+    async def _set_profile(
+        self, interaction: discord.Interaction, 자기소개: str = ""
+    ):
+        bio = 자기소개.strip()
+        if len(bio) > BIO_MAX_LENGTH:
+            await interaction.response.send_message(
+                f"❌ 자기소개는 {BIO_MAX_LENGTH}자까지예요. (현재 {len(bio)}자)",
+                ephemeral=True,
+            )
+            return
+
+        await run_db(
+            self.usage_repository.set_bio,
+            interaction.guild_id,
+            interaction.user.id,
+            bio or None,
+        )
+        await interaction.response.send_message(
+            "🗑️ 자기소개를 지웠어요." if not bio else "📝 자기소개를 저장했어요.",
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot):

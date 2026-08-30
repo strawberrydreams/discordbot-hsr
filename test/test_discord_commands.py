@@ -33,6 +33,7 @@ import module.forbidden_filter_cog as forbidden_filter_cog
 import module.game_profile_cog as game_profile_cog
 import module.greeting_cog as greeting_cog
 import module.main as bot_main
+import module.member_profile_cog as member_profile_cog
 import module.panel as panel_module
 import module.party_cog as party_cog
 import module.web_admin_cog as web_admin_cog
@@ -939,8 +940,83 @@ class CommandPrivacyTests(unittest.IsolatedAsyncioTestCase):
         # /프로필이 두 번 등록되거나 파일 이름과 내용이 다시 어긋난다.
         self.assertEqual(list(self.usage.get_app_commands()), [])
         self.assertEqual(
-            {c.name for c in self.member_profile.get_app_commands()}, {"프로필"}
+            {c.name for c in self.member_profile.get_app_commands()},
+            {"프로필", "프로필설정"},
         )
+
+    async def test_bio_round_trip_and_removal(self):
+        repository = self.member_profile.usage_repository
+        interaction = FakeInteraction(channel_id=1)
+        await MemberProfileCog._set_profile.callback(
+            self.member_profile, interaction, "정원에서 기다립니다"
+        )
+        self.assertEqual(
+            repository.get_bio(TEST_GUILD_ID, interaction.user.id),
+            "정원에서 기다립니다",
+        )
+
+        profile = FakeInteraction(channel_id=1, user=interaction.user)
+        await MemberProfileCog._profile.callback(self.member_profile, profile)
+        embed = profile.response.messages[-1][1]["embed"]
+        self.assertIn(
+            "정원에서 기다립니다", [field.value for field in embed.fields]
+        )
+
+        # 빈 입력은 삭제다.
+        await MemberProfileCog._set_profile.callback(
+            self.member_profile, FakeInteraction(channel_id=1, user=interaction.user), ""
+        )
+        self.assertIsNone(repository.get_bio(TEST_GUILD_ID, interaction.user.id))
+
+    async def test_profile_omits_bio_field_when_empty(self):
+        interaction = FakeInteraction(channel_id=1)
+        await MemberProfileCog._profile.callback(self.member_profile, interaction)
+        embed = interaction.response.messages[-1][1]["embed"]
+        self.assertNotIn("📝 자기소개", [field.name for field in embed.fields])
+
+    async def test_bio_over_limit_is_rejected(self):
+        repository = self.member_profile.usage_repository
+        interaction = FakeInteraction(channel_id=1)
+        await MemberProfileCog._set_profile.callback(
+            self.member_profile, interaction, "가" * (member_profile_cog.BIO_MAX_LENGTH + 1)
+        )
+        self.assertIn("201자", interaction.response.messages[-1][0][0])
+        self.assertIsNone(repository.get_bio(TEST_GUILD_ID, interaction.user.id))
+
+        ok = FakeInteraction(channel_id=1, user=interaction.user)
+        await MemberProfileCog._set_profile.callback(
+            self.member_profile, ok, "가" * member_profile_cog.BIO_MAX_LENGTH
+        )
+        self.assertEqual(
+            len(repository.get_bio(TEST_GUILD_ID, ok.user.id)),
+            member_profile_cog.BIO_MAX_LENGTH,
+        )
+
+    async def test_bio_is_isolated_per_guild(self):
+        repository = self.member_profile.usage_repository
+        user = FakeUser()
+        a = FakeInteraction(channel_id=1, guild_id=1111, user=user)
+        await MemberProfileCog._set_profile.callback(self.member_profile, a, "A서버 소개")
+
+        b = FakeInteraction(channel_id=1, guild_id=2222, user=user)
+        await MemberProfileCog._profile.callback(self.member_profile, b)
+        embed = b.response.messages[-1][1]["embed"]
+        self.assertNotIn("📝 자기소개", [field.name for field in embed.fields])
+        self.assertEqual(repository.get_bio(1111, user.id), "A서버 소개")
+
+    async def test_bio_is_removed_when_member_leaves(self):
+        repository = self.member_profile.usage_repository
+        user = FakeUser()
+        await MemberProfileCog._set_profile.callback(
+            self.member_profile,
+            FakeInteraction(channel_id=1, user=user),
+            "곧 나갑니다",
+        )
+        member = SimpleNamespace(
+            guild=SimpleNamespace(id=TEST_GUILD_ID), id=user.id
+        )
+        await self.usage.on_member_remove(member)
+        self.assertIsNone(repository.get_bio(TEST_GUILD_ID, user.id))
 
     async def test_legacy_party_slash_commands_are_removed(self):
         for command in ("모집", "파티", "나가기", "변경"):

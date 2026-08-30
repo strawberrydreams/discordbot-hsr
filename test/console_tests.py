@@ -981,7 +981,7 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
     check("legacy attendance startup reaches repository migration", started)
     check(
         "startup migration precedes sync and preserves data",
-        version == 3
+        version == 4
         and "ai_usage" in tables
         and "point_ledger" not in tables
         and not {"points", "last_attendance_date"} & user_columns
@@ -1419,7 +1419,7 @@ def test_schema_initialization() -> SQLiteUsageRepository:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
 
-    check("users 컬럼 구성", cols == {"guild_id", "user_id", "forbidden_count"}, f"({cols})")
+    check("users 컬럼 구성", cols == {"guild_id", "user_id", "forbidden_count", "bio"}, f"({cols})")
     check("복합 기본키 (guild_id, user_id)", pk == ["guild_id", "user_id"], f"({pk})")
     check("원장 테이블 없음", "point_ledger" not in tables)
     check("AI 사용량 테이블 생성", "ai_usage" in tables)
@@ -1447,7 +1447,7 @@ def test_schema_versions():
     SQLitePartyRepository(party_path)
     SQLiteGuildSettingsRepository(settings_path)
 
-    check("usage 스키마 버전", _user_version(attendance_path) == 3)
+    check("usage 스키마 버전", _user_version(attendance_path) == 4)
     check("party 스키마 버전", _user_version(party_path) == 2)
     check("settings 스키마 버전", _user_version(settings_path) == 6)
 
@@ -1469,7 +1469,10 @@ def test_schema_versions():
 
     with sqlite3.connect(attendance_path) as conn:
         conn.execute("PRAGMA user_version = 0")
-        conn.execute("INSERT INTO users VALUES (1, 2, 4)")
+        conn.execute(
+            "INSERT INTO users (guild_id, user_id, forbidden_count) "
+            "VALUES (1, 2, 4)"
+        )
     SQLiteUsageRepository(attendance_path)
     check(
         "무버전 usage 데이터 보존",
@@ -1499,8 +1502,9 @@ def test_schema_versions():
             PRAGMA user_version = 1;
         """)
     migrated = SQLiteUsageRepository(version_one_path)
-    check("usage v1에서 v3로 마이그레이션", _user_version(version_one_path) == 3)
+    check("usage v1에서 v4로 마이그레이션", _user_version(version_one_path) == 4)
     check("usage v1 금지어 카운트 보존", migrated.get_forbidden_count(7, 8) == 5)
+    check("usage v1 마이그레이션 후 자기소개는 비어 있음", migrated.get_bio(7, 8) is None)
 
     with sqlite3.connect(party_path) as conn:
         conn.execute("PRAGMA user_version = 0")
@@ -2544,7 +2548,7 @@ def test_legacy_backup_restore_and_prune():
         ).fetchone()
     check(
         "staged historical attendance migrates before installation",
-        version == 3
+        version == 4
         and "ai_usage" in tables
         and "point_ledger" not in tables
         and forbidden == (3,),

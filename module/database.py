@@ -154,6 +154,14 @@ class UsageRepository(ABC):
         """인스턴스 전역 일일 사용량을 반환한다."""
 
     @abstractmethod
+    def set_bio(self, guild_id: int, user_id: int, bio: Optional[str]) -> None:
+        """서버 프로필 자기소개를 저장한다. None이면 지운다."""
+
+    @abstractmethod
+    def get_bio(self, guild_id: int, user_id: int) -> Optional[str]:
+        """서버 프로필 자기소개를 반환한다. 없으면 None."""
+
+    @abstractmethod
     def delete_user(self, guild_id: int, user_id: int) -> None:
         """멤버가 나갔을 때 해당 길드의 금지어 기록을 지운다."""
 
@@ -345,7 +353,7 @@ class GameUidRepository(ABC):
 # ─────────── SQLite 구현 ─────────── #
 
 class SQLiteUsageRepository(UsageRepository):
-    _SCHEMA_VERSION = 3
+    _SCHEMA_VERSION = 4
 
     def __init__(self, db_path: pathlib.Path):
         self.db_path = pathlib.Path(db_path)
@@ -362,6 +370,7 @@ class SQLiteUsageRepository(UsageRepository):
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
                     forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    bio TEXT,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
@@ -376,6 +385,12 @@ class SQLiteUsageRepository(UsageRepository):
             """)
             if version < self._SCHEMA_VERSION:
                 self._drop_point_economy(conn)
+                self._add_bio_column(conn)
+            _require_columns(
+                conn,
+                "users",
+                {"guild_id", "user_id", "forbidden_count", "bio"},
+            )
             _require_columns(
                 conn,
                 "ai_usage",
@@ -458,6 +473,7 @@ class SQLiteUsageRepository(UsageRepository):
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
                     forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    bio TEXT,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
@@ -468,6 +484,39 @@ class SQLiteUsageRepository(UsageRepository):
             conn.execute("DROP TABLE users_v2")
         conn.execute("DROP INDEX IF EXISTS idx_ledger_user")
         conn.execute("DROP TABLE IF EXISTS point_ledger")
+
+    @staticmethod
+    def _add_bio_column(conn: sqlite3.Connection) -> None:
+        """v4: 서버 프로필 자기소개. 컬럼 하나를 붙이는 것이 전부다.
+
+        PK가 이미 (guild_id, user_id)라 서버별로 자연 분리되고, delete_user /
+        delete_guild 삭제 경로도 그대로 덮는다.
+        """
+        columns = {row[1] for row in conn.execute('PRAGMA table_info("users")')}
+        if "bio" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN bio TEXT")
+
+    def set_bio(self, guild_id: int, user_id: int, bio: Optional[str]) -> None:
+        with closing(_connect(self.db_path)) as conn:
+            # 금지어 경고가 없는 멤버는 아직 행이 없다.
+            conn.execute(
+                "INSERT OR IGNORE INTO users (guild_id, user_id, forbidden_count) "
+                "VALUES (?, ?, 0)",
+                (guild_id, user_id),
+            )
+            conn.execute(
+                "UPDATE users SET bio = ? WHERE guild_id = ? AND user_id = ?",
+                (bio, guild_id, user_id),
+            )
+            conn.commit()
+
+    def get_bio(self, guild_id: int, user_id: int) -> Optional[str]:
+        with closing(_connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT bio FROM users WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+            return row[0] if row else None
 
     def increment_forbidden_count(self, guild_id: int, user_id: int) -> None:
         with closing(_connect(self.db_path)) as conn:
