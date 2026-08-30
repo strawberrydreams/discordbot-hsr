@@ -3,9 +3,11 @@ import contextlib
 import dataclasses
 import gc
 import hashlib
+import inspect
 import json
 import os
 import pathlib
+import re
 import secrets
 import stat
 import tempfile
@@ -33,6 +35,7 @@ import module.export_legacy as export_legacy
 import module.forbidden_filter_cog as forbidden_filter_cog
 import module.game_profile_cog as game_profile_cog
 import module.greeting_cog as greeting_cog
+import module.i18n as i18n
 import module.main as bot_main
 import module.member_profile_cog as member_profile_cog
 import module.panel as panel_module
@@ -3722,7 +3725,8 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         link = self.settings_dir / "persona.json"
         link.symlink_to(target)
         self.assertEqual(
-            web_admin_cog.WebAdminCog._settings_text("persona.json"), ("", "")
+            web_admin_cog.WebAdminCog._settings_text("ko", "persona.json"),
+            ("", ""),
         )
         with self.assertRaises(ValueError):
             config.atomic_write_settings("persona.json", {})
@@ -3865,6 +3869,100 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         self.assertFalse(pathlib.Path(temporary_file.name).exists())
 
 
+class WebAdminI18nCatalogTests(unittest.TestCase):
+    def test_both_languages_define_exactly_the_same_keys(self):
+        # 키가 빠지면 화면에 조용히 빈 문자열이 렌더된다. 이 테스트가 유일한 방어선이다.
+        korean = set(i18n.STRINGS["ko"])
+        english = set(i18n.STRINGS["en"])
+        self.assertEqual(korean, english, korean ^ english)
+        self.assertEqual(set(i18n.STRINGS), set(i18n.SUPPORTED_LANGUAGES))
+
+    def test_no_catalog_entry_is_empty(self):
+        for language, catalog in i18n.STRINGS.items():
+            for key, value in catalog.items():
+                self.assertTrue(value.strip(), f"{language}:{key}")
+
+    def test_format_placeholders_match_across_languages(self):
+        # {reason}이 한쪽에만 있으면 그 언어에서 원인이 통째로 사라진다.
+        fields = lambda s: set(re.findall(r"\{([a-z_]+)\}", s))
+        for key, korean in i18n.STRINGS["ko"].items():
+            self.assertEqual(
+                fields(korean), fields(i18n.STRINGS["en"][key]), key
+            )
+
+    def test_every_template_key_exists_in_the_catalog(self):
+        used = set()
+        for name in ("admin_index.html", "admin_login.html"):
+            source = (web_admin_cog.TEMPLATE_DIR / name).read_text(encoding="utf-8")
+            used |= set(re.findall(r"\{\{t:([a-z0-9_]+)\}\}", source))
+        self.assertTrue(used)
+        self.assertEqual(used - set(i18n.STRINGS["ko"]), set())
+
+    def test_every_catalog_key_is_actually_used(self):
+        used = set()
+        for name in ("admin_index.html", "admin_login.html"):
+            used |= set(
+                re.findall(
+                    r"\{\{t:([a-z0-9_]+)\}\}",
+                    (web_admin_cog.TEMPLATE_DIR / name).read_text(encoding="utf-8"),
+                )
+            )
+        source = pathlib.Path(
+            inspect.getsourcefile(web_admin_cog)
+        ).read_text(encoding="utf-8")
+        used |= set(re.findall(r"""["']([a-z0-9_]+)["']""", source))
+        unused = set(i18n.STRINGS["ko"]) - used
+        self.assertEqual(unused, set(), f"쓰이지 않는 키: {sorted(unused)}")
+
+    def test_language_resolution_order_and_fallback(self):
+        def request(query=None, cookies=None, headers=None):
+            return SimpleNamespace(
+                query=query or {}, cookies=cookies or {}, headers=headers or {}
+            )
+
+        self.assertEqual(i18n.resolve_language(request()), "ko")
+        self.assertEqual(
+            i18n.resolve_language(request(query={"lang": "en"})), "en"
+        )
+        # 쿼리가 쿠키를 이긴다.
+        self.assertEqual(
+            i18n.resolve_language(
+                request(query={"lang": "ko"}, cookies={"admin_lang": "en"})
+            ),
+            "ko",
+        )
+        # 쿠키가 헤더를 이긴다.
+        self.assertEqual(
+            i18n.resolve_language(
+                request(
+                    cookies={"admin_lang": "en"},
+                    headers={"Accept-Language": "ko-KR"},
+                )
+            ),
+            "en",
+        )
+        self.assertEqual(
+            i18n.resolve_language(
+                request(headers={"Accept-Language": "en-GB,en;q=0.9"})
+            ),
+            "en",
+        )
+        # 알 수 없는 값은 조용히 기본값으로.
+        for bad in ("fr", "", "EN", "en; DROP TABLE"):
+            self.assertEqual(i18n.resolve_language(request(query={"lang": bad})), "ko", bad)
+        # 미들웨어의 500 경로는 어떤 객체가 와도 터지면 안 된다.
+        self.assertEqual(i18n.resolve_language(object()), "ko")
+
+    def test_translate_falls_back_instead_of_raising(self):
+        self.assertEqual(i18n.translate("en", "no_such_key"), "no_such_key")
+        self.assertEqual(i18n.translate("fr", "logout"), i18n.STRINGS["ko"]["logout"])
+        # 파라미터가 모자라도 500이 아니라 원문이 나온다.
+        self.assertEqual(
+            i18n.translate("ko", "notice_save_failed"),
+            i18n.STRINGS["ko"]["notice_save_failed"],
+        )
+
+
 class WebAdminStylesheetTests(unittest.TestCase):
     def setUp(self):
         self.css = web_admin_cog.STYLESHEET_PATH.read_text(encoding="utf-8")
@@ -3892,7 +3990,7 @@ class WebAdminStylesheetTests(unittest.TestCase):
 class WebAdminTemplateDesignTests(unittest.TestCase):
     def test_login_template_uses_local_discord_design(self):
         login_page = web_admin_cog.WebAdminCog._render_template(
-            "admin_login.html", error=""
+            "admin_login.html", lang="ko", error=""
         )
         self.assertIn('<link rel="stylesheet" href="/static/admin.css">', login_page)
         self.assertNotIn("<style", login_page)
@@ -3905,6 +4003,7 @@ class WebAdminTemplateDesignTests(unittest.TestCase):
     def test_index_template_uses_responsive_design_and_keeps_form_contracts(self):
         page = web_admin_cog.WebAdminCog._render_template(
             "admin_index.html",
+            lang="ko",
             csrf="csrf",
             notice="",
             persona_prompt="prompt",
@@ -4104,7 +4203,7 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         ) as render, patch.object(web_admin_cog.logger, "exception"):
             await cog.guild_settings_post(object())
 
-        notice = render.await_args.args[1]
+        notice = render.await_args.args[2]
         self.assertIn("예상하지 못한 오류가 발생했습니다 (RuntimeError)", notice)
         self.assertNotIn("private database path", notice)
 
@@ -4146,7 +4245,7 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         repository.forbidden_filters[1] = False
         cog = web_admin_cog.WebAdminCog(bot, repository)
 
-        rows, _, problem = await cog._guild_overview("csrf")
+        rows, _, problem = await cog._guild_overview("ko", "csrf")
 
         self.assertEqual(problem, "")
         self.assertIn('action="/guilds/settings"', rows)
@@ -4160,6 +4259,7 @@ class WebAdminMiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
     def test_generic_value_error_is_not_reflected(self):
         reason = web_admin_cog.WebAdminCog._operation_error_reason(
+            "ko",
             ValueError("private filesystem path")
         )
         self.assertNotIn("private filesystem path", reason)
@@ -4257,7 +4357,71 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<script", page)
 
     async def test_remaining_text_is_empty_without_a_matching_session(self):
-        self.assertEqual(self.cog._session_remaining_text("nobody"), "")
+        self.assertEqual(self.cog._session_remaining_text("ko", "nobody"), "")
+
+    async def test_lang_query_switches_the_whole_page(self):
+        await self._login()
+        korean = await (await self.client.get("/")).text()
+        self.assertIn("관리자 콘솔", korean)
+
+        english = await (await self.client.get("/?lang=en")).text()
+        self.assertIn("Admin console", english)
+        self.assertIn('<html lang="en">', english)
+        self.assertIn("Send announcement", english)
+        self.assertIn("Sign out", english)
+        self.assertNotIn("관리자 콘솔", english)
+
+    async def test_language_choice_survives_in_a_cookie(self):
+        response = await self.client.get("/login?lang=en")
+        self.assertEqual(response.cookies[i18n.LANGUAGE_COOKIE].value, "en")
+
+        # 쿼리 없이 열어도 쿠키가 언어를 유지한다.
+        page = await (await self.client.get("/login")).text()
+        self.assertIn("Administrator sign-in", page)
+
+        # POST 뒤 리다이렉트된 화면도 마찬가지다.
+        await self._login()
+        page = await (await self.client.get("/")).text()
+        self.assertIn("Admin console", page)
+
+    async def test_accept_language_header_is_the_last_resort(self):
+        await self._login()
+        page = await (
+            await self.client.get("/", headers={"Accept-Language": "en-US,en;q=0.9"})
+        ).text()
+        self.assertIn("Admin console", page)
+
+    async def test_unknown_lang_falls_back_to_korean_without_a_cookie(self):
+        response = await self.client.get("/login?lang=fr")
+        self.assertNotIn(i18n.LANGUAGE_COOKIE, response.cookies)
+        self.assertIn("관리자 로그인", await response.text())
+
+    async def test_language_switch_links_are_plain_anchors(self):
+        page = await (await self.client.get("/login")).text()
+        self.assertIn('href="?lang=en"', page)
+        self.assertIn('href="?lang=ko"', page)
+        # JS를 쓰지 않기로 한 결정이 링크로 지켜지는지 본다.
+        self.assertNotIn("<script", page)
+
+    async def test_server_generated_notices_follow_the_language(self):
+        _, csrf = await self._login()
+        response = await self.client.post(
+            "/settings/games.json",
+            data={"csrf": csrf, "document": '{"Game":{"max_players":2,"roles":[]}}'},
+            params={"lang": "en"},
+        )
+        body = await response.text()
+        self.assertIn("Restart the bot to apply it.", body)
+        self.assertNotIn("봇을 재시작하세요", body)
+
+    async def test_error_responses_follow_the_language(self):
+        await self._login()
+        response = await self.client.post("/announce", data={}, params={"lang": "en"})
+        self.assertEqual(response.status, 403)
+        self.assertIn("Invalid CSRF token", await response.text())
+
+        response = await self.client.post("/announce", data={}, params={"lang": "ko"})
+        self.assertIn("잘못된 CSRF 토큰", await response.text())
 
     async def test_stylesheet_is_served_without_auth(self):
         # 로그인 화면이 이 스타일시트를 쓰므로 인증 밖이어야 한다.
@@ -4705,6 +4869,7 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
     def test_template_replaces_original_placeholders_once(self):
         page = self.cog._render_template(
             "admin_index.html",
+            lang="ko",
             csrf="csrf",
             notice="",
             persona_prompt="{{games}}",
@@ -4918,7 +5083,7 @@ class WebAdminAnnouncementDirectTests(unittest.IsolatedAsyncioTestCase):
             result = await cog.announce_post(object())
 
         self.assertIs(result, response)
-        notice = render.await_args.args[1]
+        notice = render.await_args.args[2]
         self.assertIn("성공 1, 건너뜀 3, 실패 1", notice)
         self.assertIn("권한이 부족해 건너뜀", notice)
         self.assertIn("설정된 공지 채널이 삭제되어 건너뜀", notice)

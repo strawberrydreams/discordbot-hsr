@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="ko">
+<html lang="{{t:html_lang}}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{bot_name}} 관리자 로그인</title>
+  <title>{{t:login_title}}</title>
   <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body class="login">
@@ -13,26 +13,30 @@
         <span class="brand-mark" aria-hidden="true">{{bot_name_initial}}</span>
         <span>
           <span class="brand-name">{{bot_name}}</span>
-          <span class="brand-meta">Bot admin</span>
+          <span class="brand-meta">{{t:brand_meta}}</span>
         </span>
       </div>
       <div class="brand-copy">
-        <h1 id="brand-heading">Bot Control Center</h1>
-        <p>페르소나와 콘텐츠 설정, 길드 운영 현황을 로컬 환경에서 안전하게 관리하세요.</p>
+        <h1 id="brand-heading">{{t:login_hero_heading}}</h1>
+        <p>{{t:login_hero_copy}}</p>
       </div>
-      <div class="boundary"><span class="status-dot" aria-hidden="true"></span>127.0.0.1:8080 · Localhost protected</div>
+      <nav class="language-switch" aria-label="{{t:language_switch_label}}">
+        <a href="?lang=ko">{{t:language_korean}}</a>
+        <a href="?lang=en">{{t:language_english}}</a>
+      </nav>
+      <div class="boundary"><span class="status-dot" aria-hidden="true"></span>{{t:localhost_protected}}</div>
     </section>
 
     <section class="form-panel" aria-labelledby="login-heading">
-      <p class="eyebrow">Administrator access</p>
-      <h2 id="login-heading">관리자 로그인</h2>
-      <p class="form-copy">환경변수에 설정한 관리 토큰을 입력하세요.</p>
+      <p class="eyebrow">{{t:login_eyebrow}}</p>
+      <h2 id="login-heading">{{t:login_heading}}</h2>
+      <p class="form-copy">{{t:login_copy}}</p>
       <p class="error" role="alert" aria-live="assertive">{{error}}</p>
       <form method="post" action="/login">
-        <label for="admin-token">관리 토큰</label>
+        <label for="admin-token">{{t:login_token_label}}</label>
         <input id="admin-token" type="password" name="token" required autocomplete="current-password" autofocus>
-        <span class="helper">토큰은 이 로그인 요청 외에는 화면에 표시되지 않습니다.</span>
-        <button type="submit">로그인</button>
+        <span class="helper">{{t:login_token_helper}}</span>
+        <button type="submit">{{t:login_submit}}</button>
       </form>
     </section>
   </main>

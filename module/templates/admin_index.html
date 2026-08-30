@@ -1,52 +1,56 @@
 <!doctype html>
-<html lang="ko">
+<html lang="{{t:html_lang}}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{bot_name}} Bot Control Center</title>
+  <title>{{t:index_title}}</title>
   <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body>
-  <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
+  <a class="skip-link" href="#main-content">{{t:skip_to_content}}</a>
   <div class="shell">
-    <aside class="sidebar" aria-label="관리 메뉴">
+    <aside class="sidebar" aria-label="{{t:sidebar_label}}">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">{{bot_name_initial}}</span>
         <span>
           <span class="brand-name">{{bot_name}}</span>
-          <span class="brand-meta">Bot admin</span>
+          <span class="brand-meta">{{t:brand_meta}}</span>
         </span>
       </div>
 
-      <p class="nav-label">Control center</p>
-      <nav aria-label="관리 화면 바로가기">
+      <p class="nav-label">{{t:nav_label}}</p>
+      <nav aria-label="{{t:nav_section_label}}">
         <ul class="nav-list">
-          <li><a class="nav-link" aria-current="page" href="#overview"><span class="nav-icon" aria-hidden="true">⌁</span>개요</a></li>
-          <li><a class="nav-link" href="#persona"><span class="nav-icon" aria-hidden="true">✦</span>페르소나</a></li>
-          <li><a class="nav-link" href="#content-settings"><span class="nav-icon" aria-hidden="true">#</span>콘텐츠 설정</a></li>
-          <li><a class="nav-link" href="#guilds"><span class="nav-icon" aria-hidden="true">◎</span>길드 현황</a></li>
-          <li><a class="nav-link" href="#announcement"><span class="nav-icon" aria-hidden="true">↗</span>공지 보내기</a></li>
+          <li><a class="nav-link" aria-current="page" href="#overview"><span class="nav-icon" aria-hidden="true">⌁</span>{{t:nav_overview}}</a></li>
+          <li><a class="nav-link" href="#persona"><span class="nav-icon" aria-hidden="true">✦</span>{{t:nav_persona}}</a></li>
+          <li><a class="nav-link" href="#content-settings"><span class="nav-icon" aria-hidden="true">#</span>{{t:nav_content}}</a></li>
+          <li><a class="nav-link" href="#guilds"><span class="nav-icon" aria-hidden="true">◎</span>{{t:nav_guilds}}</a></li>
+          <li><a class="nav-link" href="#announcement"><span class="nav-icon" aria-hidden="true">↗</span>{{t:nav_announcement}}</a></li>
         </ul>
       </nav>
 
       <div class="local-boundary">
-        <p class="boundary-title"><span class="boundary-dot" aria-hidden="true"></span>Localhost protected</p>
-        <p class="boundary-copy">이 관리 화면은 127.0.0.1:8080에서만 접근할 수 있습니다.</p>
+        <p class="boundary-title"><span class="boundary-dot" aria-hidden="true"></span>{{t:boundary_title}}</p>
+        <p class="boundary-copy">{{t:boundary_copy}}</p>
       </div>
     </aside>
 
     <main class="main" id="main-content">
       <header class="topbar">
-        <div class="breadcrumb">{{bot_name}} / <strong>관리자 콘솔</strong></div>
+        <div class="breadcrumb">{{bot_name}} / <strong>{{t:breadcrumb_console}}</strong></div>
         <div class="topbar-actions">
           <span class="session-remaining">{{session_remaining}}</span>
+          <nav class="language-switch" aria-label="{{t:language_switch_label}}">
+            <a href="?lang=ko">{{t:language_korean}}</a>
+            <a href="?lang=en">{{t:language_english}}</a>
+          </nav>
           <form class="topbar-form" method="post" action="/session/extend">
             <input type="hidden" name="csrf" value="{{csrf}}">
-            <button class="button button-secondary" type="submit">세션 연장</button>
+            <button class="button button-secondary" type="submit">{{t:session_extend}}</button>
           </form>
           <form class="topbar-form" method="post" action="/logout">
             <input type="hidden" name="csrf" value="{{csrf}}">
-            <button class="button button-secondary" type="submit">로그아웃</button>
+            <button class="button button-secondary" type="submit">{{t:logout}}</button>
           </form>
         </div>
       </header>
@@ -54,24 +58,24 @@
       <div class="content">
         <section class="page-head" id="overview" aria-labelledby="page-title">
           <div>
-            <p class="eyebrow">Local administration</p>
-            <h1 id="page-title">Bot Control Center</h1>
-            <p class="page-copy">페르소나와 콘텐츠 설정을 관리하고, 참여 중인 Discord 길드의 운영 상태를 확인하세요.</p>
+            <p class="eyebrow">{{t:page_eyebrow}}</p>
+            <h1 id="page-title">{{t:page_title}}</h1>
+            <p class="page-copy">{{t:page_copy}}</p>
           </div>
-          <span class="status-chip"><span class="boundary-dot" aria-hidden="true"></span>ADMIN ONLINE</span>
+          <span class="status-chip"><span class="boundary-dot" aria-hidden="true"></span>{{t:status_chip}}</span>
         </section>
 
-        <section class="overview-strip" aria-label="관리 서버 운영 요약">
+        <section class="overview-strip" aria-label="{{t:overview_label}}">
           <div class="metric">
-            <span class="metric-label">접속 상태</span>
-            <strong class="metric-value">정상</strong>
+            <span class="metric-label">{{t:metric_connection}}</span>
+            <strong class="metric-value">{{t:metric_connection_value}}</strong>
           </div>
           <div class="metric">
-            <span class="metric-label">관리 범위</span>
-            <strong class="metric-value">Local</strong>
+            <span class="metric-label">{{t:metric_scope}}</span>
+            <strong class="metric-value">{{t:metric_scope_value}}</strong>
           </div>
           <div class="metric">
-            <span class="metric-label">설정 파일</span>
+            <span class="metric-label">{{t:metric_settings_files}}</span>
             <strong class="metric-value">3</strong>
           </div>
         </section>
@@ -81,8 +85,8 @@
         <section aria-labelledby="settings-title">
           <div class="section-head">
             <div>
-              <h2 class="section-title" id="settings-title">봇 설정</h2>
-              <p class="section-copy">운영 중 자주 확인하는 설정을 한곳에서 관리합니다.</p>
+              <h2 class="section-title" id="settings-title">{{t:settings_title}}</h2>
+              <p class="section-copy">{{t:settings_copy}}</p>
             </div>
           </div>
 
@@ -91,25 +95,25 @@
               <input type="hidden" name="csrf" value="{{csrf}}">
               <div class="panel-head">
                 <div>
-                  <p class="panel-kicker">AI identity</p>
-                  <h3 class="panel-title">페르소나</h3>
+                  <p class="panel-kicker">{{t:persona_kicker}}</p>
+                  <h3 class="panel-title">{{t:persona_title}}</h3>
                 </div>
-                <span class="apply-state">새 AI 세션부터 적용</span>
+                <span class="apply-state">{{t:persona_apply}}</span>
               </div>
               <div class="field-grid">
                 <div class="field">
-                  <label for="system-prompt">System prompt <span class="required">필수</span></label>
+                  <label for="system-prompt">{{t:persona_prompt_label}} <span class="required">{{t:required}}</span></label>
                   <textarea class="persona-textarea" id="system-prompt" name="system_prompt" maxlength="16000" required>{{persona_prompt}}</textarea>
-                  <span class="helper">최대 16,000자</span>
+                  <span class="helper">{{t:persona_prompt_helper}}</span>
                 </div>
                 <div class="field">
-                  <label for="greeting">인삿말 <span class="required">필수</span></label>
+                  <label for="greeting">{{t:persona_greeting_label}} <span class="required">{{t:required}}</span></label>
                   <input id="greeting" name="greeting" maxlength="1974" required value="{{persona_greeting}}">
-                  <span class="helper">새 대화가 시작될 때 사용됩니다.</span>
+                  <span class="helper">{{t:persona_greeting_helper}}</span>
                 </div>
               </div>
               <div class="panel-actions">
-                <button class="button button-primary" type="submit">페르소나 저장</button>
+                <button class="button button-primary" type="submit">{{t:persona_submit}}</button>
               </div>
             </form>
 
@@ -117,17 +121,17 @@
               <input type="hidden" name="csrf" value="{{csrf}}">
               <div class="panel-head">
                 <div>
-                  <p class="panel-kicker">Moderation</p>
-                  <h3 class="panel-title">금지어</h3>
+                  <p class="panel-kicker">{{t:forbidden_kicker}}</p>
+                  <h3 class="panel-title">{{t:forbidden_title}}</h3>
                 </div>
-                <span class="apply-state">즉시 적용</span>
+                <span class="apply-state">{{t:forbidden_apply}}</span>
               </div>
               <div class="field">
-                <label for="forbidden-words">forbidden_words.json <span class="required">필수</span></label>
+                <label for="forbidden-words">forbidden_words.json <span class="required">{{t:required}}</span></label>
                 <textarea id="forbidden-words" name="document" required spellcheck="false">{{forbidden_words}}</textarea>
               </div>
               <div class="panel-actions">
-                <button class="button button-primary" type="submit">저장 및 다시 불러오기</button>
+                <button class="button button-primary" type="submit">{{t:forbidden_submit}}</button>
               </div>
             </form>
 
@@ -135,17 +139,17 @@
               <input type="hidden" name="csrf" value="{{csrf}}">
               <div class="panel-head">
                 <div>
-                  <p class="panel-kicker">Party finder</p>
-                  <h3 class="panel-title">게임 목록</h3>
+                  <p class="panel-kicker">{{t:games_kicker}}</p>
+                  <h3 class="panel-title">{{t:games_title}}</h3>
                 </div>
-                <span class="apply-state">재시작 후 적용</span>
+                <span class="apply-state">{{t:games_apply}}</span>
               </div>
               <div class="field">
-                <label for="games">games.json <span class="required">필수</span></label>
+                <label for="games">games.json <span class="required">{{t:required}}</span></label>
                 <textarea id="games" name="document" required spellcheck="false">{{games}}</textarea>
               </div>
               <div class="panel-actions">
-                <button class="button button-primary" type="submit">게임 목록 저장</button>
+                <button class="button button-primary" type="submit">{{t:games_submit}}</button>
               </div>
             </form>
           </div>
@@ -154,17 +158,17 @@
         <section id="guilds" aria-labelledby="guild-title">
           <div class="section-head">
             <div>
-              <h2 class="section-title" id="guild-title">길드별 설정</h2>
-              <p class="section-copy">길드별 파티·공지·이벤트 채널과 웹 공지·금지어 필터 사용 여부를 저장합니다.</p>
+              <h2 class="section-title" id="guild-title">{{t:guilds_title}}</h2>
+              <p class="section-copy">{{t:guilds_copy}}</p>
             </div>
           </div>
           <div class="table-panel">
             <div class="table-wrap">
-              <table aria-label="길드별 채널·공지·금지어 설정">
+              <table aria-label="{{t:guilds_table_label}}">
                 <thead>
                   <tr>
-                    <th scope="col">길드</th>
-                    <th scope="col">채널 및 기능 설정</th>
+                    <th scope="col">{{t:guilds_column_guild}}</th>
+                    <th scope="col">{{t:guilds_column_settings}}</th>
                   </tr>
                 </thead>
                 <tbody>{{guild_rows}}</tbody>
@@ -176,8 +180,8 @@
         <section id="announcement" aria-labelledby="announce-title">
           <div class="section-head">
             <div>
-              <h2 class="section-title" id="announce-title">옵트인 공지</h2>
-              <p class="section-copy">공지를 허용한 길드의 지정 채널로 Embed 메시지를 보냅니다.</p>
+              <h2 class="section-title" id="announce-title">{{t:announce_title}}</h2>
+              <p class="section-copy">{{t:announce_copy}}</p>
             </div>
           </div>
 
@@ -187,54 +191,54 @@
               <div>
                 <div class="compact-grid">
                   <div class="field">
-                    <label for="guild-select">대상 길드</label>
+                    <label for="guild-select">{{t:announce_target}}</label>
                     <select id="guild-select" name="guild_id">{{guild_options}}</select>
                   </div>
                   <div class="field">
-                    <label for="announce-color">Embed 색상</label>
+                    <label for="announce-color">{{t:announce_color}}</label>
                     <input id="announce-color" name="color" type="color" value="#5865f2">
                   </div>
                 </div>
                 <div class="field">
-                  <label for="announce-title-input">제목 <span class="required">필수</span></label>
+                  <label for="announce-title-input">{{t:announce_title_label}} <span class="required">{{t:required}}</span></label>
                   <input id="announce-title-input" name="title" required maxlength="256">
                 </div>
                 <div class="field">
-                  <label for="announce-body">본문 <span class="required">필수</span></label>
+                  <label for="announce-body">{{t:announce_body_label}} <span class="required">{{t:required}}</span></label>
                   <textarea class="persona-textarea" id="announce-body" name="body" required maxlength="4096"></textarea>
                   <details class="syntax-guide">
-                    <summary>Discord 문법 가이드</summary>
+                    <summary>{{t:announce_syntax_summary}}</summary>
                     <ul>
-                      <li><code>**굵게**</code> · <code>*기울임*</code> · <code>__밑줄__</code> · <code>~~취소선~~</code></li>
-                      <li><code>`인라인 코드`</code> · <code>&gt; 인용</code> · <code>- 목록</code></li>
-                      <li><code>[링크 텍스트](URL)</code> · <code>&lt;@사용자_ID&gt;</code> 멘션</li>
+                      <li><code>**{{t:announce_syntax_bold}}**</code> · <code>*{{t:announce_syntax_italic}}*</code> · <code>__{{t:announce_syntax_underline}}__</code> · <code>~~{{t:announce_syntax_strike}}~~</code></li>
+                      <li><code>`{{t:announce_syntax_inline}}`</code> · <code>&gt; {{t:announce_syntax_quote}}</code> · <code>- {{t:announce_syntax_list}}</code></li>
+                      <li><code>[{{t:announce_syntax_link}}](URL)</code> · <code>&lt;@USER_ID&gt;</code> {{t:announce_syntax_mention}}</li>
                     </ul>
-                    <span class="helper">입력한 줄바꿈과 Discord Markdown이 Embed 본문에 그대로 적용됩니다.</span>
+                    <span class="helper">{{t:announce_syntax_helper}}</span>
                   </details>
                 </div>
                 <div class="field">
-                  <label for="announce-image">이미지</label>
+                  <label for="announce-image">{{t:announce_image_label}}</label>
                   <input id="announce-image" name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
-                  <span class="helper">선택 사항 · PNG, JPEG, GIF, WebP · 최대 8 MiB</span>
+                  <span class="helper">{{t:announce_image_helper}}</span>
                 </div>
                 <div class="panel-actions">
-                  <button class="button button-primary" type="submit">공지 보내기</button>
+                  <button class="button button-primary" type="submit">{{t:announce_submit}}</button>
                 </div>
               </div>
 
-              <aside class="dispatch-note" aria-label="공지 전송 안내">
-                <h3>전송 전 확인</h3>
+              <aside class="dispatch-note" aria-label="{{t:announce_note_label}}">
+                <h3>{{t:announce_note_title}}</h3>
                 <ol class="dispatch-list">
-                  <li><span class="dispatch-number">1</span><span>길드가 호스트 공지를 허용했는지 다시 확인합니다.</span></li>
-                  <li><span class="dispatch-number">2</span><span>설정된 공지 채널과 봇 권한을 검사합니다.</span></li>
-                  <li><span class="dispatch-number">3</span><span>성공·건너뜀·실패 결과를 이 화면에 표시합니다.</span></li>
+                  <li><span class="dispatch-number">1</span><span>{{t:announce_note_1}}</span></li>
+                  <li><span class="dispatch-number">2</span><span>{{t:announce_note_2}}</span></li>
+                  <li><span class="dispatch-number">3</span><span>{{t:announce_note_3}}</span></li>
                 </ol>
               </aside>
             </div>
           </form>
         </section>
 
-        <footer class="page-footer">{{bot_name}} local administration · 127.0.0.1:8080</footer>
+        <footer class="page-footer">{{t:footer}}</footer>
       </div>
     </main>
   </div>
