@@ -517,6 +517,9 @@ class DisappearingUsageBot:
         self.calls = 0
 
     def get_cog(self, name):
+        # 이름을 확인한다. 무시하면 UsageCog 개명 시 이 목이 조용히 통과한다.
+        if name != UsageCog.__name__:
+            return None
         self.calls += 1
         return self.usage_cog if self.calls == 1 else None
 
@@ -1653,6 +1656,9 @@ class GuildBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
             async def load_extension(self, extension):
                 pass
+
+            def get_cog(self, name):
+                return object()
 
         with patch.object(main, "_verify_databases"), patch.object(
             main, "DATA_DIR", pathlib.Path(tempfile.mkdtemp())

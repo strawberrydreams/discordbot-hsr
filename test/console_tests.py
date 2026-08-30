@@ -850,6 +850,10 @@ def test_startup_syncs_commands_globally():
             events.append("sync:global" if guild is None else f"sync:guild:{guild}")
 
     class FakeBot:
+        def get_cog(self, name):
+            # 실제 commands.Bot에는 항상 있다. setup_hook의 cog 등록 자기 점검용.
+            return object()
+
         tree = FakeTree()
 
         def add_view(self, view):
@@ -938,6 +942,10 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
     events = []
 
     class FakeBot:
+        def get_cog(self, name):
+            # 실제 commands.Bot에는 항상 있다. setup_hook의 cog 등록 자기 점검용.
+            return object()
+
         class tree:
             @staticmethod
             async def sync():
@@ -982,6 +990,54 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
         and events.index("migrate:attendance") < events.index("sync"),
         f"(version={version}, events={events})",
     )
+
+
+def test_startup_requires_cross_cog_dependencies():
+    """다른 cog가 참조하는 cog가 빠지면 조용한 None이 아니라 기동 실패여야 한다."""
+    import module.main as main
+
+    events = []
+
+    class FakeBot:
+        class tree:
+            @staticmethod
+            async def sync():
+                events.append("sync")
+
+        def __init__(self, missing):
+            self.missing = missing
+
+        def get_cog(self, name):
+            return None if name == self.missing else object()
+
+        async def load_extension(self, extension):
+            events.append(f"load:{extension}")
+
+    for dependency in main.CROSS_COG_DEPENDENCIES:
+        events.clear()
+        with patch.object(main, "_verify_databases"):
+            try:
+                asyncio.run(
+                    main.HyacineBot.setup_hook(FakeBot(dependency.__name__))
+                )
+                raised = ""
+            except RuntimeError as error:
+                raised = str(error)
+        check(
+            f"{dependency.__name__} 미등록 시 기동 실패",
+            dependency.__name__ in raised,
+            f"(raised={raised!r})",
+        )
+        check(
+            f"{dependency.__name__} 미등록 시 sync 미실행",
+            "sync" not in events,
+            f"({events})",
+        )
+
+    events.clear()
+    with patch.object(main, "_verify_databases"):
+        asyncio.run(main.HyacineBot.setup_hook(FakeBot(missing=None)))
+    check("의존 cog가 모두 있으면 sync까지 진행", "sync" in events, f"({events})")
 
 
 def test_startup_cog_failure_stops_postverification_and_sync():
@@ -2919,6 +2975,7 @@ if __name__ == "__main__":
         test_startup_syncs_commands_globally()
         test_startup_preverification_failure_stops_cogs_and_sync()
         test_startup_migrates_legacy_attendance_before_strict_verification()
+        test_startup_requires_cross_cog_dependencies()
         test_startup_cog_failure_stops_postverification_and_sync()
         test_instance_lock_rejects_second_holder()
         test_instance_lock_closes_failed_handle()

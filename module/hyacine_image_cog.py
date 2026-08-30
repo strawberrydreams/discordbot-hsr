@@ -20,6 +20,7 @@ from module.config import (
     LIMIT_IMAGE,
     ensure_private_directory,
 )
+from module.usage_cog import UsageCog
 
 # 임베드 description은 4,096자 한계가 있다. 넘으면 전송이 400으로 실패한다.
 MAX_DISPLAYED_PROMPT_CHARS = 1_000
@@ -90,7 +91,7 @@ class HyacineImageCog(commands.Cog):
     async def _generate_image(
         self, interaction: discord.Interaction, 프롬프트: str
     ):
-        usage_cog = self.bot.get_cog("UsageCog")
+        usage_cog = self.bot.get_cog(UsageCog.__name__)
         if not usage_cog:
             await interaction.response.send_message(
                 "❌ 사용량 모듈이 로드되지 않아 일일 한도를 확인할 수 없어요.", ephemeral=True

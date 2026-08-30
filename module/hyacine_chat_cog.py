@@ -23,6 +23,7 @@ from module.config import (
 from module.config import (
     CHAT_MODEL_LIGHT as LIGHT_MODEL,
 )
+from module.usage_cog import UsageCog
 
 DEFAULT_PERSONA = {
     "system_prompt": "당신은 놀빛 정원의 따뜻한 의사, 하늘의 백성 히아킨입니다. 사용자를 '회색둥이 씨'라 부르며, 한국어로 정확하고 다정하게 답하세요.",
@@ -221,7 +222,7 @@ class HyacineChatCog(commands.Cog):
         daily_limit: int,
     ):
         session = self.get_or_create_session(interaction.channel_id)
-        usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
+        usage_cog = self.bot.get_cog(UsageCog.__name__) if self.bot else None
         api_started = False
 
         if not usage_cog:
@@ -403,7 +404,7 @@ class HyacineChatCog(commands.Cog):
     @app_commands.command(name="상태", description="이 채널의 현재 상태 확인")
     async def _status(self, interaction: discord.Interaction):
         session = self.get_or_create_session(interaction.channel_id)
-        usage_cog = self.bot.get_cog("UsageCog") if self.bot else None
+        usage_cog = self.bot.get_cog(UsageCog.__name__) if self.bot else None
         status_message = (
             "- **대화 명령**\n"
             f"- `/기본대화`: `{LIGHT_MODEL}` (Reasoning: `none`)\n"

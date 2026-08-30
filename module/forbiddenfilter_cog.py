@@ -16,6 +16,7 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
+from module.usage_cog import UsageCog
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +374,7 @@ class ForbiddenFilterCog(commands.Cog):
                 message.channel.id,
             )
 
-        usage_cog = self.bot.get_cog("UsageCog")
+        usage_cog = self.bot.get_cog(UsageCog.__name__)
         if usage_cog:
             try:
                 await usage_cog.increment_forbidden_count(

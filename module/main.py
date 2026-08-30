@@ -15,6 +15,10 @@ from module.config import (
     OPENAI_API_KEY,
     validate_config,
 )
+from module.forbiddenfilter_cog import ForbiddenFilterCog
+from module.playwith_cog import PlayWithCog
+from module.usage_cog import UsageCog
+from module.webadmin_cog import WebAdminCog
 
 # 실행 커맨드: python -m module.main
 
@@ -37,6 +41,11 @@ EXTENSIONS = (
     ("module.usage_cog", ()),
     ("module.profile_cog", ()),
 )
+
+# 다른 cog가 런타임에 찾아 쓰는 cog들. 셋 다 환경변수 게이트가 없어 항상
+# 로드되므로, 하나라도 없다면 EXTENSIONS 등록이 빠진 것이다. 조용한 None으로
+# 기능이 반쯤 죽는 대신 기동에서 실패시킨다.
+CROSS_COG_DEPENDENCIES = (UsageCog, PlayWithCog, ForbiddenFilterCog)
 
 OPTIONAL_DEPENDENCY_VALUES = {
     "ADMIN_TOKEN": ADMIN_TOKEN,
@@ -107,6 +116,16 @@ class HyacineBot(commands.Bot):
             await self.load_extension(extension)
             print(f"🧩 Loaded extension: {extension}")
 
+        missing = [
+            cog.__name__
+            for cog in CROSS_COG_DEPENDENCIES
+            if self.get_cog(cog.__name__) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"다른 cog가 참조하는 cog가 등록되지 않았습니다: {missing}"
+            )
+
         _verify_databases()
         # 공개 배포 봇이므로 전역 sync다. 길드 sync는 봇이 설치된 서버를 미리
         # 알아야 하는데, 초대는 언제든 일어난다. 데이터 격리는 스키마가 보장한다.
@@ -114,7 +133,7 @@ class HyacineBot(commands.Bot):
         print("🔄 Command tree synced globally")
 
     async def close(self):
-        web_admin_cog = self.get_cog("WebAdminCog")
+        web_admin_cog = self.get_cog(WebAdminCog.__name__)
         try:
             if web_admin_cog is not None:
                 await web_admin_cog.close()

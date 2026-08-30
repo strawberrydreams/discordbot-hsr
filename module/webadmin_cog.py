@@ -24,11 +24,13 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
+from module.forbiddenfilter_cog import ForbiddenFilterCog
 from module.panel import (
     channel_send_capabilities,
     is_sendable_announcement_channel,
     is_sendable_panel_channel,
 )
+from module.playwith_cog import PlayWithCog
 
 DEFAULT_HOST = "127.0.0.1"
 ALLOWED_HOSTS = frozenset({DEFAULT_HOST, "0.0.0.0"})
@@ -700,7 +702,7 @@ class WebAdminCog(commands.Cog):
                 settings_saved = True
                 if settings_filename == "forbidden_words.json":
                     forbidden_filter_cog = self.bot.get_cog(
-                        "ForbiddenFilterCog"
+                        ForbiddenFilterCog.__name__
                     )
                     if forbidden_filter_cog is not None:
                         await forbidden_filter_cog.reload_forbidden_words()
@@ -813,7 +815,7 @@ class WebAdminCog(commands.Cog):
                 )
 
             if setting_name == "party_channel_id" and channel_id is not None:
-                play_with_cog = self.bot.get_cog("PlayWithCog")
+                play_with_cog = self.bot.get_cog(PlayWithCog.__name__)
                 if play_with_cog is None:
                     side_effect_problems.append(
                         "파티 모듈이 로드되지 않아 패널을 갱신하지 못했습니다."
@@ -854,7 +856,7 @@ class WebAdminCog(commands.Cog):
                     f"길드 설정 저장 실패: {self._operation_error_reason(error)}",
                 )
 
-            forbidden_filter_cog = self.bot.get_cog("ForbiddenFilterCog")
+            forbidden_filter_cog = self.bot.get_cog(ForbiddenFilterCog.__name__)
             if forbidden_filter_cog is not None:
                 try:
                     forbidden_filter_cog.invalidate_guild(guild_id)
