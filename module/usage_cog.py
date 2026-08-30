@@ -1,12 +1,11 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Optional
 
 import discord
 from discord.ext import commands
 
+from module.config import KST_TIMEZONE
 from module.database import UsageRepository, create_usage_repository, run_db
-
-KST_TIMEZONE = timezone(timedelta(hours=9))
 
 
 class UsageCog(commands.Cog):

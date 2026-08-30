@@ -9,6 +9,7 @@ import pathlib
 import secrets
 import stat
 import tempfile
+import time
 import unittest
 import warnings
 from datetime import datetime, timezone
@@ -3454,9 +3455,11 @@ class _WebSettingsRepository:
 
 
 class _WebBot:
-    def __init__(self):
+    def __init__(self, user=None):
         self.guilds = []
         self.cogs = {}
+        # READY 이전에는 bot.user가 None이다.
+        self.user = user
 
     def get_guild(self, guild_id):
         return next((guild for guild in self.guilds if guild.id == guild_id), None)
@@ -3862,12 +3865,38 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
         self.assertFalse(pathlib.Path(temporary_file.name).exists())
 
 
+class WebAdminStylesheetTests(unittest.TestCase):
+    def setUp(self):
+        self.css = web_admin_cog.STYLESHEET_PATH.read_text(encoding="utf-8")
+
+    def test_stylesheet_holds_the_design_tokens_once(self):
+        # 토큰이 한 곳에만 있어야 두 화면의 색이 갈라지지 않는다.
+        self.assertIn("--blurple: #5865f2", self.css)
+        self.assertEqual(self.css.count(":root {"), 1)
+        self.assertIn("@media (max-width: 960px)", self.css)
+
+    def test_stylesheet_scopes_login_only_rules(self):
+        # 두 화면의 .brand-mark 크기가 일부러 다르다. 로그인 규칙이 한정되지
+        # 않으면 인덱스 화면을 덮어쓴다.
+        self.assertIn("body.login {", self.css)
+        self.assertIn(".login .login-shell {", self.css)
+        self.assertNotIn("\n.login-shell {", self.css)
+
+    def test_templates_carry_no_inline_style_block(self):
+        for name in ("admin_index.html", "admin_login.html"):
+            source = (web_admin_cog.TEMPLATE_DIR / name).read_text(encoding="utf-8")
+            self.assertNotIn("<style", source, name)
+            self.assertIn('href="/static/admin.css"', source, name)
+
+
 class WebAdminTemplateDesignTests(unittest.TestCase):
     def test_login_template_uses_local_discord_design(self):
         login_page = web_admin_cog.WebAdminCog._render_template(
             "admin_login.html", error=""
         )
-        self.assertIn("--blurple: #5865f2", login_page)
+        self.assertIn('<link rel="stylesheet" href="/static/admin.css">', login_page)
+        self.assertNotIn("<style", login_page)
+        self.assertIn('<body class="login">', login_page)
         self.assertIn('for="admin-token"', login_page)
         self.assertIn('id="admin-token"', login_page)
         self.assertNotIn("<script", login_page)
@@ -3893,9 +3922,9 @@ class WebAdminTemplateDesignTests(unittest.TestCase):
             ),
             guild_options='<option value="">전체</option>',
         )
-        self.assertIn("--blurple: #5865f2", page)
+        self.assertIn('<link rel="stylesheet" href="/static/admin.css">', page)
+        self.assertNotIn("<style", page)
         self.assertIn('class="shell"', page)
-        self.assertIn("@media (max-width: 960px)", page)
         self.assertIn('href="#main-content"', page)
         for action in (
             "/logout",
@@ -4173,6 +4202,113 @@ class WebAdminHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 303)
         session_id = response.cookies[web_admin_cog.SESSION_COOKIE].value
         return session_id, self.cog.admin_sessions[session_id].csrf
+
+    async def test_session_extend_pushes_expiry_and_rebakes_cookie(self):
+        session_id, csrf = await self._login()
+        before = self.cog.admin_sessions[session_id].expires_at
+        # 만료가 가까워진 상태를 만든다.
+        self.cog.admin_sessions[session_id] = dataclasses.replace(
+            self.cog.admin_sessions[session_id],
+            expires_at=time.monotonic() + 60,
+        )
+
+        response = await self.client.post(
+            "/session/extend", data={"csrf": csrf}, allow_redirects=False
+        )
+        self.assertEqual((response.status, response.headers["Location"]), (303, "/"))
+        self.assertGreaterEqual(
+            self.cog.admin_sessions[session_id].expires_at, before
+        )
+        self.assertEqual(
+            response.cookies[web_admin_cog.SESSION_COOKIE]["max-age"],
+            str(web_admin_cog.SESSION_TTL_SECONDS),
+        )
+        # csrf는 그대로여야 열려 있던 폼이 계속 동작한다.
+        self.assertEqual(self.cog.admin_sessions[session_id].csrf, csrf)
+
+    async def test_session_extend_requires_csrf_and_a_live_session(self):
+        session_id, csrf = await self._login()
+        response = await self.client.post("/session/extend", data={})
+        self.assertEqual(response.status, 403)
+        response = await self.client.post(
+            "/session/extend", data={"csrf": "wrong"}
+        )
+        self.assertEqual(response.status, 403)
+
+        # 만료된 세션의 연장은 401이다.
+        self.cog.admin_sessions[session_id] = dataclasses.replace(
+            self.cog.admin_sessions[session_id],
+            expires_at=time.monotonic() - 1,
+        )
+        response = await self.client.post("/session/extend", data={"csrf": csrf})
+        self.assertEqual(response.status, 401)
+
+    async def test_index_shows_remaining_session_time(self):
+        session_id, csrf = await self._login()
+        self.cog.admin_sessions[session_id] = dataclasses.replace(
+            self.cog.admin_sessions[session_id],
+            expires_at=time.monotonic() + 7 * 3600 + 52 * 60,
+        )
+        page = await (await self.client.get("/")).text()
+        self.assertIn("남은 시간: 7시간 51분", page)
+        self.assertIn("KST)", page)
+        self.assertIn('action="/session/extend"', page)
+        # JS는 쓰지 않는다 — CSP를 넓히지 않기로 한 결정이다.
+        self.assertNotIn("<script", page)
+
+    async def test_remaining_text_is_empty_without_a_matching_session(self):
+        self.assertEqual(self.cog._session_remaining_text("nobody"), "")
+
+    async def test_stylesheet_is_served_without_auth(self):
+        # 로그인 화면이 이 스타일시트를 쓰므로 인증 밖이어야 한다.
+        response = await self.client.get("/static/admin.css")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "text/css")
+        body = await response.text()
+        self.assertIn("--blurple: #5865f2", body)
+        for key, value in web_admin_cog.SECURITY_HEADERS.items():
+            self.assertEqual(response.headers[key], value)
+
+    async def test_static_route_serves_only_the_one_fixed_path(self):
+        # web.static()을 쓰지 않으므로 경로 조작으로 다른 파일에 닿을 수 없다.
+        for path in (
+            "/static/../web_admin_cog.py",
+            "/static/admin.css/../../config.py",
+            "/static/",
+            "/static/other.css",
+        ):
+            response = await self.client.get(path, allow_redirects=False)
+            self.assertNotEqual(response.status, 200, path)
+
+    async def test_bot_name_falls_back_and_is_escaped(self):
+        # READY 이전에는 bot.user가 None이다.
+        self.assertEqual(self.cog._bot_name(), "Bot")
+        login = await (await self.client.get("/login")).text()
+        self.assertIn("<title>Bot 관리자 로그인</title>", login)
+
+        self.bot.user = SimpleNamespace(display_name='<script>x</script>&Bot')
+        login = await (await self.client.get("/login")).text()
+        self.assertNotIn("<script>x</script>", login)
+        self.assertIn("&lt;script&gt;", login)
+
+        await self._login()
+        index = await (await self.client.get("/")).text()
+        self.assertNotIn("<script>x</script>", index)
+        self.assertIn("&lt;script&gt;", index)
+        self.assertNotIn("Hyacine", index)
+
+    async def test_bot_name_reaches_both_screens(self):
+        self.bot.user = SimpleNamespace(display_name="정원지기")
+        login = await (await self.client.get("/login")).text()
+        self.assertIn("<title>정원지기 관리자 로그인</title>", login)
+        self.assertIn('<span class="brand-name">정원지기</span>', login)
+        self.assertIn('aria-hidden="true">정</span>', login)
+
+        await self._login()
+        index = await (await self.client.get("/")).text()
+        self.assertIn("<title>정원지기 Bot Control Center</title>", index)
+        self.assertIn('<div class="breadcrumb">정원지기 / ', index)
+        self.assertIn("정원지기 local administration", index)
 
     async def test_auth_redirect_headers_cookie_and_non_reflection(self):
         response = await self.client.get("/", allow_redirects=False)

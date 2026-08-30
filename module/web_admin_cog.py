@@ -10,7 +10,8 @@ import re
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -19,6 +20,7 @@ from aiohttp import web
 from discord.ext import commands
 
 from module import config
+from module.config import KST_TIMEZONE
 from module.database import (
     GuildSettingsRepository,
     create_guild_settings_repository,
@@ -65,9 +67,11 @@ SECURITY_HEADERS = {
 }
 ANNOUNCEMENT_COLOUR_PATTERN = re.compile(r"#[0-9A-Fa-f]{6}\Z")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
+STYLESHEET_PATH = Path(__file__).with_name("static") / "admin.css"
 PLACEHOLDER_PATTERN = re.compile(
     r"{{(csrf|notice|error|persona_prompt|persona_greeting|forbidden_words"
-    r"|games|guild_options|guild_rows)}}"
+    r"|games|guild_options|guild_rows|bot_name|bot_name_initial"
+    r"|session_remaining)}}"
 )
 # 이 둘만 Python에서 조각마다 html.escape()해 조립한 HTML 단편이다. 나머지 값은
 # 그대로 escape한다. 여기에 새 키를 넣으려면 조립부가 모든 외부 값을 escape하는지
@@ -178,9 +182,11 @@ class WebAdminCog(commands.Cog):
         )
         self.app.add_routes(
             [
+                web.get("/static/admin.css", self.stylesheet_get),
                 web.get("/login", self.login_get),
                 web.post("/login", self.login_post),
                 web.post("/logout", self.logout_post),
+                web.post("/session/extend", self.session_extend_post),
                 web.get("/", self.index_get),
                 web.post("/settings/{name}", self.settings_post),
                 web.post("/guilds/settings", self.guild_settings_post),
@@ -335,6 +341,27 @@ class WebAdminCog(commands.Cog):
         session = self.admin_sessions.get(session_id or "")
         return (session_id, session) if session_id and session else None
 
+    def _session_remaining_text(self, csrf: str) -> str:
+        """'남은 시간: 7시간 52분 (만료 21:14 KST)'. 세션이 없으면 빈 문자열.
+
+        초 단위로 줄어드는 시계가 아니라 페이지를 다시 열 때 갱신되는 값이다.
+        CSP가 default-src 'self'라 인라인 스크립트가 막혀 있고, 카운트다운
+        하나 때문에 CSP를 넓히지 않기로 했다. 연장 버튼은 303으로 되돌아오므로
+        누르면 갱신된 값이 바로 보인다.
+        """
+        session = next(
+            (s for s in self.admin_sessions.values() if s.csrf == csrf), None
+        )
+        if session is None:
+            return ""
+        remaining = max(0, int(session.expires_at - time.monotonic()))
+        hours, minutes = divmod(remaining // 60, 60)
+        expires_at = datetime.now(KST_TIMEZONE) + timedelta(seconds=remaining)
+        return (
+            f"남은 시간: {hours}시간 {minutes}분 "
+            f"(만료 {expires_at.strftime('%H:%M')} KST)"
+        )
+
     def _require_session(self, request: web.Request) -> tuple[str, AdminSession]:
         session = self._get_active_session(request)
         if session is None:
@@ -365,9 +392,35 @@ class WebAdminCog(commands.Cog):
 
         return PLACEHOLDER_PATTERN.sub(substitute, template_source)
 
+    def _bot_name(self) -> str:
+        """Discord Application에 등록된 봇 이름.
+
+        웹서버는 로그인 전에 뜨지만 페이지는 요청 시점에 렌더되고 그때는 이미
+        READY다. READY 직전 몇 초에 열면 폴백이 보인다. 길드별 닉네임이 아니라
+        전역 이름을 쓴다 — 이 화면은 길드에 매여 있지 않다.
+        """
+        user = getattr(self.bot, "user", None)
+        return getattr(user, "display_name", None) or "Bot"
+
+    async def stylesheet_get(self, request: web.Request) -> web.StreamResponse:
+        """고정 경로 하나만 서빙한다. web.static()을 쓰지 않으므로 경로 조작이 없다.
+
+        로그인 화면도 이 스타일시트를 쓰므로 인증 밖에 둔다.
+        """
+        return web.Response(
+            body=STYLESHEET_PATH.read_bytes(),
+            content_type="text/css",
+            charset="utf-8",
+        )
+
     def _login_response(self, error: str = "", *, status: int = 200) -> web.Response:
         return web.Response(
-            text=self._render_template("admin_login.html", error=error),
+            text=self._render_template(
+                "admin_login.html",
+                error=error,
+                bot_name=self._bot_name(),
+                bot_name_initial=self._bot_name()[:1],
+            ),
             content_type="text/html",
             charset="utf-8",
             status=status,
@@ -607,6 +660,9 @@ class WebAdminCog(commands.Cog):
                 games=settings_text_by_name["games.json"],
                 guild_rows=guild_rows,
                 guild_options=guild_options,
+                bot_name=self._bot_name(),
+                bot_name_initial=self._bot_name()[:1],
+                session_remaining=self._session_remaining_text(csrf),
             ),
             content_type="text/html",
             charset="utf-8",
@@ -646,6 +702,30 @@ class WebAdminCog(commands.Cog):
             csrf=csrf, expires_at=time.monotonic() + SESSION_TTL_SECONDS
         )
         response = web.HTTPSeeOther("/")
+        response.set_cookie(
+            SESSION_COOKIE,
+            session_id,
+            httponly=True,
+            samesite="Strict",
+            path="/",
+            max_age=SESSION_TTL_SECONDS,
+        )
+        raise response
+
+    async def session_extend_post(self, request: web.Request) -> web.StreamResponse:
+        """세션 만료를 다시 TTL만큼 뒤로 민다.
+
+        연장 횟수 상한은 두지 않는다. 이 화면은 loopback 전용이고 세션도 항상
+        하나뿐이라, 상한은 작업 중 강제 로그아웃이라는 더 나쁜 실패를 만든다.
+        """
+        self._require_session(request)
+        form = await self._read_form(request)
+        session_id, session = self._require_csrf(request, form)
+        self.admin_sessions[session_id] = replace(
+            session, expires_at=time.monotonic() + SESSION_TTL_SECONDS
+        )
+        response = web.HTTPSeeOther("/")
+        # 쿠키 만료도 함께 밀어야 브라우저가 먼저 세션을 버리지 않는다.
         response.set_cookie(
             SESSION_COOKIE,
             session_id,

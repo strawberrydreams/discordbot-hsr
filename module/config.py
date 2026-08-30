@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import tempfile
+from datetime import timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,6 +13,8 @@ SECRETS_ENV_FILE = PROJECT_ROOT / ".env.secrets"
 RUNTIME_ENV_FILE = PROJECT_ROOT / ".env.runtime"
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+# 봇의 모든 날짜 경계와 사용자 표시 시각의 기준.
+KST_TIMEZONE = timezone(timedelta(hours=9))
 
 
 def _owned_path_stat(path: Path, expected_type: int) -> os.stat_result:
