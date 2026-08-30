@@ -1,11 +1,13 @@
 from __future__ import annotations
+
 import asyncio
-import discord
 import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+import discord
 from discord.ext import commands
 
 from module.config import load_settings_json

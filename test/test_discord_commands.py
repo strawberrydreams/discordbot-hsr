@@ -22,35 +22,33 @@ from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 from discord.ext import commands
 
+import module.backup as backup
 import module.config as config
 import module.database as database_module
+import module.export_legacy as export_legacy
+import module.forbiddenfilter_cog as forbiddenfilter_cog
+import module.game_profile as game_profile
+import module.greeting_cog as greeting_cog
+import module.hyacine_chat_cog as hyacine_chat_cog
+import module.hyacine_image_cog as hyacine_image_cog
 import module.main as bot_main
-from module.usage_cog import KST_TIMEZONE, UsageCog
+import module.panel as panel_module
+import module.playwith_cog as playwith_cog
+import module.profile_cog as profile_cog
+import module.webadmin_cog as webadmin_cog
 from module.database import (
-    SQLiteUsageRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
+    SQLiteProfileRepository,
+    SQLiteUsageRepository,
 )
 from module.eventnotice_cog import EventNoticeCog
 from module.guildsettings_cog import GuildSettingsCog, SetupView
 from module.hyacine_chat_cog import HyacineChatCog
-import module.hyacine_chat_cog as hyacine_chat_cog
 from module.hyacine_image_cog import HyacineImageCog
-import module.hyacine_image_cog as hyacine_image_cog
-from module.playwith_cog import PlayWithCog
 from module.panel import drop_panel_locks, panel_lock, upsert_panel
-import module.panel as panel_module
-import module.playwith_cog as playwith_cog
-import module.forbiddenfilter_cog as forbiddenfilter_cog
-import module.greeting_cog as greeting_cog
-import module.game_profile as game_profile
-import module.profile_cog as profile_cog
-from module.database import SQLiteProfileRepository
-import module.backup as backup
-import module.export_legacy as export_legacy
-import module.webadmin_cog as webadmin_cog
-
-
+from module.playwith_cog import PlayWithCog
+from module.usage_cog import KST_TIMEZONE, UsageCog
 
 # 단일 운영 길드를 전제하던 상수가 사라졌다. 테스트는 임의의 길드 하나를 쓴다.
 TEST_GUILD_ID = 4_242

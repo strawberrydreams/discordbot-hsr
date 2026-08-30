@@ -1,14 +1,16 @@
+from datetime import datetime, timezone
+from typing import Optional
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime, timezone
-from typing import Optional
 
 from module.database import (
     GuildSettingsRepository,
     create_guild_settings_repository,
     run_db,
 )
+
 
 class EventNoticeCog(commands.Cog):
     def __init__(

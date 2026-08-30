@@ -11,7 +11,13 @@ from discord import app_commands
 from discord.ext import commands
 
 from module.database import ProfileRepository, create_profile_repository, run_db
-from module.game_profile import ADAPTERS, GameAdapter, ProfileLookupError, ProfileService, Showcase
+from module.game_profile import (
+    ADAPTERS,
+    GameAdapter,
+    ProfileLookupError,
+    ProfileService,
+    Showcase,
+)
 
 GAME_CHOICES = [
     app_commands.Choice(name=adapter.label, value=adapter.key)

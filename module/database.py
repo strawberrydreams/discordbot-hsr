@@ -29,6 +29,7 @@ from abc import ABC, abstractmethod
 from contextlib import closing
 from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
 from module.config import (
     AI_USAGE_RETENTION_DAYS,
     DATA_DIR,
@@ -36,7 +37,6 @@ from module.config import (
     ensure_private_directory,
     ensure_private_file,
 )
-
 
 # ─────────── 연결 정책 ─────────── #
 

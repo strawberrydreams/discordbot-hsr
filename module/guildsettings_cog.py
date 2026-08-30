@@ -23,7 +23,6 @@ from module.panel import (
     panel_lock,
 )
 
-
 logger = logging.getLogger(__name__)
 
 

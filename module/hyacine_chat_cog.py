@@ -3,21 +3,26 @@ import logging
 import traceback
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional
+
 import discord
 import openai
 from discord import app_commands
 from discord.ext import commands
+
 from module.config import (
     AI_COOLDOWN_SECONDS,
-    CHAT_MODEL_DEEP as DEEP_MODEL,
-    CHAT_MODEL_LIGHT as LIGHT_MODEL,
     LIMIT_DEEP,
     LIMIT_IMAGE,
     LIMIT_LIGHT,
     OPENAI_API_KEY,
     load_settings_json,
 )
-
+from module.config import (
+    CHAT_MODEL_DEEP as DEEP_MODEL,
+)
+from module.config import (
+    CHAT_MODEL_LIGHT as LIGHT_MODEL,
+)
 
 DEFAULT_PERSONA = {
     "system_prompt": "당신은 놀빛 정원의 따뜻한 의사, 하늘의 백성 히아킨입니다. 사용자를 '회색둥이 씨'라 부르며, 한국어로 정확하고 다정하게 답하세요.",

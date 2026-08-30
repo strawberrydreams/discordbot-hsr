@@ -28,7 +28,13 @@ venv/
 .worktrees/
 
 # 내부 작업 문서 — 공개 저장소에 넣지 않는다
+AGENTS.md
+CLAUDE.md
+DESIGN.md
 docs/plans/
 docs/superpowers/
 docs/code-review-*.md
 docs/review-remediation-plan.md
+
+# Lint cache
+.ruff_cache/

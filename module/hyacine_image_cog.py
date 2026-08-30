@@ -1,14 +1,17 @@
 from __future__ import annotations
+
 import asyncio
 import os
 import time
 import traceback
 import uuid
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
 from google.genai import errors as genai_errors
+
 from module.config import (
     AI_COOLDOWN_SECONDS,
     DATA_DIR,

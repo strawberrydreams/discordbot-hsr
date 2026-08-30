@@ -11,8 +11,8 @@
 #
 # 모든 테스트는 임시 디렉터리의 격리된 DB를 사용하므로 운영 데이터를 건드리지 않는다.
 
-import datetime
 import asyncio
+import datetime
 import gc
 import importlib
 import inspect
@@ -42,15 +42,15 @@ os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
 
 import module.database as database
 from module.database import (
-    SQLiteUsageRepository,
-    SQLitePartyRepository,
     SQLiteGuildSettingsRepository,
+    SQLitePartyRepository,
     SQLiteProfileRepository,
-    create_usage_repository,
+    SQLiteUsageRepository,
     create_party_repository,
+    create_usage_repository,
 )
-from module.usage_cog import UsageCog
 from module.hyacine_chat_cog import HyacineChatCog
+from module.usage_cog import UsageCog
 
 PASS = 0
 FAIL = 0
@@ -820,9 +820,8 @@ def test_forbidden_words_degrade_gracefully():
 
 
 def test_forbidden_words_load_logs_to_stdout():
-    import module.forbiddenfilter_cog as forbiddenfilter_cog
-
     import module.config as config
+    import module.forbiddenfilter_cog as forbiddenfilter_cog
 
     with tempfile.TemporaryDirectory() as directory:
         pathlib.Path(directory, "forbidden_words.json").write_text(
@@ -1132,8 +1131,9 @@ def test_importing_main_does_not_construct_bot():
 
 
 def test_bot_disables_all_mentions():
-    import module.main as main
     from discord.ext import commands
+
+    import module.main as main
 
     with patch.object(commands.Bot, "__init__", return_value=None) as init:
         main.HyacineBot()

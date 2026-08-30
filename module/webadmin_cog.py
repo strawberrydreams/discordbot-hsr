@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 import html
 import io
 import json
@@ -10,6 +9,7 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -29,7 +29,6 @@ from module.panel import (
     is_sendable_announcement_channel,
     is_sendable_panel_channel,
 )
-
 
 DEFAULT_HOST = "127.0.0.1"
 ALLOWED_HOSTS = frozenset({DEFAULT_HOST, "0.0.0.0"})

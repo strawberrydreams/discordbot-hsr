@@ -229,6 +229,15 @@ docker compose logs --tail=100 bot
 
 이어 Discord에서 `/프로필`, `/게임카드`, 파티 채널의 게임별 패널을 확인합니다. 이상이 있으면 즉시 봇을 다시 중지하고 비상 사본과 restore stage를 보존하세요.
 
+## 코드 린트
+
+import 정렬 규칙은 저장소 루트의 `ruff.toml`이 정의합니다. 런타임 의존성이 아니므로 `requirements.txt`/`requirements.lock`에는 넣지 않고 `uv`로 그때그때 실행합니다.
+
+```bash
+uv tool run ruff check --select I module test          # 검사
+uv tool run ruff check --select I --fix module test    # 자동 정렬
+```
+
 ## 배포
 
 변경을 모아 한 번에 배포합니다. **현재 코드로 온라인 백업 생성·검증 → pull → 테스트·빌드 → 봇·백업 재시작** 순서로 진행합니다. 이렇게 해야 새 코드의 스키마 마이그레이션 전에 구버전 DB 백업이 남습니다. 블록은 pull 전 커밋을 먼저 출력하고, 테스트나 백업 명령 하나라도 실패하면 재시작 전에 종료합니다.

@@ -19,7 +19,6 @@ from module.database import (
 )
 from module.panel import panel_lock, upsert_panel
 
-
 logger = logging.getLogger(__name__)
 PARTY_LIFETIME_SECONDS = 24 * 60 * 60
 MAX_COMPONENTS = 25

@@ -4,7 +4,6 @@ import asyncio
 
 import discord
 
-
 _PANEL_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 
 

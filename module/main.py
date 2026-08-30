@@ -4,6 +4,7 @@ from typing import BinaryIO
 
 import discord
 from discord.ext import commands
+
 from module.backup import DATABASES, verify_database
 from module.config import (
     ADMIN_TOKEN,
