@@ -239,6 +239,28 @@ textarea:focus-visible {
 
 .topbar-form { margin: 0; }
 
+.language-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.language-switch a {
+  border-radius: 8px;
+  color: var(--greyple);
+  padding: var(--space-1) var(--space-2);
+  font-size: 12px;
+  font-weight: 750;
+  text-decoration: none;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.language-switch a:hover,
+.language-switch a:focus-visible {
+  background: rgba(255, 255, 255, .06);
+  color: var(--snow);
+}
+
 .session-remaining {
   color: var(--greyple);
   font-size: 12px;
@@ -784,6 +806,8 @@ input[type="file"]::file-selector-button {
 
 
 /* ─────────────── 로그인 화면 (body.login) ─────────────── */
+
+.login .language-switch { margin-top: auto; }
 
 body.login {
   display: grid;

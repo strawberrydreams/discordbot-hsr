@@ -859,7 +859,10 @@ class WebAdminCog(commands.Cog):
     async def index_get(self, request: web.Request) -> web.StreamResponse:
         session = self._get_active_session(request)
         if session is None:
-            raise web.HTTPFound("/login")
+            # 고른 언어를 로그인 화면까지 들고 간다. 아직 쿠키가 없는 첫 방문에서
+            # ?lang=en으로 들어와도 한국어 로그인 화면이 뜨지 않게 한다.
+            chosen = chosen_language(request)
+            raise web.HTTPFound(f"/login?lang={chosen}" if chosen else "/login")
         return self._remember_language(
             await self._index_response(resolve_language(request), session[1].csrf),
             request,
