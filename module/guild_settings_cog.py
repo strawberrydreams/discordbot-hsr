@@ -22,7 +22,7 @@ from module.panel import (
     is_sendable_panel_channel,
     panel_lock,
 )
-from module.playwith_cog import PlayWithCog
+from module.party_cog import PartyCog
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +144,7 @@ class GuildSettingsCog(commands.Cog):
 
     async def _ensure_panels(self, guild: discord.Guild) -> None:
         get_cog = getattr(self.bot, "get_cog", None)
-        party_cog = get_cog(PlayWithCog.__name__) if get_cog else None
+        party_cog = get_cog(PartyCog.__name__) if get_cog else None
         if party_cog is not None:
             await party_cog.ensure_panels(guild)
 

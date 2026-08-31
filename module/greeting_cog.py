@@ -1,6 +1,6 @@
 """정적 인삿말.
 
-`/인사`는 API를 호출하지 않는데도 hyacine_chat_cog에 있어 OPENAI_API_KEY가
+`/인사`는 API를 호출하지 않는데도 ai_chat_cog에 있어 OPENAI_API_KEY가
 없으면 함께 사라졌다. AI 키가 없는 운영자도 이 명령은 쓸 수 있어야 하므로
 키 게이트 밖의 별도 확장으로 둔다.
 """
@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from module.hyacine_chat_cog import load_persona
+from module.ai_chat_cog import load_persona
 
 
 class GreetingCog(commands.Cog):

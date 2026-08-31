@@ -27,7 +27,7 @@ from module.config import BACKUP_DIR, DATA_DIR
 
 # (섹션 이름, 테이블, 뽑을 컬럼) — DB 파일별로 묶는다.
 EXPORTS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]] = {
-    "attendance_data.db": (
+    "usage_data.db": (
         (
             "users",
             "users",

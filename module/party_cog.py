@@ -43,7 +43,7 @@ def _truncate_embed_field(
 class PartyPanelButton(discord.ui.Button):
     def __init__(
         self,
-        cog: "PlayWithCog",
+        cog: "PartyCog",
         game: str,
         action: str,
         role: Optional[str] = None,
@@ -78,7 +78,7 @@ class PartyPanelButton(discord.ui.Button):
 class PartyPanelView(discord.ui.View):
     """One persistent view per game; IDs never contain the raw game name."""
 
-    def __init__(self, cog: "PlayWithCog", game: str):
+    def __init__(self, cog: "PartyCog", game: str):
         super().__init__(timeout=None)
         roles = GAMES[game]["roles"]
         if len(roles) + 1 > MAX_COMPONENTS:
@@ -92,7 +92,7 @@ class PartyPanelView(discord.ui.View):
 
 
 class GameSelectorButton(discord.ui.Button):
-    def __init__(self, cog: "PlayWithCog", game: str):
+    def __init__(self, cog: "PartyCog", game: str):
         super().__init__(
             label=game[:80],
             style=discord.ButtonStyle.success,
@@ -106,13 +106,13 @@ class GameSelectorButton(discord.ui.Button):
 
 
 class GameSelectorView(discord.ui.View):
-    def __init__(self, cog: "PlayWithCog"):
+    def __init__(self, cog: "PartyCog"):
         super().__init__(timeout=None)
         for game in list(GAMES)[:MAX_COMPONENTS]:
             self.add_item(GameSelectorButton(cog, game))
 
 
-class PlayWithCog(commands.Cog):
+class PartyCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
@@ -583,4 +583,4 @@ class PlayWithCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(PlayWithCog(bot))
+    await bot.add_cog(PartyCog(bot))

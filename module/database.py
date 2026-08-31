@@ -5,7 +5,7 @@
 #
 # 외부 DB(MySQL, Oracle 등)로 교체하는 방법:
 #   1. UsageRepository / PartyRepository / GuildSettingsRepository /
-#      ProfileRepository를 상속한
+#      GameUidRepository를 상속한
 #      구현 클래스를 이 파일에 작성 (SQL placeholder가 ?가 아닌 %s인 점 등 방언 차이만 처리)
 #   2. 아래 create_* 팩토리에 분기 추가
 #   3. 환경 변수 DB_BACKEND=mysql, DB_URL=mysql://user:pass@host:3306/botdb 형태로 설정
@@ -310,7 +310,7 @@ class GuildSettingsRepository(ABC):
         """봇이 길드에서 제거됐을 때 해당 길드 설정을 지운다."""
 
 
-class ProfileRepository(ABC):
+class GameUidRepository(ABC):
     """게임 프로필 UID 매핑. 길드별로 격리된다.
 
     같은 사람이 서버마다 다른 UID를 쓸 수 있고, 어느 서버에 등록했는지가
@@ -1176,7 +1176,7 @@ class SQLiteGuildSettingsRepository(GuildSettingsRepository):
             conn.commit()
 
 
-class SQLiteProfileRepository(ProfileRepository):
+class SQLiteGameUidRepository(GameUidRepository):
     _SCHEMA_VERSION = 1
     _COLUMN_ORDER = ("guild_id", "user_id", "game", "uid")
 
@@ -1272,7 +1272,7 @@ _UNSUPPORTED_MSG = (
 
 def create_usage_repository() -> UsageRepository:
     if DB_BACKEND == "sqlite":
-        return SQLiteUsageRepository(DATA_DIR / "attendance_data.db")
+        return SQLiteUsageRepository(DATA_DIR / "usage_data.db")
     # 외부 DB 분기 예시:
     # if DB_BACKEND == "mysql":
     #     return MySQLUsageRepository(DB_URL)
@@ -1285,11 +1285,11 @@ def create_party_repository() -> PartyRepository:
     raise NotImplementedError(_UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="PartyRepository"))
 
 
-def create_profile_repository() -> ProfileRepository:
+def create_game_uid_repository() -> GameUidRepository:
     if DB_BACKEND == "sqlite":
-        return SQLiteProfileRepository(DATA_DIR / "profile_data.db")
+        return SQLiteGameUidRepository(DATA_DIR / "game_uid_data.db")
     raise NotImplementedError(
-        _UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="ProfileRepository")
+        _UNSUPPORTED_MSG.format(backend=DB_BACKEND, repo="GameUidRepository")
     )
 
 

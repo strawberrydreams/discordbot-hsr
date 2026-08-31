@@ -25,7 +25,7 @@ BACKOFF_FAILURE_THRESHOLD = 3
 BACKOFF_SECONDS = 60.0
 
 
-class ProfileLookupError(Exception):
+class ShowcaseLookupError(Exception):
     """사용자에게 그대로 보여줄 수 있는 조회 실패."""
 
 
@@ -61,7 +61,7 @@ class GameAdapter:
             or len(cleaned) not in self.uid_lengths
         ):
             allowed_lengths = "·".join(str(length) for length in self.uid_lengths)
-            raise ProfileLookupError(
+            raise ShowcaseLookupError(
                 f"{self.label} UID는 ASCII 숫자 {allowed_lengths}자리여야 합니다."
             )
         return cleaned
@@ -150,7 +150,7 @@ class _BackoffState:
     blocked_until: float = 0.0
 
 
-class ProfileService:
+class ShowcaseService:
     """게임별 enka 클라이언트를 하나씩 살려 두고 조회 결과를 캐시한다.
 
     클라이언트를 명령마다 새로 만들면 매번 에셋 JSON을 다시 읽는다. 반대로
@@ -169,7 +169,7 @@ class ProfileService:
         try:
             return self._adapters[game]
         except KeyError:
-            raise ProfileLookupError("지원하지 않는 게임입니다.") from None
+            raise ShowcaseLookupError("지원하지 않는 게임입니다.") from None
 
     async def _get_or_create_client(self, adapter: GameAdapter):
         lock = self._locks.setdefault(adapter.key, asyncio.Lock())
@@ -185,7 +185,7 @@ class ProfileService:
     def _check_backoff(self, game: str) -> None:
         backoff = self._backoff_by_game.get(game)
         if backoff is not None and time.monotonic() < backoff.blocked_until:
-            raise ProfileLookupError(
+            raise ShowcaseLookupError(
                 "조회가 연달아 실패해 잠시 쉬는 중입니다. 1분 뒤에 다시 시도해 주세요."
             )
 
@@ -227,20 +227,20 @@ class ProfileService:
             response = await client.fetch_showcase(uid)
         except enka.errors.PlayerDoesNotExistError:
             # 오타는 실패가 아니다. 백오프를 태우지 않는다.
-            raise ProfileLookupError(
+            raise ShowcaseLookupError(
                 f"{adapter.label}에 UID `{uid}` 계정이 없습니다. 다시 확인해 주세요."
             ) from None
         except enka.errors.WrongUIDFormatError:
-            raise ProfileLookupError(f"{adapter.label} UID 형식이 아닙니다.") from None
+            raise ShowcaseLookupError(f"{adapter.label} UID 형식이 아닙니다.") from None
         except enka.errors.GameMaintenanceError:
             self._record_failure(game)
-            raise ProfileLookupError("게임이 점검 중입니다. 잠시 뒤에 다시 시도해 주세요.") from None
+            raise ShowcaseLookupError("게임이 점검 중입니다. 잠시 뒤에 다시 시도해 주세요.") from None
         except enka.errors.RateLimitedError:
             self._record_failure(game)
-            raise ProfileLookupError("Enka 요청이 몰려 있습니다. 잠시 뒤에 다시 시도해 주세요.") from None
+            raise ShowcaseLookupError("Enka 요청이 몰려 있습니다. 잠시 뒤에 다시 시도해 주세요.") from None
         except (enka.errors.EnkaAPIError, asyncio.TimeoutError, OSError):
             self._record_failure(game)
-            raise ProfileLookupError(
+            raise ShowcaseLookupError(
                 "Enka Network에 연결하지 못했습니다. 잠시 뒤에 다시 시도해 주세요."
             ) from None
 

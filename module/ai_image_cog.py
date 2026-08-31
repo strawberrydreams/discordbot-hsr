@@ -37,7 +37,7 @@ def _is_gemini_quota_error(error: Exception) -> bool:
     )
 
 
-class HyacineImageCog(commands.Cog):
+class AIImageCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -122,7 +122,7 @@ class HyacineImageCog(commands.Cog):
                     )
                 except Exception:
                     print(
-                        "❌ [hyacine_image] 일일 사용량 반환 실패 "
+                        "❌ [ai_image] 일일 사용량 반환 실패 "
                         f"(user={interaction.user.id}, command=image)"
                     )
                     traceback.print_exc()
@@ -161,7 +161,7 @@ class HyacineImageCog(commands.Cog):
                     )[:3]
                 ]
                 print(
-                    "⚠️ [hyacine_image] 이미지 없는 provider 응답 "
+                    "⚠️ [ai_image] 이미지 없는 provider 응답 "
                     f"(model={IMAGE_MODEL}, finish={','.join(finish_reasons) or 'unknown'})"
                 )
                 await interaction.followup.send(
@@ -217,12 +217,12 @@ class HyacineImageCog(commands.Cog):
                 # provider가 생성 요청을 수락하지 않았으므로 사용자 일일 예약을 반환한다.
                 api_started = False
             print(
-                "❌ [hyacine_image] 이미지 생성 실패 "
+                "❌ [ai_image] 이미지 생성 실패 "
                 f"(user={interaction.user.id})"
             )
             if quota_error:
                 print(
-                    "⚠️ [hyacine_image] provider quota/billing 제한 "
+                    "⚠️ [ai_image] provider quota/billing 제한 "
                     f"(provider=google, status={getattr(error, 'code', 'RESOURCE_EXHAUSTED')})"
                 )
             else:
@@ -243,7 +243,7 @@ class HyacineImageCog(commands.Cog):
                     )
             except Exception:
                 print(
-                    "⚠️ [hyacine_image] 오류 메시지 전송 실패 "
+                    "⚠️ [ai_image] 오류 메시지 전송 실패 "
                     f"(user={interaction.user.id})"
                 )
         finally:
@@ -257,4 +257,4 @@ class HyacineImageCog(commands.Cog):
                     pass
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HyacineImageCog(bot))
+    await bot.add_cog(AIImageCog(bot))

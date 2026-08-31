@@ -15,10 +15,10 @@ from module.config import (
     OPENAI_API_KEY,
     validate_config,
 )
-from module.forbiddenfilter_cog import ForbiddenFilterCog
-from module.playwith_cog import PlayWithCog
+from module.forbidden_filter_cog import ForbiddenFilterCog
+from module.party_cog import PartyCog
 from module.usage_cog import UsageCog
-from module.webadmin_cog import WebAdminCog
+from module.web_admin_cog import WebAdminCog
 
 # 실행 커맨드: python -m module.main
 
@@ -30,22 +30,23 @@ BOT_INTENTS.members = True
 
 # (확장 경로, 그 확장이 요구하는 환경변수 이름들)
 EXTENSIONS = (
-    ("module.webadmin_cog", ("ADMIN_TOKEN",)),
-    ("module.guildsettings_cog", ()),
-    ("module.eventnotice_cog", ()),
-    ("module.playwith_cog", ()),
-    ("module.forbiddenfilter_cog", ()),
+    ("module.web_admin_cog", ("ADMIN_TOKEN",)),
+    ("module.guild_settings_cog", ()),
+    ("module.scheduled_event_cog", ()),
+    ("module.party_cog", ()),
+    ("module.forbidden_filter_cog", ()),
     ("module.greeting_cog", ()),
-    ("module.hyacine_chat_cog", ("OPENAI_API_KEY",)),
-    ("module.hyacine_image_cog", ("GOOGLE_API_KEY",)),
+    ("module.ai_chat_cog", ("OPENAI_API_KEY",)),
+    ("module.ai_image_cog", ("GOOGLE_API_KEY",)),
     ("module.usage_cog", ()),
-    ("module.profile_cog", ()),
+    ("module.member_profile_cog", ()),
+    ("module.game_profile_cog", ()),
 )
 
 # 다른 cog가 런타임에 찾아 쓰는 cog들. 셋 다 환경변수 게이트가 없어 항상
 # 로드되므로, 하나라도 없다면 EXTENSIONS 등록이 빠진 것이다. 조용한 None으로
 # 기능이 반쯤 죽는 대신 기동에서 실패시킨다.
-CROSS_COG_DEPENDENCIES = (UsageCog, PlayWithCog, ForbiddenFilterCog)
+CROSS_COG_DEPENDENCIES = (UsageCog, PartyCog, ForbiddenFilterCog)
 
 OPTIONAL_DEPENDENCY_VALUES = {
     "ADMIN_TOKEN": ADMIN_TOKEN,

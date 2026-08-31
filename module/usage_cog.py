@@ -2,7 +2,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from module.database import UsageRepository, create_usage_repository, run_db
@@ -89,40 +88,6 @@ class UsageCog(commands.Cog):
             member.guild.id,
             member.id,
         )
-
-    # ── Slash Commands ── #
-
-    @app_commands.command(name="프로필", description="사용자의 서버 프로필 정보를 확인합니다.")
-    @app_commands.describe(유저="프로필을 확인할 유저 (선택사항, 기본값: 본인)")
-    @app_commands.guild_only()
-    async def _profile(
-        self, interaction: discord.Interaction, 유저: discord.Member = None
-    ):
-        profile_member = 유저 if 유저 else interaction.user
-
-        forbidden_count = await self.get_forbidden_count(
-            interaction.guild_id, profile_member.id
-        )
-
-        # Join date
-        joined_date = (
-            profile_member.joined_at.strftime("%Y-%m-%d")
-            if profile_member.joined_at
-            else "알 수 없음"
-        )
-
-        embed = discord.Embed(
-            title=f"👤 {profile_member.display_name}님의 프로필",
-            color=profile_member.color
-        )
-
-        if profile_member.avatar:
-            embed.set_thumbnail(url=profile_member.avatar.url)
-
-        embed.add_field(name="📅 서버 가입일", value=joined_date, inline=True)
-        embed.add_field(name="🚫 금지어 경고", value=f"{forbidden_count}회", inline=True)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(UsageCog(bot))

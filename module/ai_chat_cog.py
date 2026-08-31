@@ -106,7 +106,7 @@ class ChannelSession:
         self.lock = asyncio.Lock()
 
 
-class HyacineChatCog(commands.Cog):
+class AIChatCog(commands.Cog):
     MAX_CHANNEL_SESSIONS = 100
 
     def __init__(self, bot: commands.Bot):
@@ -249,7 +249,7 @@ class HyacineChatCog(commands.Cog):
                     )
                 except Exception:
                     print(
-                        "❌ [hyacine_chat] 일일 사용량 반환 실패 "
+                        "❌ [ai_chat] 일일 사용량 반환 실패 "
                         f"(user={interaction.user.id}, command={usage_category})"
                     )
                     traceback.print_exc()
@@ -323,7 +323,7 @@ class HyacineChatCog(commands.Cog):
             quota_exhausted = _is_insufficient_quota(exc)
             if quota_exhausted:
                 logger.warning(
-                    "[hyacine_chat] OpenAI API credit exhausted "
+                    "[ai_chat] OpenAI API credit exhausted "
                     "(model=%s, channel=%s)",
                     model,
                     interaction.channel_id,
@@ -335,7 +335,7 @@ class HyacineChatCog(commands.Cog):
             else:
                 # 상세 오류는 콘솔에만 남기고, 디스코드에는 일반 메시지만 전송
                 print(
-                    f"❌ [hyacine_chat] '{model}' 호출 실패 "
+                    f"❌ [ai_chat] '{model}' 호출 실패 "
                     f"(channel={interaction.channel_id})"
                 )
                 traceback.print_exc()
@@ -350,7 +350,7 @@ class HyacineChatCog(commands.Cog):
                     await interaction.response.send_message(error_message)
             except Exception:
                 print(
-                    "❌ [hyacine_chat] 오류 메시지 전송 실패 "
+                    "❌ [ai_chat] 오류 메시지 전송 실패 "
                     f"(channel={interaction.channel_id})"
                 )
                 traceback.print_exc()
@@ -443,4 +443,4 @@ class HyacineChatCog(commands.Cog):
         await interaction.response.send_message(status_message, ephemeral=True)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HyacineChatCog(bot))
+    await bot.add_cog(AIChatCog(bot))

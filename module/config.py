@@ -176,12 +176,12 @@ def _canonicalize_games(document: object, *, strict: bool = False) -> dict:
 def _validate_settings_document(name: str, document: object) -> object:
     """실서비스 loader와 공유하는 canonicalizer로 문서를 검증한다."""
     if name == "persona.json":
-        from module.hyacine_chat_cog import canonicalize_persona
+        from module.ai_chat_cog import canonicalize_persona
 
         canonicalize_persona(document, strict=True)
         return document
     elif name == "forbidden_words.json":
-        from module.forbiddenfilter_cog import canonicalize_forbidden_document
+        from module.forbidden_filter_cog import canonicalize_forbidden_document
 
         return canonicalize_forbidden_document(document, strict=True)
     elif name == "games.json":
@@ -377,7 +377,7 @@ def validate_config() -> None:
 def load_games() -> dict:
     """settings/games.json → games.example.json 순으로 읽는다.
 
-    형태가 어긋난 항목은 버린다. playwith_cog가 max_players/roles를 무조건
+    형태가 어긋난 항목은 버린다. party_cog가 max_players/roles를 무조건
     참조하므로, 잘못된 항목 하나가 파티 기능 전체를 깨뜨리면 안 된다.
     """
     document = load_settings_json("games.json", "games.example.json", default={})

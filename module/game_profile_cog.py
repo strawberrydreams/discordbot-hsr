@@ -10,13 +10,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from module.database import ProfileRepository, create_profile_repository, run_db
-from module.game_profile import (
+from module.database import GameUidRepository, create_game_uid_repository, run_db
+from module.enka_profiles import (
     ADAPTERS,
     GameAdapter,
-    ProfileLookupError,
-    ProfileService,
     Showcase,
+    ShowcaseLookupError,
+    ShowcaseService,
 )
 
 GAME_CHOICES = [
@@ -25,31 +25,31 @@ GAME_CHOICES = [
 ]
 
 
-class ProfileCog(commands.Cog):
+class GameProfileCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
-        profile_repository: Optional[ProfileRepository] = None,
-        profile_service: Optional[ProfileService] = None,
+        game_uid_repository: Optional[GameUidRepository] = None,
+        showcase_service: Optional[ShowcaseService] = None,
     ):
         self.bot = bot
-        self.profile_repository = profile_repository or create_profile_repository()
+        self.game_uid_repository = game_uid_repository or create_game_uid_repository()
         # 네트워크는 명령이 처음 불릴 때 열린다. 키·회선 없이도 봇은 기동해야 한다.
-        self.profile_service = profile_service or ProfileService()
+        self.showcase_service = showcase_service or ShowcaseService()
 
     async def cog_unload(self) -> None:
-        await self.profile_service.close()
+        await self.showcase_service.close()
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
         """봇이 서버에서 제거되면 그 서버의 UID 등록을 남기지 않는다."""
-        await run_db(self.profile_repository.delete_guild, guild.id)
+        await run_db(self.game_uid_repository.delete_guild, guild.id)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         """멤버가 나가면 해당 서버에 등록한 UID를 모두 지운다."""
         await run_db(
-            self.profile_repository.delete_user,
+            self.game_uid_repository.delete_user,
             member.guild.id,
             member.id,
         )
@@ -66,18 +66,18 @@ class ProfileCog(commands.Cog):
     ):
         # Enka 조회가 3초를 넘길 수 있다. 먼저 ACK한다.
         await interaction.response.defer(ephemeral=True)
-        adapter = self.profile_service.get_adapter(게임.value)
+        adapter = self.showcase_service.get_adapter(게임.value)
         try:
             normalized_uid = adapter.validate_uid(uid)
-            showcase = await self.profile_service.fetch_showcase(
+            showcase = await self.showcase_service.fetch_showcase(
                 adapter.key, normalized_uid
             )
-        except ProfileLookupError as exc:
+        except ShowcaseLookupError as exc:
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
         await run_db(
-            self.profile_repository.set_uid,
+            self.game_uid_repository.set_uid,
             interaction.guild_id,
             interaction.user.id,
             adapter.key,
@@ -99,9 +99,9 @@ class ProfileCog(commands.Cog):
         self, interaction: discord.Interaction, 게임: app_commands.Choice[str]
     ):
         await interaction.response.defer()
-        adapter = self.profile_service.get_adapter(게임.value)
+        adapter = self.showcase_service.get_adapter(게임.value)
         uid = await run_db(
-            self.profile_repository.get_uid,
+            self.game_uid_repository.get_uid,
             interaction.guild_id,
             interaction.user.id,
             adapter.key,
@@ -115,8 +115,8 @@ class ProfileCog(commands.Cog):
             return
 
         try:
-            showcase = await self.profile_service.fetch_showcase(adapter.key, uid)
-        except ProfileLookupError as exc:
+            showcase = await self.showcase_service.fetch_showcase(adapter.key, uid)
+        except ShowcaseLookupError as exc:
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
@@ -160,9 +160,9 @@ class ProfileCog(commands.Cog):
     async def _unregister(
         self, interaction: discord.Interaction, 게임: app_commands.Choice[str]
     ):
-        adapter = self.profile_service.get_adapter(게임.value)
+        adapter = self.showcase_service.get_adapter(게임.value)
         registration_removed = await run_db(
-            self.profile_repository.delete_uid,
+            self.game_uid_repository.delete_uid,
             interaction.guild_id,
             interaction.user.id,
             adapter.key,
@@ -176,4 +176,4 @@ class ProfileCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ProfileCog(bot))
+    await bot.add_cog(GameProfileCog(bot))

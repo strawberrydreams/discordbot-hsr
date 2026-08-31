@@ -27,29 +27,29 @@ from module.config import (
 )
 from module.database import (
     SQLITE_TIMEOUT_SECONDS,
+    SQLiteGameUidRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
-    SQLiteProfileRepository,
     SQLiteUsageRepository,
 )
 
 DATABASES = {
-    "attendance_data.db": {"users", "ai_usage"},
+    "usage_data.db": {"users", "ai_usage"},
     "party_data.db": {"parties", "participants"},
     "guild_settings.db": {"guild_settings", "party_panels"},
-    "profile_data.db": {"game_uids"},
+    "game_uid_data.db": {"game_uids"},
 }
 _SQLITE_REPOSITORIES = {
-    "attendance_data.db": SQLiteUsageRepository,
+    "usage_data.db": SQLiteUsageRepository,
     "party_data.db": SQLitePartyRepository,
     "guild_settings.db": SQLiteGuildSettingsRepository,
-    "profile_data.db": SQLiteProfileRepository,
+    "game_uid_data.db": SQLiteGameUidRepository,
 }
 _CURRENT_SCHEMA_VERSIONS = {
     name: repository._SCHEMA_VERSION
     for name, repository in _SQLITE_REPOSITORIES.items()
 }
-_LEGACY_ATTENDANCE_TABLES = {"users", "point_ledger"}
+_LEGACY_USAGE_TABLES = {"users", "point_ledger"}
 _LEGACY_PARTY_TABLES = {"parties", "participants"}
 _LEGACY_GUILD_SETTINGS_TABLES = {"guild_settings"}
 
@@ -100,10 +100,10 @@ def verify_database(
                 )
             if (
                 allow_legacy
-                and source_name == "attendance_data.db"
+                and source_name == "usage_data.db"
                 and schema_version in (0, 1)
             ):
-                required_tables = _LEGACY_ATTENDANCE_TABLES
+                required_tables = _LEGACY_USAGE_TABLES
             if (
                 allow_legacy
                 and source_name == "guild_settings.db"

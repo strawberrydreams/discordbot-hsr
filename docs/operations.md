@@ -50,7 +50,7 @@ OpenAI가 `429`와 `credit_balance_exhausted`를 반환하면 모델 혼잡이 �
 
 ### 게임 카드
 
-`profile_data.db`의 `game_uids` 테이블이 `(guild_id, user_id, game)`별 UID를 보관합니다. 백업·복구 경로에 다른 DB와 함께 포함됩니다.
+`game_uid_data.db`의 `game_uids` 테이블이 `(guild_id, user_id, game)`별 UID를 보관합니다. 백업·복구 경로에 다른 DB와 함께 포함됩니다.
 
 게임 데이터 파일은 첫 조회 때 프로세스 작업 디렉터리 기준 `.enka_py/`로 내려받습니다. Compose는 이 경로를 `./runtime/enka`에 bind mount하므로 container를 다시 만들어도 재다운로드하지 않습니다. 이 디렉터리는 봇 UID로 쓰기 가능해야 합니다.
 
@@ -109,6 +109,29 @@ Docker Compose CLI가 없는 개발 환경에서 콘솔 suite는 rendered Compos
 
 Mac이 잠들면 Docker Desktop 컨테이너도 중단됩니다.
 
+## 기존 설치의 DB 파일명 이관
+
+DB 파일 두 개의 이름이 내용에 맞게 바뀌었습니다. 봇은 새 이름만 찾으므로, 이 변경 이전부터 운영해 온 설치는 **봇을 멈춘 상태에서 한 번** 파일을 옮겨야 합니다. 옮기지 않으면 빈 DB가 새로 생성되고 기존 기록이 보이지 않습니다.
+
+| 이전 | 이후 | 내용 |
+|---|---|---|
+| `attendance_data.db` | `usage_data.db` | 금지어 경고 횟수, AI 일일 사용량 (출석 기능은 이미 삭제됨) |
+| `profile_data.db` | `game_uid_data.db` | 게임 UID |
+
+```bash
+docker compose stop bot backup
+cd runtime/data
+for suffix in "" "-wal" "-shm"; do
+  test -e "attendance_data.db$suffix" && mv "attendance_data.db$suffix" "usage_data.db$suffix"
+  test -e "profile_data.db$suffix" && mv "profile_data.db$suffix" "game_uid_data.db$suffix"
+done
+cd -
+docker compose up -d bot backup
+docker compose logs --tail=50 bot
+```
+
+`runtime/backups/`의 기존 백업 파일명은 그대로 두세요. manifest가 당시 이름을 기록하고 있고, 복구 절차는 manifest를 따릅니다.
+
 ## 백업 운영
 
 수동 점검은 `backup` container에서 실행합니다.
@@ -119,7 +142,7 @@ docker compose run --rm --no-deps backup python -m module.backup verify
 docker compose run --rm --no-deps backup python -m module.backup restore-test
 ```
 
-`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker의 `backup` 서비스는 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용해 SQLite 온라인 백업을 생성합니다. 값을 변경한 뒤 `docker compose up -d --force-recreate backup`으로 백업 서비스를 다시 만드세요.
+`verify`와 `restore-test`는 `runtime/backups/`에서 가장 최신 manifest를 사용합니다. 각 backup set은 `usage_data.db`, `party_data.db`, `guild_settings.db`, `game_uid_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다. 기본 백업 주기는 21,600초(6시간), 보존 기간은 30일입니다. Docker의 `backup` 서비스는 `.env.runtime`의 `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION_DAYS`를 사용해 SQLite 온라인 백업을 생성합니다. 값을 변경한 뒤 `docker compose up -d --force-recreate backup`으로 백업 서비스를 다시 만드세요.
 
 DB는 WAL 모드로 동작합니다. WAL DB는 **읽기 전용 연결이라도** `-shm`/`-wal` 파일을 만들 수 있어야 하므로, Docker `backup` 서비스의 `./runtime/data` 마운트는 `:ro`가 아니라 쓰기 가능해야 합니다. `:ro`로 되돌리면 봇이 정지한 상태(= `-shm` 부재)에서만 백업이 `attempt to write a readonly database`로 실패하고, `module.backup loop`이 예외를 삼켜 조용히 재시도만 반복합니다. 백업 코드는 SQLite 온라인 백업 API로 읽기만 하므로 rw 마운트가 데이터를 바꾸지는 않습니다.
 

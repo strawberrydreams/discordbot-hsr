@@ -41,15 +41,15 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "test-dummy")
 
 import module.database as database
+from module.ai_chat_cog import AIChatCog
 from module.database import (
+    SQLiteGameUidRepository,
     SQLiteGuildSettingsRepository,
     SQLitePartyRepository,
-    SQLiteProfileRepository,
     SQLiteUsageRepository,
     create_party_repository,
     create_usage_repository,
 )
-from module.hyacine_chat_cog import HyacineChatCog
 from module.usage_cog import UsageCog
 
 PASS = 0
@@ -507,7 +507,7 @@ test -z "$(sudo find settings runtime \( ! -uid "$BOT_UID" -o ! -gid "$BOT_GID" 
     )
     check(
         "백업은 네 DB와 존재한 세 settings를 exact same manifest로 설명",
-        """각 backup set은 `attendance_data.db`, `party_data.db`, `guild_settings.db`, `profile_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
+        """각 backup set은 `usage_data.db`, `party_data.db`, `guild_settings.db`, `game_uid_data.db`와 당시 존재한 `settings/persona.json`, `settings/forbidden_words.json`, `settings/games.json`을 같은 manifest에 넣습니다.""" in operations,
     )
     check(
         "복구는 stop→stage→DB/settings→owner/mode→access→start→health/log",
@@ -809,7 +809,7 @@ def test_deployment_contracts_skip_compose_when_cli_missing():
 
 def test_forbidden_words_degrade_gracefully():
     import module.config as config
-    from module.forbiddenfilter_cog import load_forbidden_words
+    from module.forbidden_filter_cog import load_forbidden_words
 
     with tempfile.TemporaryDirectory() as directory:
         settings_dir = pathlib.Path(directory)
@@ -821,7 +821,7 @@ def test_forbidden_words_degrade_gracefully():
 
 def test_forbidden_words_load_logs_to_stdout():
     import module.config as config
-    import module.forbiddenfilter_cog as forbiddenfilter_cog
+    import module.forbidden_filter_cog as forbidden_filter_cog
 
     with tempfile.TemporaryDirectory() as directory:
         pathlib.Path(directory, "forbidden_words.json").write_text(
@@ -829,7 +829,7 @@ def test_forbidden_words_load_logs_to_stdout():
         )
         output = StringIO()
         with patch.object(config, "SETTINGS_DIR", pathlib.Path(directory)), redirect_stdout(output):
-            forbiddenfilter_cog.ForbiddenFilterCog(bot=None)
+            forbidden_filter_cog.ForbiddenFilterCog(bot=None)
 
     check(
         "금지어 로드 로그가 stdout에 기록",
@@ -860,12 +860,12 @@ def test_startup_syncs_commands_globally():
             events.append("view:setup")
 
         async def add_cog(self, cog):
-            events.append("cog:guildsettings")
+            events.append("cog:guild_settings")
 
         async def load_extension(self, extension):
             events.append(f"load:{extension}")
-            if extension == "module.guildsettings_cog":
-                from module.guildsettings_cog import setup
+            if extension == "module.guild_settings_cog":
+                from module.guild_settings_cog import setup
 
                 await setup(self)
 
@@ -886,14 +886,14 @@ def test_startup_syncs_commands_globally():
     )
     check(
         "DB 사전 검증·마이그레이션 뒤 사후 검증 후 sync",
-        events.index("verify:pre") < events.index("load:module.guildsettings_cog")
+        events.index("verify:pre") < events.index("load:module.guild_settings_cog")
         < events.index("verify:post")
         < events.index("sync:global"),
         f"({events})",
     )
     check(
         "길드 설정 Cog가 로드 목록에 포함",
-        "load:module.guildsettings_cog" in events,
+        "load:module.guild_settings_cog" in events,
         f"({events})",
     )
     check(
@@ -928,14 +928,14 @@ def test_startup_preverification_failure_stops_cogs_and_sync():
             check("사전 DB 검증 실패 전파", False)
         except RuntimeError:
             check("사전 DB 검증 실패 전파", True)
-    check("사전 DB 검증 실패 시 Cog와 sync 미실행", events == ["verify:attendance_data.db"], f"({events})")
+    check("사전 DB 검증 실패 시 Cog와 sync 미실행", events == ["verify:usage_data.db"], f"({events})")
 
 
 def test_startup_migrates_legacy_attendance_before_strict_verification():
     import module.main as main
 
     data_dir = _TMP_DIR / "legacy-startup-data"
-    attendance_path = data_dir / "attendance_data.db"
+    attendance_path = data_dir / "usage_data.db"
     _create_legacy_attendance_db(attendance_path)
     SQLitePartyRepository(data_dir / "party_data.db")
     SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
@@ -956,8 +956,8 @@ def test_startup_migrates_legacy_attendance_before_strict_verification():
             if extension == "module.usage_cog":
                 SQLiteUsageRepository(attendance_path)
                 events.append("migrate:attendance")
-            if extension == "module.profile_cog":
-                SQLiteProfileRepository(data_dir / "profile_data.db")
+            if extension == "module.game_profile_cog":
+                SQLiteGameUidRepository(data_dir / "game_uid_data.db")
 
     with patch.object(main, "DATA_DIR", data_dir):
         try:
@@ -1257,7 +1257,7 @@ def test_backup_reads_wal_without_writer():
     with tempfile.TemporaryDirectory() as directory:
         data_dir = pathlib.Path(directory) / "data"
         data_dir.mkdir()
-        source = data_dir / "attendance_data.db"
+        source = data_dir / "usage_data.db"
         repo = SQLiteUsageRepository(source)
         repo.increment_forbidden_count(_TEST_GUILD, 1)
         del repo  # 쓰기 연결 없음 = 봇 정지 상태
@@ -1279,15 +1279,15 @@ def test_backup_reads_wal_without_writer():
 def test_guild_isolation():
     print("\n[0] 길드 격리")
     import module.database as database
-    import module.forbiddenfilter_cog as forbiddenfilter_cog
-    import module.playwith_cog as playwith_cog
+    import module.forbidden_filter_cog as forbidden_filter_cog
+    import module.party_cog as party_cog
 
     data_dir = _TMP_DIR / "guild-isolation"
     data_dir.mkdir(exist_ok=True)
     usage = database.SQLiteUsageRepository(data_dir / "a.db")
     parties = database.SQLitePartyRepository(data_dir / "p.db")
     settings = database.SQLiteGuildSettingsRepository(data_dir / "s.db")
-    profiles = database.SQLiteProfileRepository(data_dir / "g.db")
+    profiles = database.SQLiteGameUidRepository(data_dir / "g.db")
 
     A, B, USER = 1001, 1002, 7
     # 같은 사람이 서버마다 별도 카운트를 갖는다. 경계는 코드가 아니라 스키마가 만든다.
@@ -1370,22 +1370,22 @@ def test_guild_isolation():
         "DM은 금지어 집계에서 제외",
         "message.guild is None"
         in inspect.getsource(
-            forbiddenfilter_cog.ForbiddenFilterCog._inspect_message
+            forbidden_filter_cog.ForbiddenFilterCog._inspect_message
         ),
     )
     check(
         "파티 패널은 길드 밖 상호작용을 거부",
         "guild_id is None"
-        in inspect.getsource(playwith_cog.PlayWithCog._reject_invalid_interaction),
+        in inspect.getsource(party_cog.PartyCog._reject_invalid_interaction),
     )
 
 
 def test_temp_image_lifecycle():
     print("\n[0] 임시 이미지 경로와 수명")
+    import module.ai_image_cog as ai_image_cog
     import module.config as config
-    import module.hyacine_image_cog as hyacine_image_cog
 
-    cog = object.__new__(hyacine_image_cog.HyacineImageCog)
+    cog = object.__new__(ai_image_cog.AIImageCog)
     cog.temporary_image_directory = config.DATA_DIR / "temp_images"
     cog.temporary_image_directory.mkdir(parents=True, exist_ok=True)
     check("임시 경로는 DATA_DIR 아래", cog.temporary_image_directory.is_relative_to(config.DATA_DIR))
@@ -1394,7 +1394,7 @@ def test_temp_image_lifecycle():
     fresh = cog.temporary_image_directory / "fresh.png"
     stale.write_bytes(b"png")
     fresh.write_bytes(b"png")
-    old = time.time() - hyacine_image_cog.TEMP_IMAGE_TTL_SECONDS - 60
+    old = time.time() - ai_image_cog.TEMP_IMAGE_TTL_SECONDS - 60
     os.utime(stale, (old, old))
 
     cog._sweep_stale_images()
@@ -1877,7 +1877,7 @@ def test_party_capacity_constraint():
 
 
 def test_party_cog_uses_epoch_seconds():
-    from module.playwith_cog import PlayWithCog
+    from module.party_cog import PartyCog
 
     class RecordingRepository:
         created_at = None
@@ -1895,11 +1895,11 @@ def test_party_cog_uses_epoch_seconds():
             return False
 
     repository = RecordingRepository()
-    cog = object.__new__(PlayWithCog)
+    cog = object.__new__(PartyCog)
     cog.party_repository = repository
     with patch("time.time", return_value=2_000_000_000.75):
         asyncio.run(cog.create_party(_TEST_GUILD, "LOL"))
-        asyncio.run(PlayWithCog.cleanup_parties.coro(cog))
+        asyncio.run(PartyCog.cleanup_parties.coro(cog))
 
     check("Cog 파티 생성 시 epoch 정수 전달", repository.created_at == 2_000_000_000)
     check(
@@ -1909,9 +1909,9 @@ def test_party_cog_uses_epoch_seconds():
 
 
 def test_persistent_party_panel_contract():
-    import module.playwith_cog as playwith_cog
+    import module.party_cog as party_cog
 
-    source = inspect.getsource(playwith_cog)
+    source = inspect.getsource(party_cog)
     check(
         "구 파티 slash command 제거",
         all(f'name="{name}"' not in source for name in ("모집", "파티", "나가기", "변경")),
@@ -1922,7 +1922,7 @@ def test_persistent_party_panel_contract():
     )
     check(
         "파티 패널은 startup/setup/cleanup 복구 경로 제공",
-        all(name in playwith_cog.PlayWithCog.__dict__ for name in (
+        all(name in party_cog.PartyCog.__dict__ for name in (
             "ensure_panels", "render_game_panel", "on_ready", "on_member_remove"
         )),
     )
@@ -1979,7 +1979,7 @@ def test_cog_facade():
 
 def test_channel_sessions():
     print("\n[7] 채널별 대화 세션 분리")
-    cog = HyacineChatCog(bot=None)
+    cog = AIChatCog(bot=None)
 
     s1 = cog.get_or_create_session(111)
     s2 = cog.get_or_create_session(222)
@@ -1999,7 +1999,7 @@ def test_channel_sessions():
     # trim이 system 프롬프트를 보존하는지
     check("trim 후 system 프롬프트 보존", any(m["role"] == "system" for m in s1.history))
 
-    lru_cog = HyacineChatCog(bot=None)
+    lru_cog = AIChatCog(bot=None)
     for channel_id in range(lru_cog.MAX_CHANNEL_SESSIONS):
         lru_cog.get_or_create_session(channel_id)
     lru_cog.get_or_create_session(0)
@@ -2017,17 +2017,17 @@ def test_imports():
         "module.database",
         "module.main",
         "module.panel",
-        "module.guildsettings_cog",
+        "module.guild_settings_cog",
         "module.usage_cog",
-        "module.playwith_cog",
-        "module.eventnotice_cog",
-        "module.forbiddenfilter_cog",
+        "module.party_cog",
+        "module.scheduled_event_cog",
+        "module.forbidden_filter_cog",
         "module.greeting_cog",
-        "module.game_profile",
-        "module.profile_cog",
-        "module.webadmin_cog",
-        "module.hyacine_chat_cog",
-        "module.hyacine_image_cog",
+        "module.enka_profiles",
+        "module.game_profile_cog",
+        "module.web_admin_cog",
+        "module.ai_chat_cog",
+        "module.ai_image_cog",
     ]
     for m in mods:
         try:
@@ -2079,21 +2079,21 @@ def test_backup_round_trip():
     backup.DATA_DIR = _TMP_DIR
     backup.BACKUP_DIR = _TMP_DIR / "backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
-    SQLiteUsageRepository(_TMP_DIR / "attendance_data.db").increment_forbidden_count(_TEST_GUILD, 77)
+    SQLiteUsageRepository(_TMP_DIR / "usage_data.db").increment_forbidden_count(_TEST_GUILD, 77)
     SQLitePartyRepository(_TMP_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(_TMP_DIR / "guild_settings.db")
-    SQLiteProfileRepository(_TMP_DIR / "profile_data.db").set_uid(
+    SQLiteGameUidRepository(_TMP_DIR / "game_uid_data.db").set_uid(
         _TEST_GUILD, 77, "hsr", "800333171"
     )
 
     manifest = backup.create_backup_set()
     result = backup.verify_backup_set(manifest)
-    check("출석 DB 백업 검증", result["attendance_data.db"]["users"] == 1)
+    check("출석 DB 백업 검증", result["usage_data.db"]["users"] == 1)
     check("파티 DB 백업 검증", result["party_data.db"]["parties"] == 1)
-    check("프로필 DB 백업 검증", result["profile_data.db"]["game_uids"] == 1)
+    check("프로필 DB 백업 검증", result["game_uid_data.db"]["game_uids"] == 1)
     backup.restore_test(manifest)
     check("백업 복구 테스트", True)
 
@@ -2109,10 +2109,10 @@ def test_settings_backup_round_trip():
         stage = root / "stage"
         data_dir.mkdir()
         settings_dir.mkdir()
-        SQLiteUsageRepository(data_dir / "attendance_data.db")
+        SQLiteUsageRepository(data_dir / "usage_data.db")
         SQLitePartyRepository(data_dir / "party_data.db")
         SQLiteGuildSettingsRepository(data_dir / "guild_settings.db")
-        SQLiteProfileRepository(data_dir / "profile_data.db")
+        SQLiteGameUidRepository(data_dir / "game_uid_data.db")
         expected = {
             "persona.json": b'{"system_prompt":"p","greeting":"g"}\n',
             "forbidden_words.json": b'["x"]\n',
@@ -2421,7 +2421,7 @@ def test_legacy_backup_restore_and_prune():
     backup.BACKUP_DIR = backup_dir
     backup.BACKUP_RETENTION_DAYS = 30
     timestamp = "20260101T000000Z"
-    _create_legacy_attendance_db(data_dir / "attendance_data.db")
+    _create_legacy_attendance_db(data_dir / "usage_data.db")
     party_path = data_dir / "party_data.db"
     settings_path = data_dir / "guild_settings.db"
     SQLitePartyRepository(party_path).create_party(
@@ -2436,8 +2436,8 @@ def test_legacy_backup_restore_and_prune():
         conn.commit()
     with closing(sqlite3.connect(party_path)) as conn:
         conn.execute("PRAGMA user_version = 0")
-    # profile_data.db는 구버전이 없다. 현재 스키마 그대로 함께 백업된다.
-    SQLiteProfileRepository(data_dir / "profile_data.db").set_uid(
+    # game_uid_data.db는 구버전이 없다. 현재 스키마 그대로 함께 백업된다.
+    SQLiteGameUidRepository(data_dir / "game_uid_data.db").set_uid(
         _TEST_GUILD, 8, "hsr", "800333171"
     )
     backup_dir.mkdir(parents=True)
@@ -2449,7 +2449,7 @@ def test_legacy_backup_restore_and_prune():
         backup._backup_one(source, copied)
         tables = (
             {"users", "point_ledger"}
-            if source_name == "attendance_data.db"
+            if source_name == "usage_data.db"
             else {"guild_settings"}
             if source_name == "guild_settings.db"
             else current_tables
@@ -2481,17 +2481,17 @@ def test_legacy_backup_restore_and_prune():
     check(
         "historical v1 attendance backup verifies with base tables",
         verified is not None
-        and verified["attendance_data.db"] == {"point_ledger": 1, "users": 1},
+        and verified["usage_data.db"] == {"point_ledger": 1, "users": 1},
     )
     legacy_v0 = root / "legacy-v0-attendance.db"
-    shutil.copy2(data_dir / "attendance_data.db", legacy_v0)
+    shutil.copy2(data_dir / "usage_data.db", legacy_v0)
     with closing(sqlite3.connect(legacy_v0)) as conn:
         conn.execute("PRAGMA user_version = 0")
     try:
         v0_counts = backup.verify_database(
             legacy_v0,
-            backup.DATABASES["attendance_data.db"],
-            source_name="attendance_data.db",
+            backup.DATABASES["usage_data.db"],
+            source_name="usage_data.db",
             allow_legacy=True,
         )
     except RuntimeError:
@@ -2530,7 +2530,7 @@ def test_legacy_backup_restore_and_prune():
     check("all staged legacy databases reach the current contract", staged)
     if not staged:
         return
-    staged_attendance = stage / "attendance_data.db"
+    staged_attendance = stage / "usage_data.db"
     with closing(sqlite3.connect(staged_attendance)) as conn:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         tables = {
@@ -2574,8 +2574,8 @@ def test_legacy_backup_restore_and_prune():
     try:
         backup.verify_database(
             future,
-            backup.DATABASES["attendance_data.db"],
-            source_name="attendance_data.db",
+            backup.DATABASES["usage_data.db"],
+            source_name="usage_data.db",
             allow_legacy=True,
         )
         future_rejected = False
@@ -2634,13 +2634,13 @@ def test_invalid_retention_prevents_pruning():
         backup.BACKUP_INTERVAL_SECONDS = 21600
         backup.BACKUP_RETENTION_DAYS = 30
         SQLiteUsageRepository(
-            backup.DATA_DIR / "attendance_data.db"
+            backup.DATA_DIR / "usage_data.db"
         ).increment_forbidden_count(_TEST_GUILD, 1)
         SQLitePartyRepository(
             backup.DATA_DIR / "party_data.db"
         ).create_party(_TEST_GUILD, "LOL", 2_000_000_000)
         SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
-        SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
+        SQLiteGameUidRepository(backup.DATA_DIR / "game_uid_data.db")
         created_at = datetime.datetime(
             2026,
             1,
@@ -2702,7 +2702,7 @@ def test_backup_same_timestamp_rejected():
     backup.BACKUP_DIR = _TMP_DIR / "collision_backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     usage_repository = SQLiteUsageRepository(
-        backup.DATA_DIR / "attendance_data.db"
+        backup.DATA_DIR / "usage_data.db"
     )
     usage_repository.increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
@@ -2710,7 +2710,7 @@ def test_backup_same_timestamp_rejected():
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
-    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
+    SQLiteGameUidRepository(backup.DATA_DIR / "game_uid_data.db")
     fixed = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(fixed)
 
@@ -2721,7 +2721,7 @@ def test_backup_same_timestamp_rejected():
     except RuntimeError:
         check("동일 시각 백업 충돌 거부", True)
     result = backup.verify_backup_set(manifest)
-    check("충돌 후 기존 백업 보존", result["attendance_data.db"]["users"] == 1)
+    check("충돌 후 기존 백업 보존", result["usage_data.db"]["users"] == 1)
 
 
 def test_prune_requires_timestamp_bound_filenames():
@@ -2732,14 +2732,14 @@ def test_prune_requires_timestamp_bound_filenames():
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     backup.BACKUP_RETENTION_DAYS = 30
     SQLiteUsageRepository(
-        backup.DATA_DIR / "attendance_data.db"
+        backup.DATA_DIR / "usage_data.db"
     ).increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
-    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
+    SQLiteGameUidRepository(backup.DATA_DIR / "game_uid_data.db")
     current = datetime.datetime(2026, 7, 20, tzinfo=datetime.timezone.utc)
     manifest = backup.create_backup_set(current)
     copied = backup.BACKUP_DIR / "20260101T000000Z-manifest.json"
@@ -2763,14 +2763,14 @@ def test_backup_publication_is_synced():
     backup.BACKUP_DIR = _TMP_DIR / "durability_root" / "nested" / "backups"
     backup.SETTINGS_DIR = _TMP_DIR / "backup-settings"
     SQLiteUsageRepository(
-        backup.DATA_DIR / "attendance_data.db"
+        backup.DATA_DIR / "usage_data.db"
     ).increment_forbidden_count(_TEST_GUILD, 1)
     SQLitePartyRepository(backup.DATA_DIR / "party_data.db").create_party(
         _TEST_GUILD, "LOL",
         2_000_000_000,
     )
     SQLiteGuildSettingsRepository(backup.DATA_DIR / "guild_settings.db")
-    SQLiteProfileRepository(backup.DATA_DIR / "profile_data.db")
+    SQLiteGameUidRepository(backup.DATA_DIR / "game_uid_data.db")
     events = []
     synced_directories = []
     real_fsync = backup.os.fsync
@@ -2840,7 +2840,7 @@ def test_corrupt_backup_rejected():
         backup.verify_database(
             corrupt,
             {"users"},
-            source_name="attendance_data.db",
+            source_name="usage_data.db",
         )
         check("손상 백업 거부", False)
     except RuntimeError:
@@ -2903,7 +2903,7 @@ def test_legacy_export():
 
     root = _TMP_DIR / "legacy_export_src"
     root.mkdir(parents=True, exist_ok=True)
-    legacy_attendance_database_path = root / "attendance_data.db"
+    legacy_attendance_database_path = root / "usage_data.db"
     settings_db = root / "guild_settings.db"
     _create_legacy_attendance_db(legacy_attendance_database_path, version=2)
     with closing(sqlite3.connect(legacy_attendance_database_path)) as conn:
@@ -2929,7 +2929,7 @@ def test_legacy_export():
     document = export_legacy.build_export(root)
     sections = document["sections"]
 
-    check("스키마 버전 기록", document["schema_versions"]["attendance_data.db"] == 2)
+    check("스키마 버전 기록", document["schema_versions"]["usage_data.db"] == 2)
     check("users 2행 추출", len(sections["users"]) == 2, f"({sections['users']})")
     check(
         "포인트와 최종 출석일 보존",
@@ -2958,7 +2958,7 @@ def test_legacy_export():
     # 이미 마이그레이션이 끝난 DB — 사라진 것은 null, 남은 것은 그대로.
     migrated = _TMP_DIR / "legacy_export_migrated"
     migrated.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(migrated / "attendance_data.db")) as conn:
+    with closing(sqlite3.connect(migrated / "usage_data.db")) as conn:
         conn.executescript("""
             CREATE TABLE users (
                 guild_id INTEGER NOT NULL,

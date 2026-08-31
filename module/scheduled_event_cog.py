@@ -12,7 +12,7 @@ from module.database import (
 )
 
 
-class EventNoticeCog(commands.Cog):
+class ScheduledEventCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
@@ -121,4 +121,4 @@ class EventNoticeCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(EventNoticeCog(bot))
+    await bot.add_cog(ScheduledEventCog(bot))

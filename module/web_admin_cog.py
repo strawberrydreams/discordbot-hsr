@@ -24,13 +24,13 @@ from module.database import (
     create_guild_settings_repository,
     run_db,
 )
-from module.forbiddenfilter_cog import ForbiddenFilterCog
+from module.forbidden_filter_cog import ForbiddenFilterCog
 from module.panel import (
     channel_send_capabilities,
     is_sendable_announcement_channel,
     is_sendable_panel_channel,
 )
-from module.playwith_cog import PlayWithCog
+from module.party_cog import PartyCog
 
 DEFAULT_HOST = "127.0.0.1"
 ALLOWED_HOSTS = frozenset({DEFAULT_HOST, "0.0.0.0"})
@@ -406,7 +406,7 @@ class WebAdminCog(commands.Cog):
         if problem or not text:
             return "", "", problem
         # config._canonicalize_settings와 같은 이유로 함수 안에서 import한다.
-        from module.hyacine_chat_cog import canonicalize_persona
+        from module.ai_chat_cog import canonicalize_persona
 
         try:
             persona = canonicalize_persona(json.loads(text), strict=True)
@@ -815,7 +815,7 @@ class WebAdminCog(commands.Cog):
                 )
 
             if setting_name == "party_channel_id" and channel_id is not None:
-                play_with_cog = self.bot.get_cog(PlayWithCog.__name__)
+                play_with_cog = self.bot.get_cog(PartyCog.__name__)
                 if play_with_cog is None:
                     side_effect_problems.append(
                         "파티 모듈이 로드되지 않아 패널을 갱신하지 못했습니다."
