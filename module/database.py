@@ -54,8 +54,13 @@ def _secure_sqlite_paths(db_path: pathlib.Path) -> None:
     ):
         if path.is_symlink():
             raise PermissionError(f"SQLite 경로는 symlink일 수 없습니다: {path}")
-        if path.exists():
+        try:
             ensure_private_file(path)
+        except FileNotFoundError:
+            # -wal/-shm은 마지막 연결이 닫힐 때 SQLite가 지운다. 동시 연결 중에는
+            # 확인과 lstat() 사이에서 사라질 수 있는데, 없는 파일에는 조일 권한도
+            # 없다. 다시 생기면 다음 _connect가 그때 조인다.
+            continue
 
 
 def _connect(db_path, *, isolation_level: str | None = "") -> sqlite3.Connection:

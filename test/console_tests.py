@@ -1211,6 +1211,46 @@ def test_sqlite_busy_timeout():
     check("모든 연결이 헬퍼를 경유", direct == 1, f"직접 호출 {direct}건")
 
 
+def test_sqlite_connect_tolerates_vanishing_wal_sidecar():
+    """-wal/-shm은 마지막 연결이 닫힐 때 사라진다. 그 순간 다른 연결이 열려도
+    권한 조이기가 FileNotFoundError로 터지면 안 된다. 동시 run_db 두 개가
+    같은 DB를 열 때 실제로 나던 경합이다."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = pathlib.Path(directory) / "race.db"
+        with closing(database._connect(path)) as conn:
+            conn.execute("CREATE TABLE t (v INTEGER)")
+
+        wal = path.with_name(f"{path.name}-wal")
+        real_lstat = pathlib.Path.lstat
+
+        def vanishing_lstat(self):
+            # exists() 확인 직후 사라지는 sidecar를 흉내낸다.
+            if self.name == wal.name:
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_lstat(self)
+
+        with patch.object(pathlib.Path, "lstat", vanishing_lstat):
+            try:
+                with closing(database._connect(path)) as conn:
+                    conn.execute("SELECT 1").fetchone()
+                survived = True
+            except FileNotFoundError:
+                survived = False
+        check("사라진 WAL sidecar에도 연결 성공", survived)
+
+        # symlink 거부는 그대로여야 한다.
+        link_target = pathlib.Path(directory) / "elsewhere.db"
+        link_target.touch()
+        linked = pathlib.Path(directory) / "linked.db"
+        linked.symlink_to(link_target)
+        try:
+            database._connect(linked)
+            rejected = False
+        except PermissionError:
+            rejected = True
+        check("symlink DB 경로는 여전히 거부", rejected)
+
+
 def test_backup_reads_wal_without_writer():
     import module.backup as backup
 
@@ -2983,6 +3023,7 @@ if __name__ == "__main__":
         test_importing_main_does_not_construct_bot()
         test_bot_disables_all_mentions()
         test_sqlite_busy_timeout()
+        test_sqlite_connect_tolerates_vanishing_wal_sidecar()
         test_backup_reads_wal_without_writer()
         test_guild_isolation()
         test_temp_image_lifecycle()
