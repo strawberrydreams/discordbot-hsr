@@ -3871,7 +3871,8 @@ class WebAdminAtomicSettingsTests(unittest.TestCase):
 
 class WebAdminI18nCatalogTests(unittest.TestCase):
     def test_both_languages_define_exactly_the_same_keys(self):
-        # 키가 빠지면 화면에 조용히 빈 문자열이 렌더된다. 이 테스트가 유일한 방어선이다.
+        # 키가 빠지면 fallback으로 키 이름이 화면에 드러난다. 불완전한 번역을
+        # 배포 전에 잡도록 두 언어의 키 집합을 정확히 맞춘다.
         korean = set(i18n.STRINGS["ko"])
         english = set(i18n.STRINGS["en"])
         self.assertEqual(korean, english, korean ^ english)

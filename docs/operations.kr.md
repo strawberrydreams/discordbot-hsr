@@ -63,7 +63,7 @@ OpenAI가 `429`와 `credit_balance_exhausted`를 반환하면 모델 혼잡이 �
 
 알 수 없는 값은 조용히 기본값으로 떨어집니다. POST 후 리다이렉트되는 화면에는 쿼리가 남지 않으므로 쿠키가 언어를 유지합니다.
 
-문구는 `module/i18n.py`의 `STRINGS` 한 곳에 있습니다. **두 언어의 키 집합은 반드시 같아야 합니다** — 키가 빠지면 화면에 빈 문자열이 조용히 렌더되므로, 테스트가 키 집합 동등성·빈 값 없음·`{}` 자리표시자 일치·미사용 키 없음을 모두 검사합니다. 저장 결과와 오류 문구를 포함한 서버 생성 메시지도 같은 카탈로그를 씁니다.
+문구는 `module/i18n.py`의 `STRINGS` 한 곳에 있습니다. **두 언어의 키 집합은 반드시 같아야 합니다** — 키가 빠져도 화면이 깨지지는 않고 키 이름이 그대로 보이며, 테스트가 그 불완전한 번역의 배포를 막도록 키 집합 동등성·빈 값 없음·`{}` 자리표시자 일치·미사용 키 없음을 모두 검사합니다. 저장 결과와 오류 문구를 포함한 서버 생성 메시지도 같은 카탈로그를 씁니다.
 
 봇 이름과 길드 이름은 번역하지 않습니다.
 
@@ -154,16 +154,47 @@ DB 파일 두 개의 이름이 내용에 맞게 바뀌었습니다. 봇은 새 �
 | `profile_data.db` | `game_uid_data.db` | 게임 UID |
 
 ```bash
+(
+set -euo pipefail
+
 docker compose stop bot backup
 cd runtime/data
-for suffix in "" "-wal" "-shm"; do
-  test -e "attendance_data.db$suffix" && mv "attendance_data.db$suffix" "usage_data.db$suffix"
-  test -e "profile_data.db$suffix" && mv "profile_data.db$suffix" "game_uid_data.db$suffix"
-done
+
+check_database_collision() {
+  old_name=$1
+  new_name=$2
+  old_exists=0
+  new_exists=0
+  for suffix in "" "-wal" "-shm"; do
+    test ! -e "$old_name$suffix" || old_exists=1
+    test ! -e "$new_name$suffix" || new_exists=1
+  done
+  if test "$old_exists" -eq 1 && test "$new_exists" -eq 1; then
+    echo "$old_name과 $new_name이 모두 있어 어느 DB도 덮어쓰지 않고 중단합니다." >&2
+    return 1
+  fi
+}
+
+move_database() {
+  old_name=$1
+  new_name=$2
+  for suffix in "" "-wal" "-shm"; do
+    test ! -e "$old_name$suffix" || mv "$old_name$suffix" "$new_name$suffix"
+  done
+}
+
+check_database_collision attendance_data.db usage_data.db
+check_database_collision profile_data.db game_uid_data.db
+move_database attendance_data.db usage_data.db
+move_database profile_data.db game_uid_data.db
+
 cd -
 docker compose up -d bot backup
 docker compose logs --tail=50 bot
+)
 ```
+
+구·신 DB 파일군이 동시에 있으면 이 블록은 두 서비스를 중지한 채 어느 파일도 옮기지 않고 끝납니다. 두 파일군을 모두 보존하고 내용을 확인해 병합 방법을 정하세요. 어느 쪽도 확인 없이 삭제하거나 덮어쓰면 안 됩니다.
 
 `runtime/backups/`의 기존 백업 파일명은 그대로 두세요. manifest가 당시 이름을 기록하고 있고, 복구 절차는 manifest를 따릅니다.
 

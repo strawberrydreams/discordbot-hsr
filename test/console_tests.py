@@ -407,10 +407,43 @@ def test_language_pair_documents_stay_in_sync():
                     "| `profile_data.db` |", ""
                 ).replace("attendance_data.db$suffix", "").replace(
                     '"attendance_data.db', ""
-                ).replace("profile_data.db$suffix", "").replace('"profile_data.db', "")
+                ).replace("profile_data.db$suffix", "").replace(
+                    '"profile_data.db', ""
+                ).replace("attendance_data.db usage_data.db", "").replace(
+                    "profile_data.db game_uid_data.db", ""
+                )
                 for stale in ("attendance_data.db", "profile_data.db")
             ),
             "(이관 안내 표와 mv 명령은 예외)",
+        )
+
+    # 구 DB와 새 DB가 함께 있으면 mv가 새 DB를 덮어쓸 수 있다. 이관 블록은
+    # 어느 파일도 옮기기 전에 두 파일군의 충돌을 확인하고 중단해야 한다.
+    unsafe_moves = (
+        'test -e "attendance_data.db$suffix" && mv',
+        'test -e "profile_data.db$suffix" && mv',
+    )
+    migration_contract = (
+        "set -euo pipefail",
+        "move_database() {",
+        "old_exists=1",
+        "new_exists=1",
+        "return 1",
+        "check_database_collision attendance_data.db usage_data.db",
+        "check_database_collision profile_data.db game_uid_data.db",
+        "move_database attendance_data.db usage_data.db",
+        "move_database profile_data.db game_uid_data.db",
+    )
+    for name in ("docs/operations.md", "docs/operations.kr.md"):
+        source = _doc(name)
+        check(
+            f"{name} DB 파일명 이관은 충돌 시 중단",
+            all(term in source for term in migration_contract)
+            and not any(command in source for command in unsafe_moves)
+            and source.index(
+                "check_database_collision profile_data.db game_uid_data.db"
+            )
+            < source.index("move_database attendance_data.db usage_data.db"),
         )
 
 

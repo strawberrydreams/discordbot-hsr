@@ -63,7 +63,7 @@ The language is decided in this order.
 
 Unknown values fall back silently to the default. Screens reached by a redirect after a POST carry no query, so the cookie preserves the language.
 
-All strings live in one place, `STRINGS` in `module/i18n.py`. **The two languages must define exactly the same keys** — a missing key renders as a silent empty string, so tests check key-set equality, that no value is empty, that `{}` placeholders match, and that no key is unused. Server-generated messages, including save results and error text, use the same catalogue.
+All strings live in one place, `STRINGS` in `module/i18n.py`. **The two languages must define exactly the same keys** — a missing key remains visible as its key name instead of breaking the page, and tests prevent that incomplete translation from shipping by checking key-set equality, that no value is empty, that `{}` placeholders match, and that no key is unused. Server-generated messages, including save results and error text, use the same catalogue.
 
 Bot names and guild names are not translated.
 
@@ -154,16 +154,47 @@ Two database files were renamed to match their contents. The bot looks only for 
 | `profile_data.db` | `game_uid_data.db` | Game UIDs |
 
 ```bash
+(
+set -euo pipefail
+
 docker compose stop bot backup
 cd runtime/data
-for suffix in "" "-wal" "-shm"; do
-  test -e "attendance_data.db$suffix" && mv "attendance_data.db$suffix" "usage_data.db$suffix"
-  test -e "profile_data.db$suffix" && mv "profile_data.db$suffix" "game_uid_data.db$suffix"
-done
+
+check_database_collision() {
+  old_name=$1
+  new_name=$2
+  old_exists=0
+  new_exists=0
+  for suffix in "" "-wal" "-shm"; do
+    test ! -e "$old_name$suffix" || old_exists=1
+    test ! -e "$new_name$suffix" || new_exists=1
+  done
+  if test "$old_exists" -eq 1 && test "$new_exists" -eq 1; then
+    echo "Both $old_name and $new_name exist; refusing to overwrite either database." >&2
+    return 1
+  fi
+}
+
+move_database() {
+  old_name=$1
+  new_name=$2
+  for suffix in "" "-wal" "-shm"; do
+    test ! -e "$old_name$suffix" || mv "$old_name$suffix" "$new_name$suffix"
+  done
+}
+
+check_database_collision attendance_data.db usage_data.db
+check_database_collision profile_data.db game_uid_data.db
+move_database attendance_data.db usage_data.db
+move_database profile_data.db game_uid_data.db
+
 cd -
 docker compose up -d bot backup
 docker compose logs --tail=50 bot
+)
 ```
+
+If both an old and a new database family exist, the block stops with both services still down and moves nothing. Preserve both families, inspect their contents, and decide how to reconcile them; do not delete or overwrite either copy blindly.
 
 Leave the existing backup filenames in `runtime/backups/` as they are. The manifest records the names as they were, and the restore procedure follows the manifest.
 
